@@ -1,11 +1,18 @@
-# Compose "reale": Fase 2, PREDISPOSTA per il futuro test MT5 + Wine su Ubuntu. NON pronta
-# all'uso out-of-the-box:
+# Compose "reale": Fase 2, MT5 + Wine su Linux. Predisposta e costruibile, ma il test end-to-end
+# contro un terminale MT5 vero e' previsto SOLO su una VPS Ubuntu amd64 (vedi README, sezione
+# "Fase 2: MT5 reale + Wine"). Su macOS Apple Silicon e' stato validato solo:
+#   - `docker compose -f docker-compose.yml config` (interpolazione env/volumi corretta);
+#   - un tentativo di build dello stage real-mt5 (best-effort, emulazione linux/amd64 via QEMU su
+#     un host arm64: puo' essere lento o non completare a seconda dell'ambiente, vedi README).
+#
+# NON pronta all'uso out-of-the-box:
 #   - lo stage `real-mt5` del Dockerfile installa Wine/Xvfb ma non scarica ne' include alcun
 #     installer MetaTrader 5 (nessun URL, nessun binario: va fornito manualmente, vedi README);
-#   - il volume `mt5-installer` va popolato a mano con l'installer .exe prima di avviare;
+#   - la directory ./runtime/mt5 va popolata a mano (installer o terminale gia' installato)
+#     prima di avviare;
 #   - l'inizializzazione di Wine e l'avvio del terminale MT5 non sono automatizzati.
 #
-# Questo file NON fa parte delle verifiche automatiche del POC (quelle usano esclusivamente
+# Questo file NON fa parte delle verifiche automatiche di Fase 1 (quelle usano esclusivamente
 # docker-compose.mock.yml) e non va eseguito senza aver prima letto il README per intero.
 
 services:
@@ -16,31 +23,38 @@ services:
       target: real-mt5
     image: tradejournal-mt5-cloud-worker:real-mt5
     container_name: tradejournal-mt5-cloud-worker
+    platform: linux/amd64
     environment:
-      MOCK_MODE: "${MOCK_MODE:-false}"
-      DRY_RUN: "${DRY_RUN:-true}"
+      MOCK_MODE: "false"
       MT5_LOGIN: "${MT5_LOGIN:-}"
       MT5_PASSWORD: "${MT5_PASSWORD:-}"
       MT5_SERVER: "${MT5_SERVER:-}"
       TRADEJOURNAL_API_URL: "${TRADEJOURNAL_API_URL:-}"
       TRADEJOURNAL_BRIDGE_TOKEN: "${TRADEJOURNAL_BRIDGE_TOKEN:-}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      DRY_RUN: "${DRY_RUN:-true}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
-      # Popolare manualmente con l'installer MT5 (es. mt5setup.exe) prima dell'uso reale.
-      - mt5-installer:/mt5/installer:ro
-      # Persiste il WINEPREFIX (terminale MT5 installato, configurazione) tra i riavvii.
+      # Directory persistente per il terminale MT5: popolarla manualmente con l'installer
+      # ufficiale o con una directory terminale gia' installata (vedi README, "Preparazione
+      # runtime MT5"). Bind mount host, cosi' resta ispezionabile/sostituibile senza rientrare
+      # in Docker.
+      - ./runtime/mt5:/opt/mt5
+      # Persiste il WINEPREFIX (Wine stesso: registro, DLL, configurazione) tra i riavvii,
+      # separato dal terminale MT5 vero e proprio.
       - mt5-wineprefix:/home/worker/.wine
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/app/docker/healthcheck.sh"]
+      test: ["CMD", "/app/docker/healthcheck-mt5.sh"]
       interval: 30s
       timeout: 5s
-      start_period: 30s
+      start_period: 45s
       retries: 3
-    mem_limit: 1g
-    cpus: 1.0
+    # Limiti iniziali indicativi: Wine + un terminale MT5 headless consumano sensibilmente piu'
+    # RAM/CPU del solo worker Python mock. Ricalibrare sull'hardware reale della VPS (vedi
+    # README, "Comandi utili per RAM/CPU").
+    mem_limit: 2g
+    cpus: 2.0
 
 volumes:
-  mt5-installer:
   mt5-wineprefix:

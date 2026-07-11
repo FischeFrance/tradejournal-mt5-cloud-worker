@@ -45,8 +45,12 @@ def _build_client(config) -> Mt5Client:
         return MockMt5Client()
     logger.info(
         "MOCK_MODE disattivo: uso RealMt5Client (server=%s). Richiede un terminale MT5 "
-        "raggiungibile (Windows o Linux+Wine, vedi README).",
+        "raggiungibile (Windows o Linux+Wine, vedi README, 'Fase 2: MT5 reale + Wine').",
         mask_value(config.mt5_server),
+    )
+    logger.warning(
+        "Promemoria sicurezza: MT5_PASSWORD deve essere la password INVESTOR (sola lettura) "
+        "dell'account, mai la password di trading (vedi .env.example)."
     )
     return RealMt5Client(config.mt5_login, config.mt5_password, config.mt5_server)
 

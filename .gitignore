@@ -14,6 +14,10 @@ venv/
 data/
 *.log
 
+# Runtime MT5 fornito manualmente (installer, terminale installato, WINEPREFIX host-side):
+# mai versionato, vedi README "Preparazione runtime MT5".
+runtime/
+
 # Editor / OS
 .DS_Store
 .vscode/

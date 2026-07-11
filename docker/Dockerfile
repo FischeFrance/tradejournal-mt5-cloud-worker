@@ -41,16 +41,20 @@ RUN chmod +x ./docker/entrypoint.sh ./docker/healthcheck.sh \
 # Per costruirla esplicitamente (senza avviarla):
 #   docker build -f docker/Dockerfile --target real-mt5 -t tradejournal-mt5-worker:real-mt5 .
 #
-# Limiti noti/deliberati:
+# Limiti noti/deliberati (vedi README, "Limiti noti Wine/MT5" per il dettaglio completo):
 #   - NON scarica alcun installer MetaTrader 5: sarebbe una distribuzione non autorizzata di
-#     software proprietario. L'installer va fornito manualmente dall'utente (vedi README,
-#     sezione "Fornire l'installer MT5 manualmente") e montato nel volume /mt5/installer.
-#   - L'inizializzazione di Wine (creazione WINEPREFIX, avvio di Xvfb, esecuzione
-#     dell'installer MT5, avvio del terminale) NON e' automatizzata qui: richiede passi manuali
-#     documentati nel README, dato che non e' stato possibile validarli su questo ambiente
-#     (macOS, nessun MT5/Wine disponibile).
-#   - Il pacchetto Python MetaTrader5 (usato da worker/mt5_client.py:RealMt5Client) funziona
-#     solo quando il terminale MT5 e' effettivamente in esecuzione e raggiungibile.
+#     software proprietario. L'installer (o una directory terminale gia' installata) va fornito
+#     manualmente dall'utente (vedi README, sezione "Preparazione runtime MT5") e montato nel
+#     volume /opt/mt5 (tipicamente ./runtime/mt5:/opt/mt5 da docker-compose.yml).
+#   - docker/entrypoint-real.sh avvia Xvfb e verifica la presenza del terminale, ma NON installa
+#     ne' avvia automaticamente Wine/il terminale MT5: quello resta un passo manuale, documentato
+#     nel README, dato che non e' stato possibile validarlo end-to-end su questo ambiente (macOS
+#     Apple Silicon, nessun MT5/Wine reale disponibile -- solo build/config sono stati validati).
+#   - Il pacchetto Python `MetaTrader5` e' un'estensione nativa Windows: funziona solo se il
+#     processo Python che lo importa gira anch'esso dentro Wine (o dietro un bridge dedicato),
+#     non come processo Python Linux nativo verso un terminale Wine esterno. Questo Dockerfile
+#     predispone Wine/Xvfb/la directory persistente, ma la scelta tra "Python dentro Wine" e "un
+#     bridge IPC/HTTP" resta un lavoro architetturale aperto per il test reale su VPS Ubuntu.
 ########################################
 FROM base AS real-mt5
 
@@ -58,6 +62,10 @@ USER root
 
 # Repository WineHQ ufficiale (piu' aggiornato del pacchetto "wine" di Debian). Richiede
 # accesso di rete in fase di build.
+#   - xvfb + x11-utils (xdpyinfo): display virtuale headless per Wine/il terminale MT5.
+#   - procps (pgrep): usato da docker/healthcheck-mt5.sh per verificare che Xvfb sia vivo.
+#   - cabextract/unzip: tipicamente richiesti dagli script di installazione di app Windows sotto
+#     Wine (es. componenti .cab dentro l'installer MT5), tenuti pronti anche se non usati qui.
 RUN dpkg --add-architecture i386 \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -65,6 +73,8 @@ RUN dpkg --add-architecture i386 \
         gnupg2 \
         ca-certificates \
         xvfb \
+        x11-utils \
+        procps \
         cabextract \
         unzip \
     && mkdir -p /etc/apt/keyrings \
@@ -77,19 +87,25 @@ RUN dpkg --add-architecture i386 \
 ENV WINEPREFIX=/home/worker/.wine \
     WINEARCH=win64 \
     DISPLAY=:99 \
+    MT5_TERMINAL_DIR=/opt/mt5 \
     MOCK_MODE=false
 
-# Punto di mount per l'installer MT5 fornito manualmente (mai incluso nell'immagine, vedi README).
-VOLUME ["/mt5/installer"]
+COPY docker/entrypoint-real.sh docker/healthcheck-mt5.sh ./docker/
+RUN chmod +x ./docker/entrypoint-real.sh ./docker/healthcheck-mt5.sh
 
-RUN mkdir -p /home/worker/.wine && chown -R worker:worker /home/worker /app
+# /opt/mt5: directory persistente per il terminale MT5 (installer fornito manualmente o
+# directory terminale gia' installata, montata dall'host -- vedi docker-compose.yml e README,
+# sezione "Preparazione runtime MT5"). Mai popolata durante la build: nessun installer incluso
+# nell'immagine.
+RUN mkdir -p /opt/mt5 /home/worker/.wine && chown -R worker:worker /opt/mt5 /home/worker /app
+VOLUME ["/opt/mt5", "/home/worker/.wine"]
 
 USER worker
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["/app/docker/healthcheck.sh"]
+    CMD ["/app/docker/healthcheck-mt5.sh"]
 
-ENTRYPOINT ["/app/docker/entrypoint.sh"]
+ENTRYPOINT ["/app/docker/entrypoint-real.sh"]
 
 ########################################
 # Stage: mock (default) -- Fase 1 del POC.
