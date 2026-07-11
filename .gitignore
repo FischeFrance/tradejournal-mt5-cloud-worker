@@ -1,0 +1,20 @@
+# Segreti locali
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Stato locale del worker
+data/
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,46 @@
+# Compose "reale": Fase 2, PREDISPOSTA per il futuro test MT5 + Wine su Ubuntu. NON pronta
+# all'uso out-of-the-box:
+#   - lo stage `real-mt5` del Dockerfile installa Wine/Xvfb ma non scarica ne' include alcun
+#     installer MetaTrader 5 (nessun URL, nessun binario: va fornito manualmente, vedi README);
+#   - il volume `mt5-installer` va popolato a mano con l'installer .exe prima di avviare;
+#   - l'inizializzazione di Wine e l'avvio del terminale MT5 non sono automatizzati.
+#
+# Questo file NON fa parte delle verifiche automatiche del POC (quelle usano esclusivamente
+# docker-compose.mock.yml) e non va eseguito senza aver prima letto il README per intero.
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: real-mt5
+    image: tradejournal-mt5-cloud-worker:real-mt5
+    container_name: tradejournal-mt5-cloud-worker
+    environment:
+      MOCK_MODE: "${MOCK_MODE:-false}"
+      DRY_RUN: "${DRY_RUN:-true}"
+      MT5_LOGIN: "${MT5_LOGIN:-}"
+      MT5_PASSWORD: "${MT5_PASSWORD:-}"
+      MT5_SERVER: "${MT5_SERVER:-}"
+      TRADEJOURNAL_API_URL: "${TRADEJOURNAL_API_URL:-}"
+      TRADEJOURNAL_BRIDGE_TOKEN: "${TRADEJOURNAL_BRIDGE_TOKEN:-}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      # Popolare manualmente con l'installer MT5 (es. mt5setup.exe) prima dell'uso reale.
+      - mt5-installer:/mt5/installer:ro
+      # Persiste il WINEPREFIX (terminale MT5 installato, configurazione) tra i riavvii.
+      - mt5-wineprefix:/home/worker/.wine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/docker/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    mem_limit: 1g
+    cpus: 1.0
+
+volumes:
+  mt5-installer:
+  mt5-wineprefix:
