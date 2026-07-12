@@ -1,0 +1,75 @@
+# Compose "research": aggiunge Postgres locale + market-data-worker, entrambi ASSENTI da ogni
+# altro compose file di questo repository. Non ridefinisce il servizio "worker" (trade-sync,
+# comportamento invariato, vedi docker-compose.mock.yml/docker-compose.yml): questo file e'
+# pensato per essere combinato con uno di quelli tramite piu' `-f`, mai usato da solo.
+#
+# Uso tipico (trade-sync in mock + market-data mock, tutto locale, nessuna credenziale reale):
+#   cp .env.example .env
+#   # Modificare .env: impostare POSTGRES_PASSWORD (nessun default, vedi sotto)
+#   docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d --build
+#
+# Principio di isolamento: un'installazione cliente che avvia solo docker-compose.mock.yml (o
+# docker-compose.yml) non vede mai questo file, quindi non puo' avviare ne' Postgres ne'
+# market-data-worker per errore -- non e' un flag da disattivare, e' un servizio che non esiste
+# nel suo compose graph.
+#
+# Postgres NON espone alcuna porta verso l'host in questa fase: raggiungibile solo dalla rete
+# Docker interna creata da compose (dal servizio market-data-worker). Se in futuro servisse
+# ispezionare il database da un client esterno (es. psql/DBeaver dalla VM), la scelta consigliata
+# resta comunque il bind esplicito a 127.0.0.1 (mai 0.0.0.0) e va documentata qui con la
+# motivazione tecnica, non aggiunta implicitamente.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tradejournal-mt5-research-postgres
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-tradejournal_research}"
+      POSTGRES_USER: "${POSTGRES_USER:-research}"
+      # Nessun default: un valore vuoto o hardcoded per una password di database e' un rischio
+      # anche in locale. `up`/`config` falliscono subito con un messaggio chiaro se non impostata
+      # in .env, invece di avviare Postgres con una password debole/nota.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD e' obbligatorio in modalita' research: impostarlo in .env, mai committarlo}"
+    volumes:
+      - mt5-research-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-research} -d ${POSTGRES_DB:-tradejournal_research}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    mem_limit: 512m
+    cpus: 1.0
+
+  market-data-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: research-market-data
+    image: tradejournal-mt5-cloud-worker:research-market-data
+    container_name: tradejournal-mt5-market-data-worker
+    environment:
+      APP_MODE: research
+      ENABLE_MARKET_DATA: "true"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-research}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD e' obbligatorio in modalita' research}@postgres:5432/${POSTGRES_DB:-tradejournal_research}"
+      MARKET_SYMBOLS: "${MARKET_SYMBOLS:-EURUSD}"
+      MARKET_TIMEFRAMES: "${MARKET_TIMEFRAMES:-M1,M5,M15,H1,H4,D1}"
+      MARKET_DATA_POLL_SECONDS: "${MARKET_DATA_POLL_SECONDS:-60}"
+      MARKET_DATA_SOURCE: "${MARKET_DATA_SOURCE:-mock}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/docker/healthcheck-market-data.sh"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    mem_limit: 256m
+    cpus: 0.50
+
+volumes:
+  mt5-research-postgres-data:

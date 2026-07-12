@@ -1,0 +1,4 @@
+# Dipendenze aggiuntive, solo per lo stage Docker research-market-data (mai installate nello
+# stage 'mock' o 'real-mt5' usati dalle installazioni cliente: vedi docker/Dockerfile).
+-r requirements.txt
+psycopg2-binary==2.9.9

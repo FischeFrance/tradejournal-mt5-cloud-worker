@@ -15,6 +15,11 @@ Stato attuale:
   per quanto possibile su macOS (config, build sintattica, nessuna regressione mock). Il test
   end-to-end contro un terminale MT5 vero resta da fare su una **VPS Ubuntu amd64** -- vedi
   "Fase 2: MT5 reale + Wine" piu' sotto per la differenza esatta tra "predisposto" e "testato".
+- **Fase 3 (fatta, validata su Docker locale arm64): modalita' research (dati di mercato).**
+  Processo separato (`market-data-worker`, `worker/market_data_main.py`) che raccoglie candele
+  OHLC e le salva su un Postgres locale, dietro `APP_MODE=research` + `ENABLE_MARKET_DATA=true`
+  (disattiva per default, isolata dal trade-sync worker). Sorgente dati **solo mock** in questa
+  fase (nessuna dipendenza da Wine/MT5): vedi "Modalita' research (dati di mercato)" piu' sotto.
 
 Nessun deploy, nessuna risorsa cloud, nessuna credenziale reale sono stati usati per costruire
 questo POC.
@@ -40,7 +45,7 @@ Auth: header `Authorization: Bearer <TRADEJOURNAL_BRIDGE_TOKEN>`, `Content-Type:
 
 ```
 worker/
-  config.py            Lettura env var (MOCK_MODE, DRY_RUN, ...)
+  config.py            Lettura env var (MOCK_MODE, DRY_RUN, APP_MODE, ENABLE_MARKET_DATA, ...)
   mt5_client.py         Interfaccia Mt5Client astratta + RealMt5Client (stub, richiede Wine/MT5)
   mock_mt5_client.py     MockMt5Client: macchina a stati, nessuna dipendenza reale
   snapshot_store.py     Stato dell'ultimo poll (in memoria, opzionalmente su file)
@@ -48,7 +53,25 @@ worker/
   event_normalizer.py   Eventi grezzi -> payload API + event_id idempotente
   event_sender.py       Invio HTTP con retry/backoff, dry-run, masking dei log
   main.py                Loop di poll, logging, ciclo di vita, heartbeat per l'healthcheck
+                         (trade-sync worker: TUTTO quanto sopra, invariato dalla Fase 1/2)
+
+  market_data_source.py Interfaccia MarketDataSource + MockMarketDataSource (deterministica) +
+                         Mt5MarketDataSource (NON implementato, solleva NotImplementedError)
+  market_data_store.py  Upsert idempotente su Postgres (market_symbols/market_candles),
+                         checkpoint derivato da MAX(open_time)
+  db_migrate.py          Applica db/migrations/*.sql in ordine, tracciate in schema_migrations
+  market_data_main.py    Entry point del market-data-worker: processo/container SEPARATO da
+                         main.py, proprio loop/heartbeat/signal handling, mai importato da main.py
+                         (modalita' research, vedi sezione dedicata piu' sotto)
+
+db/
+  migrations/            Schema SQL esplicito e versionato (nessuna DDL sparsa nel codice Python)
 ```
+
+Il trade-sync worker (`main.py`) e il market-data-worker (`market_data_main.py`) sono due
+processi indipendenti: non condividono loop, non si importano a vicenda, girano in container
+Docker separati (vedi "Modalita' research" piu' sotto). Condividono solo `config.py` (lettura
+env var) perche' entrambi leggono variabili d'ambiente, non perche' dipendano l'uno dall'altro.
 
 `mt5_client.py` e `mock_mt5_client.py` implementano la stessa interfaccia (`account_info`,
 `get_open_positions`, `get_recent_deals`, `get_pending_orders`, `reconnect`, `health_status`):
@@ -351,6 +374,196 @@ prolungato contro un terminale MT5 reale:
 - **Nessuna gestione multiutente/orchestrazione**, invariato dalla Fase 1: un solo
   processo/account per container.
 
+## Modalita' research (dati di mercato)
+
+Modalita' **privata**, disattiva per default, pensata per raccogliere candele OHLC e salvarle su
+un Postgres locale alla macchina Ubuntu -- **mai** per le installazioni cliente. Non tocca in
+alcun modo la sincronizzazione dei trade verso TradeJournal (sezioni precedenti di questo
+README): sono due processi Docker separati, con due compose file separati.
+
+**Cosa NON e' (ancora) questa fase**: nessuna AI, nessun Bias Engine, nessun pattern recognition,
+nessuna sorgente MT5 reale funzionante (solo un adapter predisposto che si rifiuta esplicitamente
+di partire, vedi sotto), nessuna connessione a Supabase, nessun deploy cloud.
+
+### Principio di isolamento
+
+- `APP_MODE` accetta solo `client` (default) o `research`; qualunque altro valore fa fallire
+  l'avvio con un errore esplicito (vedi `worker/config.py:Config.__post_init__`).
+- `ENABLE_MARKET_DATA=true` e' valido solo insieme ad `APP_MODE=research`: impostarlo con
+  `APP_MODE=client` fa fallire l'avvio, non viene silenziosamente ignorato.
+- Il market-data-worker (`worker/market_data_main.py`) si rifiuta di partire se
+  `ENABLE_MARKET_DATA` non e' `true`: e' un processo dedicato, non ha altro scopo.
+- **Garanzia piu' forte di un flag**: Postgres e il market-data-worker sono definiti
+  *esclusivamente* in `docker-compose.research.yml`, un file compose separato mai incluso di
+  default. Un'installazione cliente che avvia solo `docker-compose.mock.yml` (o
+  `docker-compose.yml`) non vede questi servizi nel proprio compose graph: non c'e' un flag da
+  disattivare per errore, il servizio semplicemente non esiste per quel deployment.
+- Il trade-sync worker (`main.py`) non importa mai nessuno dei moduli `market_data_*`: un guasto
+  o un rallentamento nella raccolta dati di mercato non puo' propagarsi alla sincronizzazione dei
+  trade, e viceversa.
+
+### Nuove variabili d'ambiente (vedi `.env.example`)
+
+| Variabile | Default | Note |
+|---|---|---|
+| `APP_MODE` | `client` | `client` o `research`, nessun altro valore |
+| `ENABLE_MARKET_DATA` | `false` | richiede `APP_MODE=research` |
+| `DATABASE_URL` | *(vuoto)* | richiesto se `ENABLE_MARKET_DATA=true`; con Docker Compose e' costruita automaticamente dal servizio `market-data-worker`, non va impostata a mano |
+| `MARKET_SYMBOLS` | `EURUSD` | lista separata da virgola |
+| `MARKET_TIMEFRAMES` | `M1,M5,M15,H1,H4,D1` | lista separata da virgola |
+| `MARKET_DATA_POLL_SECONDS` | `60` | indipendente da `POLL_INTERVAL_SECONDS` (solo trade-sync) |
+| `MARKET_DATA_SOURCE` | `mock` | `mock` (unica funzionante) o `mt5` (predisposto, non implementato: vedi sotto) |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
+
+### Sorgente dati: solo mock in questa fase
+
+`MockMarketDataSource` (`worker/market_data_source.py`) e' **deterministica**: stesso
+symbol/timeframe/indice di candela producono sempre esattamente lo stesso valore (nessun
+`random`, nessuno stato condiviso tra chiamate). Genera candele OHLC sempre coerenti (`high` e'
+sempre il massimo, `low` sempre il minimo) per qualunque combinazione di simboli/timeframe, e
+supporta la simulazione di un buco temporale (`gap_indices`) per verificare che il worker non si
+blocchi ne' inventi dati quando una barra manca dalla sorgente.
+
+`MARKET_DATA_SOURCE=mt5` e' **accettato dalla configurazione ma non implementato**:
+`Mt5MarketDataSource` solleva `NotImplementedError` in modo esplicito al primo utilizzo, invece
+di fingere una connessione funzionante o di restituire dati falsi. Implementarlo davvero
+richiede prima di risolvere lo stesso nodo architetturale gia' descritto per `RealMt5Client` piu'
+sopra (pacchetto `MetaTrader5` nativo Windows vs worker Python Linux nativo): usare dati di
+mercato reali in questa fase significherebbe ereditare un client che oggi fallisce con un errore
+esplicito, non produrre dati silenziosamente sbagliati.
+
+### Schema database
+
+Definito interamente in `db/migrations/0001_initial_schema.sql`, applicato da
+`worker/db_migrate.py` all'avvio del market-data-worker (nessuna DDL sparsa nel codice Python;
+tracciamento delle migration gia' applicate in una tabella `schema_migrations`).
+
+```
+market_symbols
+  id (PK), canonical_symbol, broker_symbol, source, enabled, created_at, updated_at
+  UNIQUE (canonical_symbol, broker_symbol, source)
+
+market_candles
+  id (PK), symbol_id (FK -> market_symbols), timeframe, open_time (TIMESTAMPTZ, UTC),
+  open, high, low, close (NUMERIC(18,8)), tick_volume (BIGINT, nullable),
+  spread (INTEGER, nullable), source, created_at, updated_at
+  CHECK (high >= open, close, low  AND  low <= open, close)
+  UNIQUE INDEX (symbol_id, timeframe, open_time)  -- dedup + lookup/checkpoint
+```
+
+Prezzi in `NUMERIC(18,8)`, non float/double: un float binario introduce errori di arrotondamento
+non deterministici sulle ultime cifre decimali, inaccettabili per uno storico salvato in modo
+permanente. Il checkpoint per riprendere il polling dopo un riavvio **non** e' una tabella
+separata: si deriva con `MAX(open_time)` per `(symbol_id, timeframe)`, cosi' lo schema resta
+minimo e non puo' mai disallinearsi dai dati realmente salvati (vedi
+`worker/market_data_store.py:get_checkpoint`).
+
+L'upsert (`worker/market_data_store.py:upsert_candles`) usa `ON CONFLICT (symbol_id, timeframe,
+open_time) DO UPDATE`: salvare due volte la stessa candela aggiorna la riga esistente, non la
+duplica -- e' il meccanismo alla base sia della deduplicazione sia della ripresa senza perdita di
+checkpoint dopo un riavvio del collector.
+
+### Avvio locale (research)
+
+```bash
+cp .env.example .env
+# Modificare .env: impostare POSTGRES_PASSWORD (nessun default, vedi sopra). Tutto il resto puo'
+# restare ai valori di default per una prima prova locale (mock + mock).
+
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d --build
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml ps
+```
+
+Avvia **tre** container: `tradejournal-mt5-cloud-worker-mock` (trade-sync, invariato),
+`tradejournal-mt5-research-postgres` (Postgres locale, nessuna porta esposta verso l'host) e
+`tradejournal-mt5-market-data-worker` (raccoglie candele mock e le salva su Postgres).
+
+### Stop
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml down
+```
+
+Senza `-v`: il volume Postgres (`mt5-research-postgres-data`) **non** viene rimosso, i dati
+restano tra un `down`/`up` successivo (vedi "Persistenza" piu' sotto). Aggiungere `-v` solo se si
+vuole ripartire da un database vuoto deliberatamente.
+
+### Verifica log / healthcheck
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml logs market-data-worker
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml logs postgres
+
+docker inspect --format '{{.State.Health.Status}}' tradejournal-mt5-market-data-worker
+docker inspect --format '{{.State.Health.Status}}' tradejournal-mt5-research-postgres
+```
+
+Ci si aspetta, in ordine nei log del market-data-worker: avvio, applicazione delle migration
+(`Applico migration 0001_initial_schema...` alla primissima esecuzione, nessun log alle
+successive perche' gia' applicata), `Backfill iniziale...` con un conteggio di candele per ogni
+simbolo/timeframe, poi `Sync <symbol>/<timeframe>: N nuove candele.` a ogni ciclo di poll
+successivo. **Mai** `DATABASE_URL` in chiaro: solo `app_mode`/simboli/timeframe/conteggi.
+
+### Verifica righe salvate
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml exec postgres \
+  psql -U research -d tradejournal_research -c \
+  "SELECT s.canonical_symbol, c.timeframe, COUNT(*), MAX(c.open_time) \
+   FROM market_candles c JOIN market_symbols s ON s.id = c.symbol_id \
+   GROUP BY 1, 2 ORDER BY 1, 2;"
+```
+
+Rilanciando lo stesso container (`docker compose ... restart market-data-worker`) il conteggio
+per ogni riga non deve mai diminuire ne' saltare all'indietro: il collector riprende dal
+checkpoint (`MAX(open_time)`) letto da Postgres, non da uno stato interno al processo.
+
+### Backup / ripristino del volume Postgres
+
+Backup logico (consigliato per questa fase, indipendente dalla versione di Postgres):
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml exec postgres \
+  pg_dump -U research -d tradejournal_research > research_backup_$(date +%Y%m%d).sql
+```
+
+Ripristino su un volume vuoto:
+
+```bash
+cat research_backup_YYYYMMDD.sql | docker compose -f docker-compose.mock.yml \
+  -f docker-compose.research.yml exec -T postgres psql -U research -d tradejournal_research
+```
+
+Backup a livello di volume Docker (copia grezza dei file, utile per uno snapshot completo prima
+di un aggiornamento):
+
+```bash
+docker run --rm -v tradejournal-mt5-cloud-worker_mt5-research-postgres-data:/data \
+  -v "$(pwd)":/backup alpine \
+  tar czf /backup/postgres_volume_$(date +%Y%m%d).tar.gz -C /data .
+```
+
+(Il nome esatto del volume dipende dal nome della directory del progetto: verificarlo con
+`docker volume ls | grep postgres-data`.)
+
+### Limitazioni note
+
+- **MT5 reale non e' validato in modalita' research**, esattamente come in modalita' client (vedi
+  "Fase 2: MT5 reale + Wine" piu' sopra): `MARKET_DATA_SOURCE=mt5` non e' un percorso funzionante,
+  solo un adapter che fallisce in modo esplicito. Non e' stato dichiarato ne' testato come
+  funzionante in questa fase.
+- **Nessuna limitazione Wine/ARM64 per la modalita' research stessa**: a differenza dello stage
+  `real-mt5`, lo stage `research-market-data` non installa Wine e non richiede `platform:
+  linux/amd64` -- gira nativamente su Ubuntu ARM64 (e su qualunque altra architettura con Docker),
+  perche' la sorgente dati e' `mock` e Postgres supporta ARM64 in modo nativo. Il limite ARM64
+  resta interamente confinato a `RealMt5Client`/allo stage `real-mt5` (trade-sync worker).
+- Un solo processo market-data-worker per deployment (nessuna orchestrazione multi-istanza),
+  coerente con il limite gia' noto del trade-sync worker.
+- Il mock non riproduce condizioni di errore realistiche della fonte dati (simboli non
+  disponibili, storico incompleto lato broker): simula solo un flusso "felice" con un buco
+  temporale opzionale, sufficiente per validare il meccanismo di dedup/checkpoint, non il
+  comportamento di un broker reale.
+
 ## Checklist 24/48 ore
 
 Da eseguire quando il worker gira per un periodo prolungato (mock o reale) per verificarne la
@@ -407,6 +620,23 @@ scripts/benchmark.sh --real   # compose reale (Fase 2)
 - **cpus/mem_limit nei compose file** sono limiti indicativi; vanno ricalibrati per l'hardware
   reale di destinazione (laptop di sviluppo per il mock, VPS Ubuntu per il reale) prima di un
   uso prolungato.
+- **Market data reale (MT5) non implementato**, deliberatamente: `MARKET_DATA_SOURCE=mt5`
+  solleva `NotImplementedError` esplicito. Implementarlo richiede prima di risolvere lo stesso
+  nodo architetturale Wine/Python-nativo di `RealMt5Client` (vedi sopra) -- la modalita' research
+  eredita quel limite, non lo aggira.
+- **Log "Backfill" del market-data-worker e' riusato anche per il ciclo immediatamente dopo un
+  riavvio**, anche quando esiste gia' un checkpoint: il comportamento e' corretto (riparte dal
+  checkpoint reale letto da Postgres via `MAX(open_time)`, nessuna candela persa ne' duplicata,
+  verificato con un riavvio reale in fase di validazione), ma l'etichetta di log e' la stessa sia
+  al primissimo avvio (checkpoint assente) sia dopo un riavvio (checkpoint presente) -- possibile
+  micro-miglioramento di chiarezza nei log, non una correttezza da sistemare.
+- **Il mock di mercato non riproduce condizioni di errore realistiche** (vedi sezione "Modalita'
+  research" piu' sopra): copre dedup/checkpoint/gap sintetici, non il comportamento di un broker
+  reale.
+- **Nessun accesso esterno documentato/abilitato al Postgres locale** in questa fase (nessuna
+  porta pubblicata verso l'host): un domani, se servisse ispezionarlo da uno strumento esterno
+  alla VM, va aggiunta una scelta esplicita e documentata (bind a 127.0.0.1, mai 0.0.0.0), non
+  assunta implicitamente.
 
 ## Verifiche eseguite
 
@@ -471,4 +701,55 @@ In macOS Apple Silicon, Colima + Docker CLI (build amd64 sotto emulazione QEMU):
 docker compose -f docker-compose.yml config              # OK
 docker compose -f docker-compose.yml build                # OK, Wine installato, ~230s sotto emulazione
 docker compose -f docker-compose.yml run --rm worker       # OK, fallisce in modo pulito senza credenziali/terminale
+```
+
+### Fase 3 (modalita' research)
+
+Su Docker Desktop/CLI, macOS Apple Silicon (**arm64 nativo, nessuna emulazione**: a differenza
+dello stage `real-mt5`, questo stage non richiede Wine ne' `platform: linux/amd64`):
+
+- `python -m pytest`: **92 test, tutti verdi** (48 preesistenti, invariati, + 44 nuovi: 18 in
+  `tests/test_config_research.py`, 16 in `tests/test_market_data_source.py`, 5 in
+  `tests/test_market_data_main_startup.py`, 10 in
+  `tests/test_market_data_store_integration.py` contro un Postgres reale avviato via Docker
+  dalla fixture `postgres_database_url`, non mockato).
+- `docker compose -f docker-compose.mock.yml -f docker-compose.research.yml config`: OK,
+  interpolazione corretta; confermato che il servizio `worker` (trade-sync) non viene alterato
+  da `docker-compose.research.yml` (nessuna chiave in comune tra i due file per quel servizio) e
+  che `postgres` non ha alcuna sezione `ports:`.
+- `up -d --build`: build e avvio di tutti e tre i container (`tradejournal-mt5-cloud-worker-mock`,
+  `tradejournal-mt5-research-postgres`, `tradejournal-mt5-market-data-worker`), tutti `healthy`.
+- Log del market-data-worker: migration applicata una sola volta (`Applico migration
+  0001_initial_schema...`), backfill iniziale (500 candele per ciascuna delle 4 combinazioni
+  simbolo/timeframe testate), poi cicli di sync incrementali regolari; **mai** `DATABASE_URL` o
+  la password Postgres in chiaro (verificato con grep negativo su tutti i log dei tre container).
+- Log del trade-sync worker (`worker`): **identico** al comportamento di Fase 1 (stessa sequenza
+  di 7 eventi mock, stesso formato), a conferma che l'aggiunta della modalita' research non lo
+  altera in alcun modo.
+- Query diretta su Postgres (`SELECT COUNT(*) ... GROUP BY symbol, timeframe`): conteggi coerenti
+  con backfill + cicli di sync osservati nei log.
+- **Riavvio del solo market-data-worker** (`docker compose restart market-data-worker`): riparte
+  dal checkpoint reale (`MAX(open_time)` per symbol/timeframe letto da Postgres), non da zero;
+  verificato che `COUNT(*) = COUNT(DISTINCT (symbol_id, timeframe, open_time))` prima e dopo il
+  riavvio (nessuna riga duplicata, garantito anche strutturalmente dall'indice unique).
+- **`down` (senza `-v`) seguito da `up`**: il volume `mt5-research-postgres-data` sopravvive, le
+  candele salvate in precedenza sono ancora presenti dopo il riavvio dell'intero stack.
+- **Isolamento client verificato**: avviando **solo** `docker compose -f docker-compose.mock.yml
+  up`, nessun container Postgres ne' market-data-worker viene creato (verificato con `docker ps
+  --filter name=tradejournal-mt5`): il servizio non esiste nel compose graph di
+  un'installazione cliente, non e' un flag da disattivare.
+- Dopo la verifica, container/rete/volume di test creati per questa sessione sono stati rimossi
+  (`docker compose down`, poi `docker volume rm` sul volume Postgres di test, contenente solo
+  dati mock generati durante la validazione): nessuna risorsa lasciata in esecuzione.
+- **Non verificato** (richiede la VPS Ubuntu ARM64 di destinazione, non disponibile in questa
+  sessione locale): comportamento sotto carico prolungato (24/48 ore), consumo RAM/CPU reale di
+  Postgres + market-data-worker insieme al trade-sync worker sulla stessa macchina, backup/
+  ripristino (`pg_dump`/`psql`) eseguito realmente (i comandi sono documentati ma non ancora
+  eseguiti in questa sessione).
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml config   # OK
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d --build  # OK, 3 container healthy
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml down     # OK, volume Postgres sopravvive
+docker compose -f docker-compose.mock.yml up -d                                    # OK, nessun servizio research creato
 ```

@@ -3,12 +3,17 @@
 # Contesto di build atteso: la ROOT del repository (non docker/), perche' questo Dockerfile
 # copia sia requirements.txt che worker/ dalla root. Vedi docker-compose.mock.yml / docker-compose.yml.
 #
-# Due stage finali:
-#   - mock (default): Fase 1 del POC. Solo Python, MOCK_MODE=true, nessuna dipendenza da
-#     Wine/MT5. E' lo stage usato da docker-compose.mock.yml e testabile ovunque, incluso macOS.
+# Tre stage finali:
+#   - mock (default): Fase 1 del POC (trade-sync worker, worker/main.py). Solo Python,
+#     MOCK_MODE=true, nessuna dipendenza da Wine/MT5. E' lo stage usato da
+#     docker-compose.mock.yml e testabile ovunque, incluso macOS/Ubuntu ARM64.
 #   - real-mt5: Fase 2, PREDISPOSTA ma non pronta all'uso. Aggiunge Wine + Xvfb per eseguire in
 #     futuro il terminale MetaTrader 5 reale su Linux. Vedi il commento sopra quello stage e il
 #     README per i limiti e i passi manuali richiesti.
+#   - research-market-data: modalita' research (worker/market_data_main.py, processo separato dal
+#     trade-sync worker). Nessuna dipendenza da Wine/MT5: raccoglie dati di mercato mock e li
+#     salva su Postgres. Mai avviata da un'installazione cliente: solo da
+#     docker-compose.research.yml, esplicitamente. Vedi il commento sopra quello stage.
 
 ########################################
 # Stage: base
@@ -121,3 +126,36 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/app/docker/healthcheck.sh"]
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
+
+########################################
+# Stage: research-market-data -- market-data-worker, modalita' research (Postgres locale).
+#
+# Processo separato dal trade-sync worker (stage mock/real-mt5 sopra): esegue
+# worker/market_data_main.py, mai worker/main.py. Non collegata a nessun docker-compose
+# "cliente": va avviata esplicitamente aggiungendo docker-compose.research.yml (vedi README).
+# Nessuna dipendenza da Wine/MT5/ARM64: usa solo MARKET_DATA_SOURCE=mock in questa fase, quindi
+# gira nativamente ovunque, incluso Ubuntu ARM64.
+########################################
+FROM base AS research-market-data
+
+USER root
+
+COPY requirements-research.txt ./
+RUN pip install --no-cache-dir -r requirements-research.txt
+
+# db/migrations: solo qui, non nello stage base/mock/real-mt5 -- le immagini cliente non hanno
+# alcun motivo di contenere DDL Postgres che non eseguiranno mai (vedi worker/db_migrate.py).
+COPY db/ ./db/
+COPY docker/entrypoint-market-data.sh docker/healthcheck-market-data.sh ./docker/
+RUN chmod +x ./docker/entrypoint-market-data.sh ./docker/healthcheck-market-data.sh \
+    && chown -R worker:worker /app/db
+
+ENV APP_MODE=research \
+    ENABLE_MARKET_DATA=true
+
+USER worker
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/app/docker/healthcheck-market-data.sh"]
+
+ENTRYPOINT ["/app/docker/entrypoint-market-data.sh"]
