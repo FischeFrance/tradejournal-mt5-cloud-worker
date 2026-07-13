@@ -1,0 +1,8 @@
+# Da installare SOLO dentro il Python Windows eseguito sotto Wine (stesso WINEPREFIX del
+# terminale MT5, vedi README sezione "mt5-bridge reale"), MAI nel Python Linux del
+# market-data-worker: il pacchetto MetaTrader5 e' un'estensione nativa Windows, non importabile
+# da un interprete Linux (vedi worker/market_data_source.py e mt5_bridge.py per il dettaglio).
+#
+# Nessun'altra dipendenza: bridge/common.py e bridge/windows/mt5_bridge.py usano solo la
+# standard library per la parte HTTP.
+MetaTrader5

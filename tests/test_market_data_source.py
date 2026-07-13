@@ -93,10 +93,14 @@ def test_build_market_data_source_mock():
     assert isinstance(source, MockMarketDataSource)
 
 
-def test_build_market_data_source_mt5_is_not_implemented():
+def test_build_market_data_source_mt5_without_bridge_config_raises():
+    # MARKET_DATA_SOURCE=mt5 e' ora implementato (client HTTP verso mt5-bridge, vedi
+    # tests/test_mt5_market_data_source.py per la copertura completa): qui verifichiamo solo che
+    # la factory rifiuti di costruire il client senza bridge_url/bridge_token, invece di fingere
+    # una configurazione valida.
     import pytest
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         build_market_data_source("mt5")
 
 

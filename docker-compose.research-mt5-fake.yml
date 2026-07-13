@@ -1,0 +1,54 @@
+# Compose "research-mt5-fake": aggiunge SOLO il servizio mt5-bridge-fake e collega
+# market-data-worker (gia' definito in docker-compose.research.yml) ad esso. Da usare SEMPRE
+# insieme a docker-compose.research.yml (che fornisce postgres + market-data-worker) e a un
+# compose trade-sync (mock o reale), mai da solo:
+#
+#   docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+#     -f docker-compose.research-mt5-fake.yml up -d --build
+#
+# Cosa fa questo file, esattamente:
+#   - definisce il nuovo servizio mt5-bridge-fake (bridge/fake/fake_bridge.py: dati sintetici
+#     deterministici, nessuna dipendenza da Wine/MT5, gira nativamente anche su Ubuntu ARM64);
+#   - estende (non ridefinisce) il servizio market-data-worker di docker-compose.research.yml
+#     aggiungendo depends_on: mt5-bridge-fake e cambiando il DEFAULT di MARKET_DATA_SOURCE/
+#     MT5_BRIDGE_URL da mock a mt5/http://mt5-bridge-fake:8080 (un MARKET_DATA_SOURCE esplicito
+#     in .env ha comunque sempre la precedenza, vedi sintassi ${VAR:-default}).
+#
+# mt5-bridge-fake NON pubblica alcuna porta verso l'host: raggiungibile solo dalla rete Docker
+# interna del compose (da market-data-worker). Stesso principio gia' applicato a postgres in
+# docker-compose.research.yml.
+#
+# Questo NON e' il bridge reale: quello (bridge/windows/mt5_bridge.py) e' predisposto ma non
+# ancora impacchettato in un servizio Docker ne' validato (richiede Windows Python sotto Wine su
+# una VPS AMD64, vedi README). Nessun tentativo di eseguire MetaTrader5/Wine e' fatto da questo
+# file ne' dal servizio che definisce.
+
+services:
+  mt5-bridge-fake:
+    build:
+      context: .
+      dockerfile: bridge/fake/Dockerfile
+    image: tradejournal-mt5-bridge:fake
+    container_name: tradejournal-mt5-bridge-fake
+    environment:
+      MT5_BRIDGE_TOKEN: "${MT5_BRIDGE_TOKEN:?MT5_BRIDGE_TOKEN e' obbligatorio per il fake bridge: impostarlo in .env, mai committarlo}"
+      EURUSD_BROKER_SYMBOL: "${EURUSD_BROKER_SYMBOL:-EURUSD}"
+      PORT: "8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "bridge/fake/healthcheck.py"]
+      interval: 15s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    mem_limit: 128m
+    cpus: 0.25
+
+  market-data-worker:
+    environment:
+      MARKET_DATA_SOURCE: "${MARKET_DATA_SOURCE:-mt5}"
+      MT5_BRIDGE_URL: "${MT5_BRIDGE_URL:-http://mt5-bridge-fake:8080}"
+      MT5_BRIDGE_TOKEN: "${MT5_BRIDGE_TOKEN:?MT5_BRIDGE_TOKEN e' obbligatorio quando si usa mt5-bridge-fake}"
+    depends_on:
+      mt5-bridge-fake:
+        condition: service_healthy

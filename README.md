@@ -56,7 +56,7 @@ worker/
                          (trade-sync worker: TUTTO quanto sopra, invariato dalla Fase 1/2)
 
   market_data_source.py Interfaccia MarketDataSource + MockMarketDataSource (deterministica) +
-                         Mt5MarketDataSource (NON implementato, solleva NotImplementedError)
+                         Mt5MarketDataSource (client HTTP verso mt5-bridge, vedi sotto)
   market_data_store.py  Upsert idempotente su Postgres (market_symbols/market_candles),
                          checkpoint derivato da MAX(open_time)
   db_migrate.py          Applica db/migrations/*.sql in ordine, tracciate in schema_migrations
@@ -66,6 +66,17 @@ worker/
 
 db/
   migrations/            Schema SQL esplicito e versionato (nessuna DDL sparsa nel codice Python)
+
+bridge/
+  common.py              Scaffolding HTTP condiviso (stdlib only): auth Bearer, parsing/
+                         validazione richieste, envelope JSON/errori -- nessuna logica MT5
+  fake/
+    fake_bridge.py        Bridge finto: dati sintetici deterministici, nessuna dipendenza da
+                         Wine/MT5, gira su qualunque architettura (usato per i test/ARM64)
+    Dockerfile             Immagine del fake bridge (SOLO test/validazione locale)
+  windows/
+    mt5_bridge.py          Bridge reale: PREDISPOSTO, NON VALIDATO (richiede Windows Python
+                         sotto Wine + pacchetto MetaTrader5, vedi sezione "mt5-bridge")
 ```
 
 Il trade-sync worker (`main.py`) e il market-data-worker (`market_data_main.py`) sono due
@@ -382,8 +393,12 @@ alcun modo la sincronizzazione dei trade verso TradeJournal (sezioni precedenti 
 README): sono due processi Docker separati, con due compose file separati.
 
 **Cosa NON e' (ancora) questa fase**: nessuna AI, nessun Bias Engine, nessun pattern recognition,
-nessuna sorgente MT5 reale funzionante (solo un adapter predisposto che si rifiuta esplicitamente
-di partire, vedi sotto), nessuna connessione a Supabase, nessun deploy cloud.
+nessuna connessione a Supabase, nessun deploy cloud, e **nessun runtime MT5 reale validato**: la
+sorgente `mt5` parla con un servizio bridge separato via HTTP (vedi "mt5-bridge" piu' sotto), che
+per i test locali e' un *fake* deterministico (nessuna dipendenza da Wine/MT5, gira anche su
+Ubuntu ARM64); il bridge *reale* (`bridge/windows/mt5_bridge.py`) e' scritto e predisposto ma non
+e' mai stato eseguito contro un terminale MT5 vero in questa fase (richiede Windows Python sotto
+Wine su una VPS AMD64, non disponibile in questa sessione di sviluppo arm64).
 
 ### Principio di isolamento
 
@@ -412,25 +427,151 @@ di partire, vedi sotto), nessuna connessione a Supabase, nessun deploy cloud.
 | `MARKET_SYMBOLS` | `EURUSD` | lista separata da virgola |
 | `MARKET_TIMEFRAMES` | `M1,M5,M15,H1,H4,D1` | lista separata da virgola |
 | `MARKET_DATA_POLL_SECONDS` | `60` | indipendente da `POLL_INTERVAL_SECONDS` (solo trade-sync) |
-| `MARKET_DATA_SOURCE` | `mock` | `mock` (unica funzionante) o `mt5` (predisposto, non implementato: vedi sotto) |
+| `MARKET_DATA_SOURCE` | `mock` | `mock` (in-process) o `mt5` (client HTTP verso mt5-bridge, vedi sotto) |
+| `MT5_BRIDGE_URL` | *(vuoto)* | richiesto se `MARKET_DATA_SOURCE=mt5`; es. `http://mt5-bridge-fake:8080` |
+| `MT5_BRIDGE_TOKEN` | *(vuoto)* | richiesto se `MARKET_DATA_SOURCE=mt5`; stesso valore su market-data-worker e sul bridge |
+| `MT5_BRIDGE_TIMEOUT_SECONDS` | `10` | timeout per singola richiesta HTTP al bridge |
+| `EURUSD_BROKER_SYMBOL` | `EURUSD` | simbolo con cui il bridge interroga MT5 (puo' differire dal canonico, es. `EURUSD.a`) |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
 
-### Sorgente dati: solo mock in questa fase
+`MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` / `MT5_TERMINAL_PATH` (vedi `.env.example`) **non**
+sono lette da `worker/config.py`: appartengono esclusivamente al servizio `mt5-bridge` reale
+(`bridge/windows/mt5_bridge.py`), mai al market-data-worker.
+
+### Due sorgenti dati: mock (in-process) e mt5 (bridge HTTP)
 
 `MockMarketDataSource` (`worker/market_data_source.py`) e' **deterministica**: stesso
 symbol/timeframe/indice di candela producono sempre esattamente lo stesso valore (nessun
 `random`, nessuno stato condiviso tra chiamate). Genera candele OHLC sempre coerenti (`high` e'
 sempre il massimo, `low` sempre il minimo) per qualunque combinazione di simboli/timeframe, e
 supporta la simulazione di un buco temporale (`gap_indices`) per verificare che il worker non si
-blocchi ne' inventi dati quando una barra manca dalla sorgente.
+blocchi ne' inventi dati quando una barra manca dalla sorgente. Gira interamente dentro il
+processo `market_data_main.py`, nessuna rete coinvolta.
 
-`MARKET_DATA_SOURCE=mt5` e' **accettato dalla configurazione ma non implementato**:
-`Mt5MarketDataSource` solleva `NotImplementedError` in modo esplicito al primo utilizzo, invece
-di fingere una connessione funzionante o di restituire dati falsi. Implementarlo davvero
-richiede prima di risolvere lo stesso nodo architetturale gia' descritto per `RealMt5Client` piu'
-sopra (pacchetto `MetaTrader5` nativo Windows vs worker Python Linux nativo): usare dati di
-mercato reali in questa fase significherebbe ereditare un client che oggi fallisce con un errore
-esplicito, non produrre dati silenziosamente sbagliati.
+`Mt5MarketDataSource` (`MARKET_DATA_SOURCE=mt5`) e' un **client HTTP**: parla con un servizio
+esterno chiamato `mt5-bridge` (vedi la sezione dedicata subito sotto), non importa mai il
+pacchetto `MetaTrader5` ne' apre connessioni Wine/IPC. Non nasconde mai un errore dietro una
+lista vuota: timeout, autenticazione fallita, payload non conforme al contratto o OHLC
+incoerente sollevano `Mt5BridgeError`/`Mt5BridgeAuthError` in modo esplicito
+(`worker/market_data_main.py` intercetta l'eccezione per singola coppia simbolo/timeframe,
+logga un errore e ritenta al ciclo di poll successivo, senza mai far cadere l'intero processo).
+
+## mt5-bridge
+
+Il pacchetto Python ufficiale `MetaTrader5` e' un'estensione nativa **Windows**: comunica via IPC
+direttamente con il processo del terminale MetaTrader 5. **Non e' importabile da un interprete
+Python Linux**, nemmeno dentro lo stesso container Wine, se il processo Python che lo importa non
+e' anch'esso un Python Windows (stesso limite gia' descritto per `RealMt5Client` in "Fase 2: MT5
+reale + Wine" piu' sopra). Per questo il market-data-worker Linux **non tenta mai** di importare
+`MetaTrader5`: parla con un servizio HTTP separato, `mt5-bridge`, che nella sua forma reale gira
+come **Windows Python sotto Wine**, nello stesso `WINEPREFIX` del terminale MT5.
+
+Tre pezzi, stesso contratto HTTP (vedi `bridge/common.py`):
+
+| Servizio | Codice | Dove gira | Dipendenze | Stato |
+|---|---|---|---|---|
+| `mt5-bridge-fake` | `bridge/fake/fake_bridge.py` | Qualunque architettura, incluso Ubuntu ARM64 | Solo standard library | **Funzionante**, usato per i test |
+| `mt5-bridge` (reale) | `bridge/windows/mt5_bridge.py` | Windows Python sotto Wine, VPS AMD64 | Pacchetto `MetaTrader5` | **Predisposto, NON validato** |
+| Client Linux | `worker/market_data_source.py:Mt5MarketDataSource` | market-data-worker (qualunque architettura) | `requests` (gia' presente) | **Funzionante** |
+
+### Contratto API
+
+Autenticazione Bearer (`MT5_BRIDGE_TOKEN`) su **entrambi** gli endpoint. JSON UTF-8. Nessun
+endpoint di trading esiste (ne' `/v1/order_send` ne' equivalenti): il bridge e' di sola lettura.
+
+```
+GET /health
+  -> 200 {"status": "ok", "terminal_connected": true, "account_connected": true,
+          "server": "<nome server sanitizzato>", "version": "<versione terminale>"}
+
+POST /v1/candles
+  <- {"symbol": "EURUSD", "timeframe": "M5", "since": "2026-07-12T10:00:00Z"|null, "limit": 500}
+  -> 200 {"symbol": "EURUSD", "timeframe": "M5", "candles": [
+            {"open_time": "2026-07-12T10:05:00Z", "open": "1.17001", "high": "1.17045",
+             "low": "1.16990", "close": "1.17030", "tick_volume": 122, "spread": 8,
+             "source": "mt5"}
+          ]}
+  -> 401 {"error": {"code": "unauthorized", "message": "..."}}          token mancante/errato
+  -> 422 {"error": {"code": "unsupported_symbol"|"unsupported_timeframe"|..., "message": "..."}}
+  -> 502 {"error": {"code": "mt5_error", "message": "..."}}             terminale MT5 non risponde
+```
+
+Regole applicate dal bridge (fake e reale, stesso `bridge/common.py`): solo `EURUSD`/il broker
+symbol configurato; solo i sei timeframe `M1,M5,M15,H1,H4,D1`; `limit` troncato a un massimo
+protetto lato server (1000) indipendentemente da cosa chiede il client; `since` **esclusivo**
+(candele con `open_time` strettamente maggiore); candele sempre in ordine cronologico crescente;
+timestamp sempre UTC (suffisso `Z`); prezzi sempre come **stringhe** decimali, mai numeri JSON
+(evita qualunque arrotondamento binario intermedio); la candela ancora in formazione al momento
+della richiesta non e' mai inclusa.
+
+`Mt5MarketDataSource` applica comunque una difesa in profondita' lato client (non si fida
+ciecamente del bridge): riordina le candele, scarta quelle con `open_time <= since`, tronca al
+`limit` richiesto, e valida `Decimal`/UTC/coerenza OHLC su ogni candela ricevuta.
+
+### mt5-bridge-fake (test locali, qualunque architettura)
+
+```bash
+cp .env.example .env
+# Impostare in .env: POSTGRES_PASSWORD e MT5_BRIDGE_TOKEN (nessun default per nessuno dei due).
+# MARKET_DATA_SOURCE=mt5 (il default del file .env.example resta "mock": va cambiato per usare
+# il bridge invece della sorgente in-process).
+
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+  -f docker-compose.research-mt5-fake.yml up -d --build
+```
+
+Avvia **quattro** container: `worker` (trade-sync, invariato), `postgres`, `mt5-bridge-fake`
+(candele sintetiche deterministiche per EURUSD sui sei timeframe, nessuna dipendenza da Wine/MT5)
+e `market-data-worker` (ora configurato per parlare con `mt5-bridge-fake` invece che con
+`MockMarketDataSource`). `docker-compose.research-mt5-fake.yml` va sempre combinato con
+`docker-compose.research.yml`: da solo non definisce ne' `postgres` ne' l'intero
+`market-data-worker`, solo `mt5-bridge-fake` e alcune chiavi aggiuntive per `market-data-worker`
+(vedi commenti in quel file).
+
+`mt5-bridge-fake` **non pubblica alcuna porta verso l'host**: raggiungibile solo dalla rete
+Docker interna del compose, stesso principio gia' applicato a `postgres`.
+
+Il fake bridge simula anche gli scenari di errore di un bridge reale (401 con token errato,
+timeout, errore MT5, payload malformato, candela duplicata) tramite un header di test
+(`X-Mt5-Fake-Scenario`) usato **solo** dai test automatici (`tests/test_fake_bridge.py`): il
+client di produzione non lo invia mai.
+
+### mt5-bridge reale (AMD64, non validato)
+
+`bridge/windows/mt5_bridge.py` implementa lo stesso contratto usando il pacchetto `MetaTrader5`
+reale: `initialize()` con `MT5_TERMINAL_PATH`, `login()` con `MT5_LOGIN`/`MT5_PASSWORD`/
+`MT5_SERVER`, `symbol_select()` sul broker symbol, lettura candele via `copy_rates_from_pos`
+(quando `since` e' assente: le candele piu' recenti disponibili, **non** l'intero storico --
+MT5 non ha un'epoca sintetica fissa come il mock/fake) o `copy_rates_range` (quando `since` e'
+presente), esclusione esplicita della candela in formazione, `last_error()` in caso di
+fallimento, `shutdown()` pulito alla chiusura. **Nessuna chiamata di trading** (`order_send` e
+affini non compaiono nel file, verificato anche da un test statico dedicato).
+
+**Non ancora impacchettato in un'immagine Docker ne' in un compose file**: a differenza dello
+stage `real-mt5` del trade-sync worker, in questa fase esiste solo lo script Python
+(`bridge/windows/requirements.txt` elenca la sola dipendenza `MetaTrader5`, da installare dentro
+il Python Windows sotto Wine, mai nel Python Linux del market-data-worker). Passi manuali ancora
+da fare prima di un primo test reale su una VPS Ubuntu **AMD64** (mai ARM64: stesso vincolo gia'
+noto per `real-mt5`, vedi "Requisiti VPS Ubuntu amd64" piu' sopra):
+
+1. predisporre Wine + un terminale MT5 funzionante (stesso procedimento di "Preparazione runtime
+   MT5" piu' sopra, stesso `WINEPREFIX`);
+2. installare un Python Windows sotto quel `WINEPREFIX` (es. `wine python-3.11.msi` o
+   equivalente) **senza versionarlo** in questo repository;
+3. `wine python.exe -m pip install -r bridge/windows/requirements.txt` dentro il `WINEPREFIX`;
+4. avviare con `wine python.exe bridge\windows\mt5_bridge.py`, con
+   `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`/`MT5_TERMINAL_PATH`/`MT5_BRIDGE_TOKEN` nell'ambiente
+   di **quel** processo (mai in quello di market-data-worker);
+5. solo a quel punto puntare `MT5_BRIDGE_URL` del market-data-worker verso quell'indirizzo.
+
+Fino a quel test, questo bridge resta **scritto ma non validato**: nessuna riga di questo
+repository dichiara o simula il contrario.
+
+**Investor password, sempre**: `MT5_PASSWORD` deve essere la password INVESTOR (sola lettura)
+dell'account, mai quella di trading -- stesso principio gia' vale ovunque in questo repository
+(vedi anche `.env.example`). Il bridge legge solo `account_info`/candele storiche: non ha ne'
+bisogno ne' possibilita' di operare sull'account (nessun endpoint di trading esiste nel
+contratto HTTP).
 
 ### Schema database
 
@@ -478,6 +619,10 @@ Avvia **tre** container: `tradejournal-mt5-cloud-worker-mock` (trade-sync, invar
 `tradejournal-mt5-research-postgres` (Postgres locale, nessuna porta esposta verso l'host) e
 `tradejournal-mt5-market-data-worker` (raccoglie candele mock e le salva su Postgres).
 
+Per usare `MARKET_DATA_SOURCE=mt5` contro il fake bridge invece del mock in-process, vedi
+"mt5-bridge-fake (test locali, qualunque architettura)" piu' sopra: stesso comando con in piu'
+`-f docker-compose.research-mt5-fake.yml` (quarto container, `mt5-bridge-fake`).
+
 ### Stop
 
 ```bash
@@ -486,16 +631,21 @@ docker compose -f docker-compose.mock.yml -f docker-compose.research.yml down
 
 Senza `-v`: il volume Postgres (`mt5-research-postgres-data`) **non** viene rimosso, i dati
 restano tra un `down`/`up` successivo (vedi "Persistenza" piu' sotto). Aggiungere `-v` solo se si
-vuole ripartire da un database vuoto deliberatamente.
+vuole ripartire da un database vuoto deliberatamente. Con il fake bridge incluso, aggiungere
+allo stesso modo `-f docker-compose.research-mt5-fake.yml` sia a `down` sia a ogni comando
+successivo di questa sezione (`logs`/`exec`/...): i file `-f` vanno sempre combinati assieme.
 
 ### Verifica log / healthcheck
 
 ```bash
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml logs market-data-worker
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml logs postgres
+# Con il fake bridge incluso (-f docker-compose.research-mt5-fake.yml), anche:
+#   docker compose ... logs mt5-bridge-fake
 
 docker inspect --format '{{.State.Health.Status}}' tradejournal-mt5-market-data-worker
 docker inspect --format '{{.State.Health.Status}}' tradejournal-mt5-research-postgres
+docker inspect --format '{{.State.Health.Status}}' tradejournal-mt5-bridge-fake
 ```
 
 Ci si aspetta, in ordine nei log del market-data-worker: avvio, applicazione delle migration
@@ -548,21 +698,32 @@ docker run --rm -v tradejournal-mt5-cloud-worker_mt5-research-postgres-data:/dat
 
 ### Limitazioni note
 
-- **MT5 reale non e' validato in modalita' research**, esattamente come in modalita' client (vedi
-  "Fase 2: MT5 reale + Wine" piu' sopra): `MARKET_DATA_SOURCE=mt5` non e' un percorso funzionante,
-  solo un adapter che fallisce in modo esplicito. Non e' stato dichiarato ne' testato come
-  funzionante in questa fase.
-- **Nessuna limitazione Wine/ARM64 per la modalita' research stessa**: a differenza dello stage
-  `real-mt5`, lo stage `research-market-data` non installa Wine e non richiede `platform:
-  linux/amd64` -- gira nativamente su Ubuntu ARM64 (e su qualunque altra architettura con Docker),
-  perche' la sorgente dati e' `mock` e Postgres supporta ARM64 in modo nativo. Il limite ARM64
-  resta interamente confinato a `RealMt5Client`/allo stage `real-mt5` (trade-sync worker).
-- Un solo processo market-data-worker per deployment (nessuna orchestrazione multi-istanza),
-  coerente con il limite gia' noto del trade-sync worker.
-- Il mock non riproduce condizioni di errore realistiche della fonte dati (simboli non
-  disponibili, storico incompleto lato broker): simula solo un flusso "felice" con un buco
-  temporale opzionale, sufficiente per validare il meccanismo di dedup/checkpoint, non il
-  comportamento di un broker reale.
+- **MT5 reale non e' validato**, ne' in modalita' client (vedi "Fase 2: MT5 reale + Wine" piu'
+  sopra) ne' in modalita' research: `mt5-bridge` reale (`bridge/windows/mt5_bridge.py`) e' scritto
+  e sintatticamente verificato (`python -m py_compile`, senza il pacchetto `MetaTrader5`
+  installato: l'import e' lazy), ma non e' mai stato eseguito contro un terminale MT5 vero. Solo
+  `MARKET_DATA_SOURCE=mock` e `MARKET_DATA_SOURCE=mt5` **contro il fake bridge** sono stati
+  effettivamente testati ed eseguiti in questa fase.
+- **Il bridge reale non ha ancora un'immagine Docker/compose dedicati**: richiede prima Wine +
+  Windows Python + il pacchetto `MetaTrader5` installati manualmente sotto lo stesso `WINEPREFIX`
+  del terminale (vedi "mt5-bridge reale (AMD64, non validato)" piu' sopra) -- impacchettarlo in
+  un Dockerfile non validabile in questa sessione avrebbe rischiato di sembrare "pronto" senza
+  esserlo davvero.
+- **Nessuna limitazione Wine/ARM64 per la modalita' research in se'** (ne' per lo stage
+  `research-market-data` ne' per `mt5-bridge-fake`): entrambi sono Python standard library/stdlib
+  HTTP, nessuna dipendenza da Wine, girano nativamente su Ubuntu ARM64 (e su qualunque altra
+  architettura con Docker). Il limite ARM64/AMD64 resta interamente confinato a
+  `RealMt5Client`/stage `real-mt5` (trade-sync worker) e al futuro bridge reale.
+- Un solo processo market-data-worker e un solo bridge per deployment (nessuna orchestrazione
+  multi-istanza), coerente con il limite gia' noto del trade-sync worker.
+- Il mock/fake bridge non riproducono condizioni di errore realistiche della fonte dati (simboli
+  non disponibili, storico incompleto lato broker, riconnessioni broker-terminale): simulano un
+  insieme scelto di scenari (gap, timeout, errore MT5, payload malformato, candela duplicata),
+  sufficiente per validare dedup/checkpoint/gestione errori del client, non il comportamento
+  completo di un broker reale.
+- Scope volutamente ristretto a **EURUSD** (`EURUSD_BROKER_SYMBOL` per il mapping broker) sui sei
+  timeframe supportati: nessun altro asset e' previsto in questa fase, ne' lato bridge ne' lato
+  mapping canonical/broker in `worker/market_data_main.py:_broker_symbol`.
 
 ## Checklist 24/48 ore
 
@@ -620,10 +781,13 @@ scripts/benchmark.sh --real   # compose reale (Fase 2)
 - **cpus/mem_limit nei compose file** sono limiti indicativi; vanno ricalibrati per l'hardware
   reale di destinazione (laptop di sviluppo per il mock, VPS Ubuntu per il reale) prima di un
   uso prolungato.
-- **Market data reale (MT5) non implementato**, deliberatamente: `MARKET_DATA_SOURCE=mt5`
-  solleva `NotImplementedError` esplicito. Implementarlo richiede prima di risolvere lo stesso
-  nodo architetturale Wine/Python-nativo di `RealMt5Client` (vedi sopra) -- la modalita' research
-  eredita quel limite, non lo aggira.
+- **mt5-bridge reale non validato.** Il client Linux (`Mt5MarketDataSource`) e il fake bridge
+  (`bridge/fake/fake_bridge.py`) sono implementati e testati (unitari, contratto HTTP,
+  end-to-end contro Postgres reale, e manualmente via Docker Compose). Il bridge reale
+  (`bridge/windows/mt5_bridge.py`) e' scritto e sintatticamente verificato ma **mai eseguito**
+  contro Wine/Windows Python/un terminale MT5 vero: richiede una VPS Ubuntu AMD64, non disponibile
+  in questa sessione (arm64). Nessuna immagine Docker/compose esiste ancora per il bridge reale
+  (vedi "mt5-bridge reale (AMD64, non validato)").
 - **Log "Backfill" del market-data-worker e' riusato anche per il ciclo immediatamente dopo un
   riavvio**, anche quando esiste gia' un checkpoint: il comportamento e' corretto (riparte dal
   checkpoint reale letto da Postgres via `MAX(open_time)`, nessuna candela persa ne' duplicata,
@@ -752,4 +916,77 @@ docker compose -f docker-compose.mock.yml -f docker-compose.research.yml config 
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d --build  # OK, 3 container healthy
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml down     # OK, volume Postgres sopravvive
 docker compose -f docker-compose.mock.yml up -d                                    # OK, nessun servizio research creato
+```
+
+### Fase 4 (mt5-bridge: client HTTP + fake bridge)
+
+Stesso ambiente della Fase 3 (Docker locale, arm64 nativo -- **il fake bridge non richiede Wine
+ne' `platform: linux/amd64`, a differenza dello stage `real-mt5`**):
+
+- `python -m pytest`: **160 test, tutti verdi** (92 di Fase 1-3 + 68 nuovi: config/bridge in
+  `tests/test_config_research.py`, `tests/test_bridge_common.py` per le funzioni pure di
+  `bridge/common.py`, `tests/test_fake_bridge.py` per il contratto HTTP del fake bridge -- vero
+  server in ascolto su 127.0.0.1, non un mock --, `tests/test_mt5_market_data_source.py` per il
+  client (retry su 5xx, nessun retry su 401/400, timeout, Decimal da stringhe, validazione UTC/
+  OHLC, difesa in profondita' su ordine/since/limit, nessun segreto nei log),
+  `tests/test_bridge_no_trading.py` (controllo statico: nessuna chiamata `order_send`/
+  `order_check`/`TRADE_ACTION_*` in nessun file sotto `bridge/`), e
+  `tests/test_mt5_bridge_end_to_end.py` (fake bridge reale -> `Mt5MarketDataSource` -> Postgres
+  reale via Docker, stesso principio della fixture gia' usata in Fase 3). Un test preesistente
+  (`test_build_market_data_source_mt5_is_not_implemented`) e' stato deliberatamente aggiornato:
+  il suo intero scopo era verificare lo stub `NotImplementedError` che questa fase sostituisce
+  con un'implementazione reale, vedi `tests/test_market_data_source.py`.
+- `docker compose -f docker-compose.mock.yml -f docker-compose.research.yml -f
+  docker-compose.research-mt5-fake.yml config`: OK, `market-data-worker` riceve correttamente
+  `MARKET_DATA_SOURCE=mt5`/`MT5_BRIDGE_URL=http://mt5-bridge-fake:8080` (default di
+  `docker-compose.research-mt5-fake.yml`, sovrascrivibile da `.env`), `depends_on` include sia
+  `postgres` sia `mt5-bridge-fake`, nessuno dei due espone una sezione `ports:`.
+- `up -d --build`: build e avvio di **quattro** container (`worker`, `postgres`,
+  `mt5-bridge-fake`, `market-data-worker`), tutti `healthy`.
+- Log del market-data-worker: `mt5-bridge raggiungibile: terminal_connected=True
+  account_connected=True server=FakeBridge-Demo` (health check opzionale all'avvio), poi backfill
+  (500 candele per EURUSD/M1 e EURUSD/M5) e cicli di sync incrementali via richieste HTTP reali a
+  `mt5-bridge-fake` (confermato anche dai log del bridge stesso: `POST /v1/candles HTTP/1.1 200`
+  dall'IP interno Docker di market-data-worker, non `127.0.0.1`). **Mai** `MT5_BRIDGE_TOKEN` ne'
+  `DATABASE_URL`/`POSTGRES_PASSWORD` in chiaro in nessuno dei quattro log (grep negativo su tutti
+  i container).
+- Query diretta su Postgres: righe salvate con `canonical_symbol=EURUSD`,
+  `broker_symbol=EURUSD` (da `EURUSD_BROKER_SYMBOL`), `source=mt5` -- distinte dalle righe
+  `source=mock` di eventuali sync precedenti (stesso `canonical_symbol`, chiave univoca diversa
+  per `source`, nessun conflitto).
+- **Riavvio del solo market-data-worker** contro il fake bridge: `SIGTERM` gestito (`Ricevuto
+  segnale 15, arresto in corso...` poi `arrestato in modo pulito`), ripartenza dal checkpoint
+  reale; verificato `COUNT(*) = COUNT(DISTINCT (symbol_id, timeframe, open_time))` subito dopo,
+  nessuna riga duplicata.
+- **Nessuna porta pubblicata** per `mt5-bridge-fake` ne' per `postgres` (`docker port` vuoto per
+  entrambi).
+- **Regressione `MARKET_DATA_SOURCE=mock` verificata esplicitamente**: passato da `mt5` a `mock`
+  in `.env` e riavviato **senza** includere `docker-compose.research-mt5-fake.yml` -- solo 3
+  container (nessun `mt5-bridge-fake`), log tornati al formato di Fase 3 (nessuna riga
+  "mt5-bridge raggiungibile"), le candele `source=mt5` gia' salvate restano intatte insieme alle
+  nuove `source=mock`, `COUNT(*) = COUNT(DISTINCT ...)` ancora verificato su tutta la tabella.
+- Trade-sync worker (`worker`): log identici a Fase 1/3 in ogni combinazione provata, a conferma
+  che il lavoro di questa fase non lo tocca in alcun modo.
+- Dopo la verifica, container/rete/volume/immagini di test sono stati fermati e il volume
+  Postgres di test rimosso (conteneva solo dati sintetici generati durante la validazione):
+  nessuna risorsa lasciata in esecuzione.
+- **Non verificato** (richiede Windows Python sotto Wine + un terminale MT5 reale su una VPS
+  Ubuntu AMD64, non disponibile in questa sessione arm64): l'intero bridge reale
+  (`bridge/windows/mt5_bridge.py`) -- `initialize()`/`login()`/`symbol_select()` contro un
+  terminale vero, `copy_rates_from_pos`/`copy_rates_range` contro dati di mercato reali,
+  `last_error()` su un fallimento reale, comportamento di `shutdown()` in chiusura. Solo
+  `python -m py_compile` (sintassi) e un controllo statico sull'assenza di chiamate di trading
+  sono stati eseguiti su questo file.
+
+```bash
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+  -f docker-compose.research-mt5-fake.yml config                                   # OK
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+  -f docker-compose.research-mt5-fake.yml up -d --build                            # OK, 4 container healthy
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+  -f docker-compose.research-mt5-fake.yml restart market-data-worker               # OK, checkpoint ripreso, 0 duplicati
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
+  -f docker-compose.research-mt5-fake.yml down                                     # OK, volume Postgres sopravvive
+# .env: MARKET_DATA_SOURCE=mt5 -> mock
+docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d     # OK, nessun mt5-bridge-fake creato
 ```

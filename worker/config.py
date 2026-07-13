@@ -45,6 +45,15 @@ def _as_tuple(raw: Optional[str], default: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _as_float(raw: Optional[str], default: float) -> float:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Config:
     mock_mode: bool
@@ -63,6 +72,10 @@ class Config:
     market_timeframes: Tuple[str, ...] = field(default_factory=lambda: _DEFAULT_MARKET_TIMEFRAMES)
     market_data_poll_seconds: int = 60
     market_data_source: str = "mock"
+    mt5_bridge_url: Optional[str] = None
+    mt5_bridge_token: Optional[str] = None
+    mt5_bridge_timeout_seconds: float = 10.0
+    eurusd_broker_symbol: str = "EURUSD"
 
     def __post_init__(self) -> None:
         if self.app_mode not in _VALID_APP_MODES:
@@ -88,6 +101,15 @@ class Config:
                 raise ConfigError("ENABLE_MARKET_DATA=true richiede almeno un timeframe in MARKET_TIMEFRAMES.")
             if self.market_data_poll_seconds <= 0:
                 raise ConfigError("MARKET_DATA_POLL_SECONDS deve essere un intero positivo.")
+            if self.market_data_source == "mt5":
+                if not self.mt5_bridge_url:
+                    raise ConfigError("MARKET_DATA_SOURCE=mt5 richiede MT5_BRIDGE_URL non vuoto.")
+                if not self.mt5_bridge_token:
+                    raise ConfigError("MARKET_DATA_SOURCE=mt5 richiede MT5_BRIDGE_TOKEN non vuoto.")
+                if self.mt5_bridge_timeout_seconds <= 0:
+                    raise ConfigError("MT5_BRIDGE_TIMEOUT_SECONDS deve essere un numero positivo.")
+                if not self.eurusd_broker_symbol:
+                    raise ConfigError("EURUSD_BROKER_SYMBOL non puo' essere vuoto.")
 
     @property
     def has_api_target(self) -> bool:
@@ -119,4 +141,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         market_timeframes=_as_tuple(source.get("MARKET_TIMEFRAMES"), _DEFAULT_MARKET_TIMEFRAMES),
         market_data_poll_seconds=_as_int(source.get("MARKET_DATA_POLL_SECONDS"), 60),
         market_data_source=(get("MARKET_DATA_SOURCE") or "mock").strip().lower(),
+        mt5_bridge_url=get("MT5_BRIDGE_URL"),
+        mt5_bridge_token=get("MT5_BRIDGE_TOKEN"),
+        mt5_bridge_timeout_seconds=_as_float(source.get("MT5_BRIDGE_TIMEOUT_SECONDS"), 10.0),
+        eurusd_broker_symbol=get("EURUSD_BROKER_SYMBOL") or "EURUSD",
     )

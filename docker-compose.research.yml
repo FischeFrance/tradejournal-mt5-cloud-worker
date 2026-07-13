@@ -18,6 +18,11 @@
 # ispezionare il database da un client esterno (es. psql/DBeaver dalla VM), la scelta consigliata
 # resta comunque il bind esplicito a 127.0.0.1 (mai 0.0.0.0) e va documentata qui con la
 # motivazione tecnica, non aggiunta implicitamente.
+#
+# MARKET_DATA_SOURCE=mt5: per usare un bridge HTTP reale (o il fake bridge di test) al posto del
+# MockMarketDataSource in-process, aggiungere ANCHE docker-compose.research-mt5-fake.yml (test
+# locali, qualunque architettura) -- vedi quel file e README. Questo file da solo continua a
+# usare MARKET_DATA_SOURCE=mock per default, invariato.
 
 services:
   postgres:
@@ -57,6 +62,13 @@ services:
       MARKET_TIMEFRAMES: "${MARKET_TIMEFRAMES:-M1,M5,M15,H1,H4,D1}"
       MARKET_DATA_POLL_SECONDS: "${MARKET_DATA_POLL_SECONDS:-60}"
       MARKET_DATA_SOURCE: "${MARKET_DATA_SOURCE:-mock}"
+      # Rilevanti solo con MARKET_DATA_SOURCE=mt5 (vedi docker-compose.research-mt5-fake.yml, che
+      # sovrascrive MARKET_DATA_SOURCE/MT5_BRIDGE_URL di default quando incluso): vuoti qui, cosi'
+      # market-data-worker in modalita' mock (il default di questo file) non li usa mai.
+      MT5_BRIDGE_URL: "${MT5_BRIDGE_URL:-}"
+      MT5_BRIDGE_TOKEN: "${MT5_BRIDGE_TOKEN:-}"
+      MT5_BRIDGE_TIMEOUT_SECONDS: "${MT5_BRIDGE_TIMEOUT_SECONDS:-10}"
+      EURUSD_BROKER_SYMBOL: "${EURUSD_BROKER_SYMBOL:-EURUSD}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     depends_on:
       postgres:

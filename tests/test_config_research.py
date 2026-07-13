@@ -121,3 +121,68 @@ def test_market_data_source_accepts_mt5_value_but_not_arbitrary_strings():
     assert load_config({"MARKET_DATA_SOURCE": "mt5"}).market_data_source == "mt5"
     with pytest.raises(ConfigError, match="MARKET_DATA_SOURCE"):
         load_config({"MARKET_DATA_SOURCE": "bloomberg"})
+
+
+def _research_mt5_env(**overrides):
+    env = {
+        "APP_MODE": "research",
+        "ENABLE_MARKET_DATA": "true",
+        "DATABASE_URL": "postgresql://x",
+        "MARKET_DATA_SOURCE": "mt5",
+        "MT5_BRIDGE_URL": "http://mt5-bridge:8080",
+        "MT5_BRIDGE_TOKEN": "bridge-token",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_mt5_source_enabled_with_bridge_config_is_valid():
+    config = load_config(_research_mt5_env())
+    assert config.mt5_bridge_url == "http://mt5-bridge:8080"
+    assert config.mt5_bridge_token == "bridge-token"
+
+
+def test_mt5_source_enabled_without_bridge_url_raises():
+    with pytest.raises(ConfigError, match="MT5_BRIDGE_URL"):
+        load_config(_research_mt5_env(MT5_BRIDGE_URL=""))
+
+
+def test_mt5_source_enabled_without_bridge_token_raises():
+    with pytest.raises(ConfigError, match="MT5_BRIDGE_TOKEN"):
+        load_config(_research_mt5_env(MT5_BRIDGE_TOKEN=""))
+
+
+def test_mt5_source_enabled_with_non_positive_timeout_raises():
+    with pytest.raises(ConfigError, match="MT5_BRIDGE_TIMEOUT_SECONDS"):
+        load_config(_research_mt5_env(MT5_BRIDGE_TIMEOUT_SECONDS="0"))
+
+
+def test_mock_source_does_not_require_bridge_config():
+    # Nessuna regressione: MARKET_DATA_SOURCE=mock (il default) non deve mai richiedere
+    # MT5_BRIDGE_URL/TOKEN, nemmeno con ENABLE_MARKET_DATA=true.
+    config = load_config({
+        "APP_MODE": "research", "ENABLE_MARKET_DATA": "true", "DATABASE_URL": "postgresql://x",
+    })
+    assert config.market_data_source == "mock"
+
+
+def test_mt5_bridge_timeout_seconds_default_and_parsing():
+    assert load_config({}).mt5_bridge_timeout_seconds == 10.0
+    assert load_config({"MT5_BRIDGE_TIMEOUT_SECONDS": "2.5"}).mt5_bridge_timeout_seconds == 2.5
+
+
+def test_eurusd_broker_symbol_default_and_parsing():
+    assert load_config({}).eurusd_broker_symbol == "EURUSD"
+    assert load_config({"EURUSD_BROKER_SYMBOL": "EURUSD.a"}).eurusd_broker_symbol == "EURUSD.a"
+
+
+def test_config_never_reads_mt5_credentials_for_bridge_purposes():
+    """worker/config.py non deve MAI leggere MT5_LOGIN/MT5_PASSWORD/MT5_SERVER come parte della
+    configurazione del bridge: quelle credenziali appartengono esclusivamente al servizio bridge
+    (bridge/windows/mt5_bridge.py), mai al market-data-worker."""
+    config = load_config(_research_mt5_env(MT5_LOGIN="99999", MT5_PASSWORD="投資家", MT5_SERVER="Broker-Demo"))
+    # I campi esistono (ereditati dal trade-sync worker, invariati), ma nulla nella validazione
+    # o nel funzionamento della modalita' mt5 dipende da essi: il test chiave e' che
+    # Mt5MarketDataSource/build_market_data_source non li ricevano mai (vedi
+    # worker/market_data_main.py, che li ignora completamente per il ramo mt5).
+    assert config.mt5_login == "99999"  # letto per il trade-sync worker, non per il bridge

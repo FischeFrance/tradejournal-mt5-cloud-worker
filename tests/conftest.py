@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -9,6 +10,11 @@ import pytest
 
 WORKER_DIR = os.path.join(os.path.dirname(__file__), "..", "worker")
 sys.path.insert(0, os.path.abspath(WORKER_DIR))
+
+BRIDGE_DIR = os.path.join(os.path.dirname(__file__), "..", "bridge")
+BRIDGE_FAKE_DIR = os.path.join(BRIDGE_DIR, "fake")
+sys.path.insert(0, os.path.abspath(BRIDGE_DIR))
+sys.path.insert(0, os.path.abspath(BRIDGE_FAKE_DIR))
 
 
 def _wait_for_postgres_ready(database_url: str, timeout_seconds: float = 30.0) -> None:
@@ -106,3 +112,32 @@ def market_data_store(postgres_database_url):
     store.connect()
     yield store
     store.close()
+
+
+FAKE_BRIDGE_TEST_TOKEN = "test-bridge-token-not-a-secret"
+
+
+@pytest.fixture
+def fake_bridge_server():
+    """Avvia bridge/fake/fake_bridge.py in-process su un thread proprio, bind 127.0.0.1 con
+    porta assegnata dal sistema operativo: un vero server HTTP (socket reali, nessun mock di
+    `requests` o dell'HTTP stesso), usato sia per testare direttamente il contratto del fake
+    bridge sia per testare Mt5MarketDataSource contro un bridge realmente in ascolto.
+
+    Restituisce (base_url, token). Bind solo su loopback: nessuna esposizione di rete reale,
+    anche solo per la durata del test."""
+    import fake_bridge
+
+    config = fake_bridge.BridgeConfig(
+        token=FAKE_BRIDGE_TEST_TOKEN, broker_symbol="EURUSD", port=0, host="127.0.0.1"
+    )
+    server = fake_bridge.make_server(config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        yield f"http://127.0.0.1:{port}", FAKE_BRIDGE_TEST_TOKEN
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

@@ -57,3 +57,36 @@ def test_run_does_not_log_database_url_on_failed_startup(capsys):
     captured = capsys.readouterr()
     assert "supersecretpassword" not in captured.out
     assert "supersecretpassword" not in captured.err
+
+
+def test_run_returns_error_code_with_mt5_source_without_bridge_config(capsys):
+    # ENABLE_MARKET_DATA=true + MARKET_DATA_SOURCE=mt5 senza MT5_BRIDGE_URL/TOKEN: load_config()
+    # deve sollevare ConfigError prima ancora di provare a connettersi a Postgres o al bridge.
+    exit_code = run(env={
+        "APP_MODE": "research",
+        "ENABLE_MARKET_DATA": "true",
+        "DATABASE_URL": "postgresql://x",
+        "MARKET_DATA_SOURCE": "mt5",
+    })
+    assert exit_code == 1
+
+
+def test_run_does_not_log_mt5_bridge_token_on_failed_startup(capsys):
+    # Stesso principio del test precedente su DATABASE_URL, applicato a MT5_BRIDGE_TOKEN: la
+    # connessione a Postgres fallisce subito (porta 1 chiusa), MA anche se non arrivasse mai a
+    # usare il bridge in questo run, il token non deve mai comparire nell'startup log iniziale
+    # (che include gia' market_data_source/mt5_bridge_url, mai il token).
+    run(
+        env={
+            "APP_MODE": "research",
+            "ENABLE_MARKET_DATA": "true",
+            "DATABASE_URL": "postgresql://research_user:pass@127.0.0.1:1/db",
+            "MARKET_DATA_SOURCE": "mt5",
+            "MT5_BRIDGE_URL": "http://mt5-bridge:8080",
+            "MT5_BRIDGE_TOKEN": "super-secret-bridge-token",
+        },
+        connect_max_retries=1,
+    )
+    captured = capsys.readouterr()
+    assert "super-secret-bridge-token" not in captured.out
+    assert "super-secret-bridge-token" not in captured.err
