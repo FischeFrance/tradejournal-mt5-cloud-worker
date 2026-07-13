@@ -15,6 +15,7 @@ from typing import Mapping, Optional, Tuple
 
 _VALID_APP_MODES = ("client", "research")
 _VALID_MARKET_DATA_SOURCES = ("mock", "mt5")
+_VALID_MT5_CLIENT_SOURCES = ("mock", "bridge", "direct")
 _DEFAULT_MARKET_SYMBOLS = ("EURUSD",)
 _DEFAULT_MARKET_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4", "D1")
 
@@ -37,6 +38,15 @@ def _as_int(raw: Optional[str], default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
+
+
+def _as_strict_int(raw: Optional[str], default: int, name: str) -> int:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} deve essere un intero.") from exc
 
 
 def _as_tuple(raw: Optional[str], default: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -76,6 +86,8 @@ class Config:
     mt5_bridge_token: Optional[str] = None
     mt5_bridge_timeout_seconds: float = 10.0
     eurusd_broker_symbol: str = "EURUSD"
+    mt5_client_source: str = "mock"
+    mt5_deal_lookback_hours: int = 24
 
     def __post_init__(self) -> None:
         if self.app_mode not in _VALID_APP_MODES:
@@ -87,6 +99,27 @@ class Config:
                 f"MARKET_DATA_SOURCE non valido: '{self.market_data_source}'. "
                 f"Valori ammessi: {list(_VALID_MARKET_DATA_SOURCES)}."
             )
+        if self.mt5_client_source not in _VALID_MT5_CLIENT_SOURCES:
+            raise ConfigError(
+                f"MT5_CLIENT_SOURCE non valido: '{self.mt5_client_source}'. "
+                f"Valori ammessi: {list(_VALID_MT5_CLIENT_SOURCES)}."
+            )
+        if self.mt5_client_source == "bridge":
+            if not self.mt5_bridge_url:
+                raise ConfigError("MT5_CLIENT_SOURCE=bridge richiede MT5_BRIDGE_URL non vuoto.")
+            if not self.mt5_bridge_token:
+                raise ConfigError("MT5_CLIENT_SOURCE=bridge richiede MT5_BRIDGE_TOKEN non vuoto.")
+            if self.mt5_bridge_timeout_seconds <= 0:
+                raise ConfigError("MT5_BRIDGE_TIMEOUT_SECONDS deve essere un numero positivo.")
+            if not 1 <= self.mt5_deal_lookback_hours <= 168:
+                raise ConfigError("MT5_DEAL_LOOKBACK_HOURS deve essere compreso tra 1 e 168.")
+            if (
+                self.tradejournal_bridge_token
+                and self.mt5_bridge_token == self.tradejournal_bridge_token
+            ):
+                raise ConfigError(
+                    "MT5_BRIDGE_TOKEN e TRADEJOURNAL_BRIDGE_TOKEN devono essere distinti."
+                )
         if self.enable_market_data and self.app_mode != "research":
             raise ConfigError(
                 "ENABLE_MARKET_DATA=true richiede APP_MODE=research (installazioni client non "
@@ -124,8 +157,14 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         value = source.get(name)
         return value if value not in (None, "") else None
 
+    mock_mode = _as_bool(source.get("MOCK_MODE"), True)
+    # MOCK_MODE resta l'alias retrocompatibile quando MT5_CLIENT_SOURCE non e' impostato. Il
+    # nuovo runtime raccomandato con MOCK_MODE=false e' il bridge HTTP; il client MetaTrader5
+    # diretto resta disponibile soltanto scegliendo esplicitamente "direct".
+    mt5_client_source = (get("MT5_CLIENT_SOURCE") or ("mock" if mock_mode else "bridge")).strip().lower()
+
     return Config(
-        mock_mode=_as_bool(source.get("MOCK_MODE"), True),
+        mock_mode=mock_mode,
         dry_run=_as_bool(source.get("DRY_RUN"), True),
         mt5_login=get("MT5_LOGIN"),
         mt5_password=get("MT5_PASSWORD"),
@@ -145,4 +184,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         mt5_bridge_token=get("MT5_BRIDGE_TOKEN"),
         mt5_bridge_timeout_seconds=_as_float(source.get("MT5_BRIDGE_TIMEOUT_SECONDS"), 10.0),
         eurusd_broker_symbol=get("EURUSD_BROKER_SYMBOL") or "EURUSD",
+        mt5_client_source=mt5_client_source,
+        mt5_deal_lookback_hours=_as_strict_int(
+            source.get("MT5_DEAL_LOOKBACK_HOURS"), 24, "MT5_DEAL_LOOKBACK_HOURS"
+        ),
     )

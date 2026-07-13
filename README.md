@@ -20,6 +20,9 @@ Stato attuale:
   OHLC e le salva su un Postgres locale, dietro `APP_MODE=research` + `ENABLE_MARKET_DATA=true`
   (disattiva per default, isolata dal trade-sync worker). Sorgente dati **solo mock** in questa
   fase (nessuna dipendenza da Wine/MT5): vedi "Modalita' research (dati di mercato)" piu' sotto.
+- **Trade-sync via bridge HTTP:** il worker Linux usa `GET /health` e una sola
+  `POST /v1/trading/snapshot` per poll. Il fake deterministico e il compose locale girano anche
+  su ARM64; il bridge Windows reale resta predisposto ma non validato su VPS AMD64.
 
 Nessun deploy, nessuna risorsa cloud, nessuna credenziale reale sono stati usati per costruire
 questo POC.
@@ -84,11 +87,10 @@ processi indipendenti: non condividono loop, non si importano a vicenda, girano 
 Docker separati (vedi "Modalita' research" piu' sotto). Condividono solo `config.py` (lettura
 env var) perche' entrambi leggono variabili d'ambiente, non perche' dipendano l'uno dall'altro.
 
-`mt5_client.py` e `mock_mt5_client.py` implementano la stessa interfaccia (`account_info`,
-`get_open_positions`, `get_recent_deals`, `get_pending_orders`, `reconnect`, `health_status`):
-`main.py` sceglie l'uno o l'altro in base a `MOCK_MODE`, senza altre modifiche. L'interfaccia
-astratta (`Mt5Client`, classe base in `mt5_client.py`) non e' mai stata toccata nell'implementare
-`RealMt5Client`: e' il punto di innesto stabile tra mock e reale.
+`MockMt5Client`, `BridgeMt5Client` e `RealMt5Client` implementano la stessa interfaccia
+`Mt5Client`. `main.py` seleziona `mock|bridge|direct` tramite `MT5_CLIENT_SOURCE`, mantenendo la
+derivazione retrocompatibile da `MOCK_MODE` quando la nuova variabile non e' impostata. Il client
+bridge usa un solo snapshot HTTP coerente per poll; quello direct resta il percorso legacy.
 
 `RealMt5Client` (in `mt5_client.py`) implementa tutti e sei i metodi richiesti (`account_info`,
 `get_open_positions`, `get_recent_deals`, `get_pending_orders`, `reconnect`, `health_status`),
@@ -98,6 +100,157 @@ chiaro (sempre mascherati via `event_sender.mask_value`). Resta pero' **non test
 end-to-end** senza un terminale MT5 reale: vedi "Fase 2: MT5 reale + Wine" per cosa e' stato
 effettivamente validato (mapping dei campi e retry, con un modulo `MetaTrader5` finto iniettato
 nei test) e cosa no (la connessione IPC reale al terminale).
+
+## Trade-sync tramite mt5-bridge HTTP
+
+Il percorso raccomandato con un terminale reale separa nettamente Windows/Wine dal worker
+applicativo Linux:
+
+```text
+MetaTrader 5 + Windows Python (stesso WINEPREFIX)
+  -> mt5-bridge: GET /health, POST /v1/trading/snapshot
+  -> trade-sync worker Linux: diff, normalizzazione, event_id, retry ingestion
+  -> TradeJournal ingestion API
+```
+
+Il worker Linux non contiene credenziali MT5 e non importa mai `MetaTrader5`: conosce soltanto
+`MT5_BRIDGE_URL` e `MT5_BRIDGE_TOKEN`. Login, server, password investor e percorso del terminale
+vivono esclusivamente nel processo bridge Windows. `MT5_BRIDGE_TOKEN` autentica worker -> bridge;
+`TRADEJOURNAL_BRIDGE_TOKEN` autentica worker -> app e deve essere un valore differente.
+
+`MT5_CLIENT_SOURCE` accetta `mock`, `bridge` o `direct`. `MOCK_MODE` resta accettato come alias
+di configurazione: se la nuova variabile non e' impostata, `true` seleziona `mock` e `false`
+seleziona il nuovo default `bridge`. Il valore esplicito e' autorevole. `direct` conserva il
+client legacy predisposto, ma il runtime raccomandato con MT5 reale e' `bridge`.
+
+### Contratto `POST /v1/trading/snapshot`
+
+La richiesta richiede `Authorization: Bearer <MT5_BRIDGE_TOKEN>` e un body JSON facoltativo:
+
+```json
+{"deal_lookback_hours": 24}
+```
+
+Il valore deve essere un intero positivo; il default e' 24 ore, valori oltre 168 vengono
+limitati a 168 e valori booleani/non interi/non positivi producono `422
+invalid_deal_lookback_hours`. La risposta completa ha questa forma:
+
+```json
+{
+  "account": {
+    "login": "123456",
+    "server": "Broker-Demo",
+    "balance": 10000.0,
+    "equity": 10010.0,
+    "currency": "EUR",
+    "leverage": 100
+  },
+  "positions": [{
+    "ticket": "10001", "symbol": "EURUSD", "direction": "buy", "volume": 0.1,
+    "open_price": 1.17, "stop_loss": 1.168, "take_profit": 1.174,
+    "open_time": "2026-07-13T10:00:00Z"
+  }],
+  "orders": [{
+    "ticket": "20001", "symbol": "EURUSD", "direction": "buy", "volume": 0.1,
+    "price": 1.168, "stop_loss": 1.166, "take_profit": 1.172, "order_type": 2
+  }],
+  "deals": [{
+    "deal_ticket": "30001", "position_ticket": "10001", "close_price": 1.172,
+    "profit": 20.0, "commission": -0.5, "swap": 0.0,
+    "close_time": "2026-07-13T10:15:00Z"
+  }],
+  "generated_at": "2026-07-13T10:15:01Z"
+}
+```
+
+Ticket e login sono sempre stringhe; timestamp sempre UTC; `positions`, `orders` e `deals` sono
+sempre array, anche se vuoti. Gli ordini MT5 di tipo 0/2/4/6 sono mappati `buy`, 1/3/5/7
+`sell`; nei deal entrano soltanto uscite `DEAL_ENTRY_OUT`/`DEAL_ENTRY_OUT_BY`. La risposta non
+contiene password. Errori di auth/validazione/MT5 usano l'envelope strutturato
+`{"error":{"code":"...","message":"..."}}`. Non esiste alcun endpoint di apertura,
+modifica, cancellazione o chiusura ordini.
+
+`BridgeMt5Client.snapshot()` effettua una sola richiesta per poll, valida l'intero payload e
+converte gli array in dizionari indicizzati per ticket, come richiesto da `event_detector.py`.
+L'account dello stesso payload viene memorizzato; la successiva `account_info()` non effettua una
+seconda richiesta. Timeout/errori rete/5xx hanno retry limitato; 401, 403, 404 e 422 non vengono
+ritentati.
+
+### Test manuale locale: fake bridge -> app locale
+
+Il compose dedicato contiene soltanto `mt5-bridge-fake` e `trade-sync-worker`: nessun Postgres,
+nessun market-data-worker e nessuna porta pubblicata. Il worker usa un volume nominato per
+`/app/data/snapshot.json`; non rimuoverlo durante un normale riavvio.
+
+```bash
+cp .env.example .env
+
+# .env: usare l'IP LAN del Mac su cui ascolta l'app, per esempio da `ipconfig getifaddr en0`.
+MT5_BRIDGE_TOKEN=<token-locale-privato>
+TRADEJOURNAL_BRIDGE_TOKEN=<token-ingestion-diverso>
+TRADEJOURNAL_API_URL=http://<IP-MAC>:3000/api/mt5-events
+DRY_RUN=false
+POLL_INTERVAL_SECONDS=5
+
+docker compose -f docker-compose.trade-sync-fake.yml config
+docker compose -f docker-compose.trade-sync-fake.yml up -d --build
+docker compose -f docker-compose.trade-sync-fake.yml ps
+docker compose -f docker-compose.trade-sync-fake.yml logs -f trade-sync-worker
+```
+
+L'app deve ascoltare su un'interfaccia raggiungibile dalla VM Docker e il firewall del Mac deve
+consentire la sola rete locale necessaria. Nei log devono comparire, una volta ciascuno e in
+ordine: `trade_opened`, modifica SL, modifica TP, `trade_closed`, pending create/modify/cancel.
+Verifiche operative:
+
+```bash
+# La colonna PORTS puo' mostrare solo `8080/tcp`, mai `0.0.0.0:...`/`127.0.0.1:...`:
+# e' metadato interno dell'immagine, non una pubblicazione sull'host.
+docker compose -f docker-compose.trade-sync-fake.yml ps
+
+# Verifica inequivocabile: atteso {"8080/tcp":null}.
+docker inspect $(docker compose -f docker-compose.trade-sync-fake.yml ps -q mt5-bridge-fake) \
+  --format '{{json .NetworkSettings.Ports}}'
+
+# Il fake resta allo stato corrente; il volume consente al worker di ripartire senza duplicare.
+docker compose -f docker-compose.trade-sync-fake.yml restart trade-sync-worker
+docker compose -f docker-compose.trade-sync-fake.yml logs --since=2m trade-sync-worker
+
+# Arresto normale: conserva trade-sync-snapshot.
+docker compose -f docker-compose.trade-sync-fake.yml down
+```
+
+`down -v` e' un reset distruttivo riservato a un nuovo test deliberato. Ricreare anche il fake
+riporta la sua macchina a stati all'inizio; non equivale a un normale restart del solo worker.
+Al primissimo avvio, se il bridge reale riporta una posizione gia' aperta e non esiste uno
+snapshot persistito, il worker emette `trade_opened`: lo snapshot iniziale vuoto rappresenta
+"mai osservato", non "ignora lo stato corrente". I successivi riavvii usano il file persistito.
+
+### Successivo test su VPS Ubuntu AMD64
+
+Questo test resta obbligatorio prima di dichiarare funzionante il runtime reale:
+
+1. usare Ubuntu AMD64 e un account demo con password investor, mai un account live;
+2. installare terminale MT5 e Python Windows nello stesso `WINEPREFIX` e installare
+   `bridge/windows/requirements.txt` con quel Python Windows;
+3. avviare `bridge/windows/mt5_bridge.py` nello stesso prefix, con credenziali MT5 e
+   `MT5_BRIDGE_TOKEN` nell'ambiente del solo bridge; non esporre la porta 8080 su Internet;
+4. verificare da una rete privata `GET /health`, auth 401 con token errato e uno snapshot con
+   ticket stringa/timestamp UTC/array vuoti; confrontare account, posizioni, pending e deal con
+   il terminale;
+5. avviare il worker Linux con `MT5_CLIENT_SOURCE=bridge`, URL privato del bridge, token bridge,
+   token ingestion distinto e inizialmente `DRY_RUN=true`; verificare una sola POST snapshot per
+   poll e nessuna credenziale/token nei log;
+6. con un account demo aprire/modificare/chiudere una posizione e creare/modificare/cancellare un
+   pending; solo dopo il dry-run impostare `DRY_RUN=false` verso un'API DEV;
+7. riavviare soltanto il worker e verificare volume snapshot, event_id stabili, zero eventi
+   duplicati e comportamento corretto dopo disconnessione/riconnessione.
+
+Il bridge reale e' quindi **prepared but unvalidated** fino al completamento di questa checklist.
+Una chiusura parziale non e' rappresentata correttamente dal contratto attuale: il detector non
+tratta ancora una riduzione di volume come chiusura parziale e questa fase non ne amplia il
+contratto. Nell'app corrente `trade_opened` crea una notifica dedicata; modifica e chiusura
+aggiornano il trade importato senza creare necessariamente una nuova notifica.
 
 ## Test locale in modalita' mock (senza Docker)
 
@@ -421,6 +574,7 @@ Wine su una VPS AMD64, non disponibile in questa sessione di sviluppo arm64).
 
 | Variabile | Default | Note |
 |---|---|---|
+| `MT5_CLIENT_SOURCE` | derivato da `MOCK_MODE` | trade-sync: `mock`, `bridge` (raccomandato con MT5 reale) o `direct` legacy |
 | `APP_MODE` | `client` | `client` o `research`, nessun altro valore |
 | `ENABLE_MARKET_DATA` | `false` | richiede `APP_MODE=research` |
 | `DATABASE_URL` | *(vuoto)* | richiesto se `ENABLE_MARKET_DATA=true`; con Docker Compose e' costruita automaticamente dal servizio `market-data-worker`, non va impostata a mano |
@@ -428,15 +582,17 @@ Wine su una VPS AMD64, non disponibile in questa sessione di sviluppo arm64).
 | `MARKET_TIMEFRAMES` | `M1,M5,M15,H1,H4,D1` | lista separata da virgola |
 | `MARKET_DATA_POLL_SECONDS` | `60` | indipendente da `POLL_INTERVAL_SECONDS` (solo trade-sync) |
 | `MARKET_DATA_SOURCE` | `mock` | `mock` (in-process) o `mt5` (client HTTP verso mt5-bridge, vedi sotto) |
-| `MT5_BRIDGE_URL` | *(vuoto)* | richiesto se `MARKET_DATA_SOURCE=mt5`; es. `http://mt5-bridge-fake:8080` |
-| `MT5_BRIDGE_TOKEN` | *(vuoto)* | richiesto se `MARKET_DATA_SOURCE=mt5`; stesso valore su market-data-worker e sul bridge |
+| `MT5_BRIDGE_URL` | *(vuoto)* | richiesto se `MT5_CLIENT_SOURCE=bridge` o `MARKET_DATA_SOURCE=mt5`; es. `http://mt5-bridge-fake:8080` |
+| `MT5_BRIDGE_TOKEN` | *(vuoto)* | richiesto per i client bridge; stesso valore sul worker e sul bridge, distinto dal token ingestion |
 | `MT5_BRIDGE_TIMEOUT_SECONDS` | `10` | timeout per singola richiesta HTTP al bridge |
+| `MT5_DEAL_LOOKBACK_HOURS` | `24` | trade-sync snapshot; intero 1..168 |
 | `EURUSD_BROKER_SYMBOL` | `EURUSD` | simbolo con cui il bridge interroga MT5 (puo' differire dal canonico, es. `EURUSD.a`) |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
 
-`MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` / `MT5_TERMINAL_PATH` (vedi `.env.example`) **non**
-sono lette da `worker/config.py`: appartengono esclusivamente al servizio `mt5-bridge` reale
-(`bridge/windows/mt5_bridge.py`), mai al market-data-worker.
+Con `MT5_CLIENT_SOURCE=bridge`, `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` /
+`MT5_TERMINAL_PATH` (vedi `.env.example`) appartengono esclusivamente al servizio
+`mt5-bridge` reale (`bridge/windows/mt5_bridge.py`), mai ai worker Linux. Soltanto il percorso
+legacy `direct` legge le prime tre nel trade-sync worker.
 
 ### Due sorgenti dati: mock (in-process) e mt5 (bridge HTTP)
 
@@ -476,7 +632,7 @@ Tre pezzi, stesso contratto HTTP (vedi `bridge/common.py`):
 
 ### Contratto API
 
-Autenticazione Bearer (`MT5_BRIDGE_TOKEN`) su **entrambi** gli endpoint. JSON UTF-8. Nessun
+Autenticazione Bearer (`MT5_BRIDGE_TOKEN`) su **tutti** gli endpoint. JSON UTF-8. Nessun
 endpoint di trading esiste (ne' `/v1/order_send` ne' equivalenti): il bridge e' di sola lettura.
 
 ```
@@ -494,6 +650,11 @@ POST /v1/candles
   -> 401 {"error": {"code": "unauthorized", "message": "..."}}          token mancante/errato
   -> 422 {"error": {"code": "unsupported_symbol"|"unsupported_timeframe"|..., "message": "..."}}
   -> 502 {"error": {"code": "mt5_error", "message": "..."}}             terminale MT5 non risponde
+
+POST /v1/trading/snapshot
+  <- {"deal_lookback_hours": 24}
+  -> 200 {"account": {...}, "positions": [...], "orders": [...], "deals": [...],
+          "generated_at": "2026-07-13T10:15:01Z"}
 ```
 
 Regole applicate dal bridge (fake e reale, stesso `bridge/common.py`): solo `EURUSD`/il broker
@@ -540,7 +701,8 @@ client di produzione non lo invia mai.
 
 `bridge/windows/mt5_bridge.py` implementa lo stesso contratto usando il pacchetto `MetaTrader5`
 reale: `initialize()` con `MT5_TERMINAL_PATH`, `login()` con `MT5_LOGIN`/`MT5_PASSWORD`/
-`MT5_SERVER`, `symbol_select()` sul broker symbol, lettura candele via `copy_rates_from_pos`
+`MT5_SERVER`, snapshot read-only via `account_info()`/`positions_get()`/`orders_get()`/
+`history_deals_get()`, `symbol_select()` sul broker symbol, lettura candele via `copy_rates_from_pos`
 (quando `since` e' assente: le candele piu' recenti disponibili, **non** l'intero storico --
 MT5 non ha un'epoca sintetica fissa come il mock/fake) o `copy_rates_range` (quando `since` e'
 presente), esclusione esplicita della candela in formazione, `last_error()` in caso di
@@ -569,7 +731,7 @@ repository dichiara o simula il contrario.
 
 **Investor password, sempre**: `MT5_PASSWORD` deve essere la password INVESTOR (sola lettura)
 dell'account, mai quella di trading -- stesso principio gia' vale ovunque in questo repository
-(vedi anche `.env.example`). Il bridge legge solo `account_info`/candele storiche: non ha ne'
+(vedi anche `.env.example`). Il bridge legge solo account/snapshot/candele storiche: non ha ne'
 bisogno ne' possibilita' di operare sull'account (nessun endpoint di trading esiste nel
 contratto HTTP).
 
@@ -990,3 +1152,24 @@ docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
 # .env: MARKET_DATA_SOURCE=mt5 -> mock
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml up -d     # OK, nessun mt5-bridge-fake creato
 ```
+
+### Fase 5 (trade-sync tramite snapshot HTTP)
+
+Verifica eseguita localmente su Docker arm64 con soli dati e token throwaway:
+
+- `python -m pytest`: **231 test, tutti verdi** (160 preesistenti + 71 nuovi per contratto
+  snapshot, mapping Windows read-only, client/config/checkpoint, scenario fake, Compose ed E2E
+  socket reale fino a una ingestion HTTP finta); unico warning locale `urllib3`/LibreSSL;
+- `docker compose -f docker-compose.trade-sync-fake.yml config`: OK; grafo limitato ai due
+  servizi previsti e nessuna porta pubblicata;
+- `up -d --build --wait`: fake bridge e worker entrambi `healthy`; osservati esattamente i sette
+  eventi nell'ordine previsto;
+- restart del solo `trade-sync-worker`: snapshot persistito nel volume e conteggio eventi
+  invariato a 7, quindi nessun duplicato;
+- `docker inspect` sul fake bridge: `{"8080/tcp":null}`; token bridge e ingestion assenti dai
+  log; nessuna chiamata o endpoint di trading trovati dai controlli statici/socket;
+- container, rete e volume throwaway rimossi al termine. Le immagini locali costruite possono
+  essere riusate per un test successivo.
+
+Il bridge Windows reale resta **prepared but unvalidated** fino al test su VPS Ubuntu AMD64 con
+Python Windows e terminale MT5 nello stesso `WINEPREFIX`.

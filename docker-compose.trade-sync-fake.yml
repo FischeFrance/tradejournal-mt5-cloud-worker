@@ -1,0 +1,91 @@
+# Compose dedicato al solo flusso trade-sync HTTP locale:
+#
+#   mt5-bridge-fake -> trade-sync-worker -> TradeJournal ingestion API
+#
+# Non include market-data-worker o Postgres. Il bridge non pubblica porte verso l'host: e'
+# raggiungibile esclusivamente dal worker sulla rete Docker interna. Il target `mock` del
+# Dockerfile e' intenzionale: fornisce il runtime Python Linux leggero, mentre
+# MT5_CLIENT_SOURCE=bridge seleziona il client HTTP e MOCK_MODE=false abilita la persistenza
+# dello snapshot. Nessun pacchetto MetaTrader5 viene installato o importato nel container Linux.
+#
+# Prima dell'avvio impostare in .env due token DIVERSI e la destinazione dell'app locale:
+#   MT5_BRIDGE_TOKEN=<token privato worker -> bridge>
+#   TRADEJOURNAL_BRIDGE_TOKEN=<token ingestion app, diverso dal precedente>
+#   TRADEJOURNAL_API_URL=http://<IP-MAC>:3000/api/mt5-events
+# Per inviare davvero gli eventi impostare anche DRY_RUN=false (il default sicuro e' true).
+
+services:
+  mt5-bridge-fake:
+    build:
+      context: .
+      dockerfile: bridge/fake/Dockerfile
+      target: mt5-bridge-fake
+    image: tradejournal-mt5-bridge:fake
+    environment:
+      MT5_BRIDGE_TOKEN: "${MT5_BRIDGE_TOKEN:?MT5_BRIDGE_TOKEN e' obbligatorio per il fake bridge}"
+      EURUSD_BROKER_SYMBOL: "${EURUSD_BROKER_SYMBOL:-EURUSD}"
+      PORT: "8080"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "bridge/fake/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    mem_limit: 128m
+    cpus: 0.25
+
+  trade-sync-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: mock
+    image: tradejournal-mt5-cloud-worker:trade-sync-bridge
+    environment:
+      # `mock` qui e' soltanto il nome storico dello stage immagine leggero. Il client usato dal
+      # processo e' quello HTTP verso il bridge; il client MetaTrader5 diretto non viene usato.
+      MOCK_MODE: "false"
+      MT5_CLIENT_SOURCE: "bridge"
+      MT5_BRIDGE_URL: "${MT5_BRIDGE_URL:-http://mt5-bridge-fake:8080}"
+      MT5_BRIDGE_TOKEN: "${MT5_BRIDGE_TOKEN:?MT5_BRIDGE_TOKEN e' obbligatorio per il trade-sync worker}"
+      MT5_BRIDGE_TIMEOUT_SECONDS: "${MT5_BRIDGE_TIMEOUT_SECONDS:-10}"
+      MT5_DEAL_LOOKBACK_HOURS: "${MT5_DEAL_LOOKBACK_HOURS:-24}"
+      TRADEJOURNAL_API_URL: "${TRADEJOURNAL_API_URL:?TRADEJOURNAL_API_URL e' obbligatorio; usare l'endpoint locale dell'app}"
+      TRADEJOURNAL_BRIDGE_TOKEN: "${TRADEJOURNAL_BRIDGE_TOKEN:?TRADEJOURNAL_BRIDGE_TOKEN e' obbligatorio e deve essere diverso da MT5_BRIDGE_TOKEN}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      DRY_RUN: "${DRY_RUN:-true}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    depends_on:
+      mt5-bridge-fake:
+        condition: service_healthy
+    volumes:
+      # Non rimuovere durante un normale restart: contiene /app/data/snapshot.json, necessario
+      # per non rigenerare eventi gia' osservati dopo il riavvio del worker.
+      - trade-sync-snapshot:/app/data
+    tmpfs:
+      # main.py aggiorna qui il file heartbeat usato dall'healthcheck.
+      - /tmp:rw,noexec,nosuid,size=16m
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/docker/healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    mem_limit: 256m
+    cpus: 0.50
+
+volumes:
+  trade-sync-snapshot:

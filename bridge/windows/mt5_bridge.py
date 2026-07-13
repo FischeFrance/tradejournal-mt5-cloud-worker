@@ -9,8 +9,8 @@ container Wine, se il processo Python che lo importa non e' anch'esso Windows --
 gia' documentato in worker/mt5_client.py:RealMt5Client per il trade-sync worker).
 
 Implementa lo stesso contratto HTTP di bridge/fake/fake_bridge.py (vedi bridge/common.py):
-GET /health, POST /v1/candles. Nessun endpoint di trading e nessuna chiamata a order_send in
-questo file, deliberatamente: questo servizio e' di sola lettura (account_info/candele storiche).
+GET /health, POST /v1/candles e POST /v1/trading/snapshot. Nessun endpoint di trading e nessuna
+chiamata a order_send in questo file, deliberatamente: questo servizio e' di sola lettura.
 
 Credenziali (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_TERMINAL_PATH) lette solo da qui, mai dal
 market-data-worker Linux (vedi worker/config.py, che non le legge affatto) e mai stampate: solo
@@ -27,8 +27,9 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from typing import Any, Callable, Optional, TypeVar
@@ -59,6 +60,16 @@ _TIMEFRAME_MT5_CONSTANT_NAMES = {
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+
+
+def _epoch_to_utc_z(epoch_seconds: Any) -> str:
+    return format_iso_utc(datetime.fromtimestamp(int(epoch_seconds), tz=timezone.utc))
+
+
+def _order_direction(order_type: Any) -> str:
+    # Enum MT5: BUY/BUY_LIMIT/BUY_STOP/BUY_STOP_LIMIT = 0/2/4/6; i corrispondenti SELL sono
+    # 1/3/5/7. Tenere il mapping esplicito rende evidente che non si sta eseguendo alcuna azione.
+    return "buy" if int(order_type) in {0, 2, 4, 6} else "sell"
 
 
 def _mask(value: Optional[str]) -> str:
@@ -102,6 +113,10 @@ class _Mt5Session:
         self._sleep = sleep_fn
         self._mt5 = None
         self._connected = False
+        # MetaTrader5 condivide una singola sessione IPC. ThreadingHTTPServer puo' servire
+        # /candles, /health e /trading/snapshot in parallelo: serializziamo ogni operazione MT5
+        # completa, in particolare le quattro letture che compongono uno snapshot.
+        self._operation_lock = threading.RLock()
 
     def _import_mt5(self):
         try:
@@ -152,6 +167,10 @@ class _Mt5Session:
         )
 
     def health(self) -> dict:
+        with self._operation_lock:
+            return self._health_unlocked()
+
+    def _health_unlocked(self) -> dict:
         if not self._connected or self._mt5 is None:
             return {
                 "status": "degraded",
@@ -174,6 +193,17 @@ class _Mt5Session:
         }
 
     def get_candles(self, broker_symbol: str, timeframe: str, since: Optional[datetime], now: datetime, limit: int) -> list:
+        with self._operation_lock:
+            return self._get_candles_unlocked(broker_symbol, timeframe, since, now, limit)
+
+    def _get_candles_unlocked(
+        self,
+        broker_symbol: str,
+        timeframe: str,
+        since: Optional[datetime],
+        now: datetime,
+        limit: int,
+    ) -> list:
         """Legge candele storiche reali. Usa copy_rates_from_pos quando 'since' e' assente (le
         `limit` candele piu' recenti disponibili -- NON l'intero storico dall'inizio: a
         differenza del mock/fake bridge, MT5 non ha un'epoca sintetica fissa nota a priori, vedi
@@ -222,13 +252,115 @@ class _Mt5Session:
         candles.sort(key=lambda c: c["open_time"])
         return candles[:limit]
 
+    def get_trading_snapshot(self, deal_lookback_hours: int) -> dict:
+        with self._operation_lock:
+            return self._get_trading_snapshot_unlocked(deal_lookback_hours)
+
+    def _get_trading_snapshot_unlocked(self, deal_lookback_hours: int) -> dict:
+        """Legge account, posizioni, ordini e deal di uscita usando esclusivamente API MT5
+        read-only. Ogni ``None`` del package viene trasformato in un BridgeError strutturato dopo
+        i retry limitati di ``_call_with_retry``.
+        """
+        if not self._connected or self._mt5 is None:
+            raise BridgeError(503, "mt5_not_connected", "mt5-bridge non e' connesso al terminale MT5.")
+
+        mt5 = self._mt5
+
+        def _fetch_account() -> dict:
+            info = mt5.account_info()
+            if info is None:
+                raise RuntimeError(f"account_info() fallito: {mt5.last_error()}")
+            return {
+                "login": str(info.login),
+                "server": str(info.server),
+                "balance": float(info.balance),
+                "equity": float(info.equity),
+                "currency": str(info.currency),
+                "leverage": int(info.leverage),
+            }
+
+        def _fetch_positions() -> list:
+            positions = mt5.positions_get()
+            if positions is None:
+                raise RuntimeError(f"positions_get() fallito: {mt5.last_error()}")
+            return [
+                {
+                    "ticket": str(position.ticket),
+                    "symbol": str(position.symbol),
+                    "direction": "buy" if int(position.type) == 0 else "sell",
+                    "volume": float(position.volume),
+                    "open_price": float(position.price_open),
+                    "stop_loss": float(position.sl),
+                    "take_profit": float(position.tp),
+                    "open_time": _epoch_to_utc_z(position.time),
+                }
+                for position in positions
+            ]
+
+        def _fetch_orders() -> list:
+            orders = mt5.orders_get()
+            if orders is None:
+                raise RuntimeError(f"orders_get() fallito: {mt5.last_error()}")
+            return [
+                {
+                    "ticket": str(order.ticket),
+                    "symbol": str(order.symbol),
+                    "direction": _order_direction(order.type),
+                    "volume": float(order.volume_current),
+                    "price": float(order.price_open),
+                    "stop_loss": float(order.sl),
+                    "take_profit": float(order.tp),
+                    "order_type": int(order.type),
+                }
+                for order in orders
+            ]
+
+        account = self._call_with_retry("lettura account_info snapshot", _fetch_account)
+        positions = self._call_with_retry("lettura posizioni snapshot", _fetch_positions)
+        orders = self._call_with_retry("lettura ordini snapshot", _fetch_orders)
+
+        date_to = datetime.now(timezone.utc)
+        date_from = date_to - timedelta(hours=deal_lookback_hours)
+
+        def _fetch_deals() -> list:
+            deals = mt5.history_deals_get(date_from, date_to)
+            if deals is None:
+                raise RuntimeError(f"history_deals_get() fallito: {mt5.last_error()}")
+            exit_entries = {
+                int(getattr(mt5, "DEAL_ENTRY_OUT", 1)),
+                int(getattr(mt5, "DEAL_ENTRY_OUT_BY", 3)),
+            }
+            return [
+                {
+                    "deal_ticket": str(deal.ticket),
+                    "position_ticket": str(deal.position_id),
+                    "close_price": float(deal.price),
+                    "profit": float(deal.profit),
+                    "commission": float(deal.commission),
+                    "swap": float(deal.swap),
+                    "close_time": _epoch_to_utc_z(deal.time),
+                }
+                for deal in deals
+                if int(getattr(deal, "entry", -1)) in exit_entries
+            ]
+
+        deals = self._call_with_retry("lettura storico deal snapshot", _fetch_deals)
+        return {
+            "account": account,
+            "positions": positions,
+            "orders": orders,
+            "deals": deals,
+            "generated_at": format_iso_utc(datetime.now(timezone.utc)),
+        }
+
     def shutdown(self) -> None:
-        if self._mt5 is not None:
-            try:
-                self._mt5.shutdown()
-            except Exception as exc:  # noqa: BLE001 - shutdown deve essere best-effort
-                sys.stderr.write(f"[mt5-bridge] shutdown() ha sollevato un errore (ignorato): {exc}\n")
-        self._connected = False
+        with self._operation_lock:
+            if self._mt5 is not None:
+                try:
+                    self._mt5.shutdown()
+                except Exception as exc:  # noqa: BLE001 - shutdown deve essere best-effort
+                    sys.stderr.write(f"[mt5-bridge] shutdown() ha sollevato un errore (ignorato): {exc}\n")
+            self._connected = False
 
 
 class Handler(BaseBridgeHandler):
@@ -243,19 +375,26 @@ class Handler(BaseBridgeHandler):
         self.send_json(200, self.session.health())
 
     def do_POST(self) -> None:
-        if self.path != "/v1/candles":
+        if self.path not in ("/v1/candles", "/v1/trading/snapshot"):
             self.send_bridge_error(BridgeError(404, "not_found", f"Path non trovato: {self.path}"))
             return
         if not self.check_auth():
             return
         try:
             request = self.read_json_body()
-            symbol, timeframe, since, now, limit = self.parse_candles_request(request)
-            candles = self.session.get_candles(symbol, timeframe, since, now, limit)
+            if self.path == "/v1/trading/snapshot":
+                deal_lookback_hours = self.parse_trading_snapshot_request(request)
+                snapshot = self.session.get_trading_snapshot(deal_lookback_hours)
+            else:
+                symbol, timeframe, since, now, limit = self.parse_candles_request(request)
+                candles = self.session.get_candles(symbol, timeframe, since, now, limit)
         except BridgeError as exc:
             self.send_bridge_error(exc)
             return
-        self.send_json(200, {"symbol": symbol, "timeframe": timeframe, "candles": candles})
+        if self.path == "/v1/trading/snapshot":
+            self.send_json(200, snapshot)
+        else:
+            self.send_json(200, {"symbol": symbol, "timeframe": timeframe, "candles": candles})
 
 
 def make_server(config: Mt5BridgeConfig, session: _Mt5Session) -> ThreadingHTTPServer:

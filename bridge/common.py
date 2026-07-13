@@ -1,11 +1,11 @@
 """Scaffolding HTTP condiviso tra bridge/fake/fake_bridge.py e bridge/windows/mt5_bridge.py.
 
-Stesso contratto (GET /health, POST /v1/candles, autenticazione Bearer, envelope JSON, stessa
-validazione di simbolo/timeframe/limit/since) per entrambi: cio' che cambia tra fake e reale e'
-solo la sorgente delle candele (una callable) e lo stato di salute riportato, mai il protocollo
-HTTP in se'. Solo standard library: nessuna dipendenza da installare, ne' nell'immagine Docker del
-fake bridge ne' in un futuro Windows Python sotto Wine (dove installare pacchetti extra oltre a
-`MetaTrader5` e' un passo manuale in piu' da evitare quando non necessario).
+Stesso contratto (GET /health, POST /v1/candles, POST /v1/trading/snapshot, autenticazione
+Bearer, envelope JSON e validazione richieste) per entrambi: cio' che cambia tra fake e reale e'
+solo la sorgente dei dati e lo stato di salute riportato, mai il protocollo HTTP. Solo standard
+library: nessuna dipendenza da installare, ne' nell'immagine Docker del fake bridge ne' in un
+futuro Windows Python sotto Wine (dove installare pacchetti extra oltre a `MetaTrader5` e' un
+passo manuale in piu' da evitare quando non necessario).
 
 Questo modulo non importa mai MetaTrader5 e non sa nulla di Wine: e' puro protocollo HTTP.
 """
@@ -34,6 +34,12 @@ TIMEFRAME_SECONDS = {
 #: /restituire una quantita' di dati arbitraria in un colpo solo.
 MAX_LIMIT = 1000
 DEFAULT_LIMIT = 100
+
+#: Finestra dello storico deal usata da POST /v1/trading/snapshot. Il limite lato server evita
+#: che un client mal configurato chieda a MT5 una scansione arbitrariamente ampia; valori sopra
+#: il massimo vengono troncati, mentre zero, negativi e tipi diversi da int sono rifiutati.
+DEFAULT_DEAL_LOOKBACK_HOURS = 24
+MAX_DEAL_LOOKBACK_HOURS = 168
 
 #: Header di test, MAI inviato dal client di produzione (worker/market_data_source.py -
 #: Mt5MarketDataSource): permette ai test di fissare deterministicamente il concetto di "adesso"
@@ -124,9 +130,12 @@ class BaseBridgeHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         raw_body = self.rfile.read(content_length) if content_length else b""
         try:
-            return json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            request = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise BridgeError(400, "invalid_json", "Corpo della richiesta non e' JSON valido.") from exc
+        if not isinstance(request, dict):
+            raise BridgeError(422, "invalid_request", "Il corpo della richiesta deve essere un oggetto JSON.")
+        return request
 
     def parse_candles_request(self, request: dict) -> Tuple[str, str, Optional[datetime], datetime, int]:
         """Valida request/query per POST /v1/candles secondo il contratto (vedi README):
@@ -153,3 +162,24 @@ class BaseBridgeHandler(BaseHTTPRequestHandler):
             now = parse_iso_utc(now_override, "now")
 
         return symbol, timeframe, since, now, limit
+
+    def parse_trading_snapshot_request(self, request: dict) -> int:
+        """Valida il body facoltativo di POST /v1/trading/snapshot.
+
+        L'unico campo ammesso e' ``deal_lookback_hours``. Il default e' 24 ore; interi positivi
+        oltre 168 vengono troncati al massimo sicuro. ``bool`` e' escluso esplicitamente anche se
+        in Python e' una sottoclasse di ``int``.
+        """
+        unexpected = set(request) - {"deal_lookback_hours"}
+        if unexpected:
+            names = ", ".join(sorted(str(name) for name in unexpected))
+            raise BridgeError(422, "invalid_request", f"Campi non supportati nella richiesta: {names}.")
+
+        lookback = request.get("deal_lookback_hours", DEFAULT_DEAL_LOOKBACK_HOURS)
+        if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback <= 0:
+            raise BridgeError(
+                422,
+                "invalid_deal_lookback_hours",
+                "'deal_lookback_hours' deve essere un intero positivo.",
+            )
+        return min(lookback, MAX_DEAL_LOOKBACK_HOURS)

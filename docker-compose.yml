@@ -26,6 +26,10 @@ services:
     platform: linux/amd64
     environment:
       MOCK_MODE: "false"
+      # Compose legacy della Fase 2: conserva esplicitamente il client diretto predisposto.
+      # Per il runtime raccomandato HTTP usare docker-compose.trade-sync-fake.yml in locale e
+      # il bridge Windows separato descritto nel README sul VPS AMD64.
+      MT5_CLIENT_SOURCE: "direct"
       MT5_LOGIN: "${MT5_LOGIN:-}"
       MT5_PASSWORD: "${MT5_PASSWORD:-}"
       MT5_SERVER: "${MT5_SERVER:-}"

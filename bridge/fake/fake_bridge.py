@@ -1,8 +1,9 @@
 """Fake bridge: implementa lo stesso contratto HTTP di mt5-bridge (vedi bridge/common.py e
 bridge/windows/mt5_bridge.py) con dati sintetici deterministici, senza alcuna dipendenza da
 MetaTrader5/Wine. Gira nativamente su qualunque architettura, incluso Ubuntu ARM64: usato per
-validare in locale market-data-worker con MARKET_DATA_SOURCE=mt5 prima di avere un vero terminale
-MT5 su una VPS AMD64 (vedi docker-compose.research-mt5-fake.yml e README).
+validare in locale sia market-data-worker sia trade-sync worker prima di avere un vero terminale
+MT5 su una VPS AMD64 (vedi i compose fake dedicati e README). Oltre alle candele espone uno
+scenario trading thread-safe a otto stati (baseline vuota + sette transizioni).
 
 Simula anche gli scenari di errore che un bridge reale puo' incontrare, tramite l'header di test
 X-Mt5-Fake-Scenario (nomi validi: timeout, mt5_error, malformed_payload, duplicate_candle).
@@ -20,6 +21,8 @@ import math
 import os
 import sys
 import time
+import copy
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
@@ -44,6 +47,17 @@ _EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 #: configurano un client con un timeout ancora piu' corto per dimostrare l'enforcement reale),
 #: abbastanza lunga da non essere confusa con la normale latenza di risposta.
 TIMEOUT_SCENARIO_SLEEP_SECONDS = 1.5
+
+_TRADING_GENERATED_AT = (
+    "2026-07-13T09:59:59Z",
+    "2026-07-13T10:00:01Z",
+    "2026-07-13T10:05:01Z",
+    "2026-07-13T10:10:01Z",
+    "2026-07-13T10:15:01Z",
+    "2026-07-13T10:20:01Z",
+    "2026-07-13T10:25:01Z",
+    "2026-07-13T10:30:01Z",
+)
 
 
 def _deterministic_seed(symbol: str, timeframe: str) -> int:
@@ -97,7 +111,96 @@ def _generate_candles(symbol: str, timeframe: str, since: Optional[datetime], no
     return candles
 
 
+def _trading_account() -> dict:
+    return {
+        "login": "123456",
+        "server": "FakeBridge-Demo",
+        "balance": 10000.0,
+        "equity": 10010.0,
+        "currency": "EUR",
+        "leverage": 100,
+    }
+
+
+def _build_trading_steps() -> list:
+    """Scenario cumulativo che produce esattamente i sette eventi attesi dal worker.
+
+    Lo stato zero e' deliberatamente vuoto: consente al primo poll di stabilire una baseline
+    senza inventare eventi. Ogni risposta successiva introduce una sola transizione osservabile.
+    """
+    position = {
+        "ticket": "10001",
+        "symbol": "EURUSD",
+        "direction": "buy",
+        "volume": 0.10,
+        "open_price": 1.17000,
+        "stop_loss": 1.16800,
+        "take_profit": 1.17400,
+        "open_time": "2026-07-13T10:00:00Z",
+    }
+    modified_sl = {**position, "stop_loss": 1.16900}
+    modified_tp = {**modified_sl, "take_profit": 1.17500}
+    deal = {
+        "deal_ticket": "30001",
+        "position_ticket": "10001",
+        "close_price": 1.17200,
+        "profit": 20.0,
+        "commission": -0.5,
+        "swap": 0.0,
+        "close_time": "2026-07-13T10:15:00Z",
+    }
+    order = {
+        "ticket": "20001",
+        "symbol": "EURUSD",
+        "direction": "buy",
+        "volume": 0.10,
+        "price": 1.16800,
+        "stop_loss": 1.16600,
+        "take_profit": 1.17200,
+        "order_type": 2,
+    }
+    modified_order = {
+        **order,
+        "price": 1.16750,
+        "stop_loss": 1.16550,
+        "take_profit": 1.17250,
+    }
+    return [
+        {"positions": [], "orders": [], "deals": []},
+        {"positions": [position], "orders": [], "deals": []},
+        {"positions": [modified_sl], "orders": [], "deals": []},
+        {"positions": [modified_tp], "orders": [], "deals": []},
+        {"positions": [], "orders": [], "deals": [deal]},
+        {"positions": [], "orders": [order], "deals": [deal]},
+        {"positions": [], "orders": [modified_order], "deals": [deal]},
+        {"positions": [], "orders": [], "deals": [deal]},
+    ]
+
+
+class FakeTradingScenario:
+    """Macchina a stati per il solo fake, isolata per istanza di server e thread-safe."""
+
+    def __init__(self) -> None:
+        self._steps = _build_trading_steps()
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def next_snapshot(self) -> dict:
+        with self._lock:
+            index = self._index
+            state = copy.deepcopy(self._steps[index])
+            if self._index < len(self._steps) - 1:
+                self._index += 1
+        return {
+            "account": _trading_account(),
+            **state,
+            "generated_at": _TRADING_GENERATED_AT[index],
+        }
+
+
 class Handler(BaseBridgeHandler):
+    trading_scenario: FakeTradingScenario
+
     def do_GET(self) -> None:
         if self.path != "/health":
             self.send_bridge_error(BridgeError(404, "not_found", f"Path non trovato: {self.path}"))
@@ -113,10 +216,14 @@ class Handler(BaseBridgeHandler):
         })
 
     def do_POST(self) -> None:
-        if self.path != "/v1/candles":
+        if self.path not in ("/v1/candles", "/v1/trading/snapshot"):
             self.send_bridge_error(BridgeError(404, "not_found", f"Path non trovato: {self.path}"))
             return
         if not self.check_auth():
+            return
+
+        if self.path == "/v1/trading/snapshot":
+            self._handle_trading_snapshot()
             return
 
         scenario = (self.headers.get("X-Mt5-Fake-Scenario") or "").strip().lower()
@@ -146,6 +253,15 @@ class Handler(BaseBridgeHandler):
 
         self.send_json(200, {"symbol": symbol, "timeframe": timeframe, "candles": candles})
 
+    def _handle_trading_snapshot(self) -> None:
+        try:
+            request = self.read_json_body()
+            self.parse_trading_snapshot_request(request)
+        except BridgeError as exc:
+            self.send_bridge_error(exc)
+            return
+        self.send_json(200, self.trading_scenario.next_snapshot())
+
     def _send_malformed_payload(self) -> None:
         # Deliberatamente non conforme al contratto (open_time non ISO8601, open numerico invece
         # di stringa, nessun campo high/low/close): usato solo per verificare che
@@ -169,7 +285,11 @@ def make_config_from_env() -> BridgeConfig:
 
 
 def make_server(config: BridgeConfig) -> ThreadingHTTPServer:
-    handler_cls = type("_FakeBridgeHandler", (Handler,), {"config": config})
+    handler_cls = type(
+        "_FakeBridgeHandler",
+        (Handler,),
+        {"config": config, "trading_scenario": FakeTradingScenario()},
+    )
     return ThreadingHTTPServer((config.host, config.port), handler_cls)
 
 

@@ -93,7 +93,8 @@ ENV WINEPREFIX=/home/worker/.wine \
     WINEARCH=win64 \
     DISPLAY=:99 \
     MT5_TERMINAL_DIR=/opt/mt5 \
-    MOCK_MODE=false
+    MOCK_MODE=false \
+    MT5_CLIENT_SOURCE=direct
 
 COPY docker/entrypoint-real.sh docker/healthcheck-mt5.sh ./docker/
 RUN chmod +x ./docker/entrypoint-real.sh ./docker/healthcheck-mt5.sh
