@@ -246,34 +246,35 @@ class _Mt5Session:
                         f"login() fallito: {mt5.last_error()} "
                         "(credenziali non stampate per sicurezza)"
                     )
-            else:
-                account = mt5.account_info()
-                if account is None:
-                    raise RuntimeError(
-                        f"account_info() dopo initialize() ha restituito None: {mt5.last_error()}"
-                    )
 
-                actual_login = str(account.login)
-                actual_server = str(account.server)
-                expected_login = self._config.mt5_expected_login
-                expected_server = self._config.mt5_expected_server
-                if expected_login and actual_login != expected_login:
-                    raise RuntimeError(
-                        "MT5_EXPECTED_LOGIN non coincide con l'account della sessione "
-                        f"esistente (atteso={_mask(expected_login)}, "
-                        f"effettivo={_mask(actual_login)})."
-                    )
-                if expected_server and actual_server != expected_server:
-                    raise RuntimeError(
-                        "MT5_EXPECTED_SERVER non coincide con il server della sessione "
-                        f"esistente (atteso={_mask(expected_server)}, "
-                        f"effettivo={_mask(actual_server)})."
-                    )
-                connected_identity["login"] = _mask(actual_login)
-                connected_identity["server"] = _mask(actual_server)
+            # La connessione e la health non dipendono da alcun simbolo. Un broker puo' usare
+            # suffissi (per esempio EURUSD.a) oppure rifiutare temporaneamente symbol_select()
+            # pur mantenendo terminale e account perfettamente disponibili. La disponibilita'
+            # del simbolo viene quindi verificata solo quando /v1/candles lo richiede.
+            account = mt5.account_info()
+            if account is None:
+                raise RuntimeError(
+                    f"account_info() dopo la connessione ha restituito None: {mt5.last_error()}"
+                )
 
-            if not mt5.symbol_select(self._config.broker_symbol, True):
-                raise RuntimeError(f"symbol_select({self._config.broker_symbol!r}) fallito: {mt5.last_error()}")
+            actual_login = str(account.login)
+            actual_server = str(account.server)
+            expected_login = self._config.mt5_expected_login
+            expected_server = self._config.mt5_expected_server
+            if expected_login and actual_login != expected_login:
+                raise RuntimeError(
+                    "MT5_EXPECTED_LOGIN non coincide con l'account della sessione "
+                    f"connessa (atteso={_mask(expected_login)}, "
+                    f"effettivo={_mask(actual_login)})."
+                )
+            if expected_server and actual_server != expected_server:
+                raise RuntimeError(
+                    "MT5_EXPECTED_SERVER non coincide con il server della sessione "
+                    f"connessa (atteso={_mask(expected_server)}, "
+                    f"effettivo={_mask(actual_server)})."
+                )
+            connected_identity["login"] = _mask(actual_login)
+            connected_identity["server"] = _mask(actual_server)
             self._mt5 = mt5
 
         self._call_with_retry("connessione al terminale MT5", _do_connect)
@@ -302,7 +303,7 @@ class _Mt5Session:
         info = self._mt5.account_info()
         terminal = self._mt5.terminal_info()
         return {
-            "status": "ok" if info is not None else "degraded",
+            "status": "ok" if info is not None and terminal is not None else "degraded",
             "terminal_connected": terminal is not None,
             "account_connected": info is not None,
             # info.server e' gia' il nome server MT5: mascherato comunque, coerente con la
@@ -340,6 +341,47 @@ class _Mt5Session:
         mt5 = self._mt5
         tf_constant = getattr(mt5, _TIMEFRAME_MT5_CONSTANT_NAMES[timeframe])
         step_seconds = TIMEFRAME_SECONDS[timeframe]
+
+        try:
+            symbol_info = mt5.symbol_info(broker_symbol)
+        except Exception as exc:  # noqa: BLE001 - errore dell'estensione MetaTrader5
+            raise BridgeError(
+                502,
+                "mt5_error",
+                f"Verifica del simbolo MT5 richiesto {broker_symbol!r} fallita: "
+                f"{self._sanitize_error(exc)}",
+            ) from None
+        if symbol_info is None:
+            detail = self._sanitize_error(
+                RuntimeError(f"symbol_info() ha restituito None: {mt5.last_error()}")
+            )
+            raise BridgeError(
+                422,
+                "symbol_not_found",
+                f"Il simbolo MT5 richiesto {broker_symbol!r} non esiste o non e' disponibile "
+                f"nel terminale. Dettaglio MT5: {detail}",
+            )
+
+        if not bool(getattr(symbol_info, "visible", False)):
+            try:
+                selected = mt5.symbol_select(broker_symbol, True)
+            except Exception as exc:  # noqa: BLE001 - errore dell'estensione MetaTrader5
+                raise BridgeError(
+                    502,
+                    "symbol_not_selectable",
+                    f"Il simbolo MT5 richiesto {broker_symbol!r} non e' selezionabile: "
+                    f"{self._sanitize_error(exc)}",
+                ) from None
+            if not selected:
+                detail = self._sanitize_error(
+                    RuntimeError(f"symbol_select() fallito: {mt5.last_error()}")
+                )
+                raise BridgeError(
+                    502,
+                    "symbol_not_selectable",
+                    f"Il simbolo MT5 richiesto {broker_symbol!r} non e' selezionabile. "
+                    f"Dettaglio MT5: {detail}",
+                )
 
         def _fetch():
             if since is None:
@@ -478,15 +520,19 @@ class _Mt5Session:
 
     def shutdown(self) -> None:
         with self._operation_lock:
-            if self._mt5 is not None:
+            # Rendere lo shutdown idempotente evita una seconda chiamata all'estensione MT5 se
+            # arrivano piu' segnali o se il cleanup viene richiesto nuovamente dopo il finally.
+            mt5 = self._mt5
+            self._mt5 = None
+            self._connected = False
+            if mt5 is not None:
                 try:
-                    self._mt5.shutdown()
+                    mt5.shutdown()
                 except Exception as exc:  # noqa: BLE001 - shutdown deve essere best-effort
                     sys.stderr.write(
                         "[mt5-bridge] shutdown() ha sollevato un errore (ignorato): "
                         f"{self._sanitize_error(exc)}\n"
                     )
-            self._connected = False
 
 
 class Handler(BaseBridgeHandler):
@@ -528,27 +574,58 @@ def make_server(config: Mt5BridgeConfig, session: _Mt5Session) -> ThreadingHTTPS
     return ThreadingHTTPServer((config.host, config.port), handler_cls)
 
 
+def _serve_server(server: ThreadingHTTPServer, session: _Mt5Session) -> None:
+    """Esegue il server e ne coordina uno shutdown idempotente e privo di deadlock.
+
+    ``HTTPServer.shutdown()`` deve essere invocato da un thread diverso da quello che sta
+    eseguendo ``serve_forever()``. I signal handler Python vengono eseguiti nel thread principale,
+    che in questo processo e' anche quello del loop HTTP: il primo segnale avvia quindi un thread
+    daemon dedicato. Il cleanup di socket e sessione MT5 resta nel ``finally`` del loop ed e'
+    eseguito una sola volta anche quando arrivano segnali ripetuti.
+    """
+
+    shutdown_requested = threading.Event()
+
+    def _request_shutdown(_signum, _frame) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        sys.stderr.write("[mt5-bridge] Segnale di arresto ricevuto, chiusura in corso...\n")
+        threading.Thread(
+            target=server.shutdown,
+            name="mt5-bridge-http-shutdown",
+            daemon=True,
+        ).start()
+
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+        sys.stderr.write(
+            f"[mt5-bridge] in ascolto su {server.server_address[0]}:"
+            f"{server.server_address[1]}\n"
+        )
+        server.serve_forever()
+    finally:
+        # Blocca l'avvio di nuovi thread di shutdown mentre il cleanup e' gia' in corso.
+        shutdown_requested.set()
+        try:
+            server.server_close()
+        finally:
+            session.shutdown()
+
+
 def main() -> None:
     config = Mt5BridgeConfig()
     session = _Mt5Session(config)
     session.connect()
 
-    server = make_server(config, session)
-
-    def _shutdown(_signum, _frame):
-        sys.stderr.write("[mt5-bridge] Segnale di arresto ricevuto, chiusura in corso...\n")
-        session.shutdown()
-        server.shutdown()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
-    sys.stderr.write(f"[mt5-bridge] in ascolto su {config.host}:{config.port} (broker_symbol={config.broker_symbol})\n")
     try:
-        server.serve_forever()
-    finally:
+        server = make_server(config, session)
+    except Exception:
         session.shutdown()
-        server.server_close()
+        raise
+
+    _serve_server(server, session)
 
 
 if __name__ == "__main__":

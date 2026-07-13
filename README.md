@@ -601,8 +601,8 @@ prolungata non sono ancora stati validati contro dati reali.
 | `MT5_DEAL_LOOKBACK_HOURS` | `24` | trade-sync snapshot; intero 1..168 |
 | `MT5_SESSION_MODE` | `login` | bridge reale: `login` oppure `existing`; valori diversi bloccano l'avvio |
 | `MT5_TERMINAL_PATH` | *(vuoto)* | bridge reale: obbligatorio in `existing`, opzionale (raccomandato) in `login` |
-| `MT5_EXPECTED_LOGIN` / `MT5_EXPECTED_SERVER` | *(vuoto)* | controlli opzionali della sessione gia' aperta in modalita' `existing` |
-| `EURUSD_BROKER_SYMBOL` | `EURUSD` | simbolo con cui il bridge interroga MT5 (puo' differire dal canonico, es. `EURUSD.a`) |
+| `MT5_EXPECTED_LOGIN` / `MT5_EXPECTED_SERVER` | *(vuoto)* | controlli opzionali dell'account connesso, dopo initialize/login |
+| `EURUSD_BROKER_SYMBOL` | `EURUSD` | nome broker esatto richiesto a `/v1/candles` (es. `EURUSD.a`); non e' un probe di connessione |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
 
 Con `MT5_CLIENT_SOURCE=bridge`, `MT5_SESSION_MODE`, le variabili `MT5_EXPECTED_*` e
@@ -674,9 +674,11 @@ POST /v1/trading/snapshot
           "generated_at": "2026-07-13T10:15:01Z"}
 ```
 
-Regole applicate dal bridge (fake e reale, stesso `bridge/common.py`): solo `EURUSD`/il broker
-symbol configurato; solo i sei timeframe `M1,M5,M15,H1,H4,D1`; `limit` troncato a un massimo
-protetto lato server (1000) indipendentemente da cosa chiede il client; `since` **esclusivo**
+Regole applicate dal bridge (fake e reale, stesso `bridge/common.py`): solo il broker symbol
+configurato, inviato nel payload col suo nome MT5 esatto (per esempio `EURUSD.a`); nessun alias,
+ricerca per prefisso o suffisso automatico; solo i sei timeframe `M1,M5,M15,H1,H4,D1`; `limit`
+troncato a un massimo protetto lato server (1000) indipendentemente da cosa chiede il client;
+`since` **esclusivo**
 (candele con `open_time` strettamente maggiore); candele sempre in ordine cronologico crescente;
 timestamp sempre UTC (suffisso `Z`); prezzi sempre come **stringhe** decimali, mai numeri JSON
 (evita qualunque arrotondamento binario intermedio); la candela ancora in formazione al momento
@@ -725,10 +727,8 @@ reale. `MT5_SESSION_MODE` accetta soltanto i due valori seguenti; il default con
   `mt5.initialize(path=MT5_TERMINAL_PATH)` e usa l'account gia' collegato nel terminale. Non
   chiama mai `mt5.login()`, non richiede `MT5_PASSWORD` e non cambia account o tipo di sessione.
   Dopo l'inizializzazione `account_info()` deve restituire un account, altrimenti l'avvio
-  fallisce. `MT5_EXPECTED_LOGIN` e `MT5_EXPECTED_SERVER` sono
-  controlli opzionali: se impostati devono coincidere rispettivamente con `account_info().login`
-  e, con confronto esatto, `account_info().server`. E' la modalita' adatta al test locale con il
-  terminale principale gia' aperto e collegato.
+  fallisce. E' la modalita' adatta al test locale con il terminale principale gia' aperto e
+  collegato.
 - `MT5_SESSION_MODE=login`: mantiene il comportamento storico, eseguendo `initialize()` e poi
   `mt5.login()`; richiede `MT5_LOGIN`, `MT5_PASSWORD` e `MT5_SERVER`. `MT5_TERMINAL_PATH` resta
   opzionale: se assente `initialize()` viene chiamato senza `path`, anche se specificarlo e'
@@ -736,12 +736,20 @@ reale. `MT5_SESSION_MODE` accetta soltanto i due valori seguenti; il default con
   esempio su una VPS, e `MT5_PASSWORD` deve essere esclusivamente la password **investor** (sola
   lettura), mai quella principale/di trading.
 
+In entrambe le modalita', dopo `initialize()` e l'eventuale `login()`, `account_info()` deve
+restituire un account valido. `MT5_EXPECTED_LOGIN` e `MT5_EXPECTED_SERVER` sono controlli
+opzionali applicati all'account connesso: se impostati devono coincidere rispettivamente con
+`account_info().login` e, con confronto esatto, `account_info().server`.
+
 Dopo la connessione il bridge offre snapshot read-only via `account_info()`/`positions_get()`/
-`orders_get()`/`history_deals_get()`, selezione del broker symbol e lettura candele tramite
-`copy_rates_from_pos` o `copy_rates_range`; `shutdown()` chiude la connessione. Login, server,
-token e altri valori sensibili non vengono stampati integralmente. Non esistono chiamate
-`order_send`, `order_check`, `TRADE_ACTION_*` o endpoint che aprono, modificano o chiudono
-ordini: gli unici endpoint restano `GET /health`, `POST /v1/candles` e
+`orders_get()`/`history_deals_get()` senza dipendere da alcun simbolo. Solo durante
+`POST /v1/candles` verifica con `symbol_info()` il nome esatto ricevuto e, se il simbolo esiste ma
+non e' visibile, prova `symbol_select(requested_symbol, True)` prima di leggere le candele con
+`copy_rates_from_pos` o `copy_rates_range`. Un simbolo inesistente o non selezionabile produce un
+errore esplicito, senza tentare alias o suffissi. `shutdown()` chiude la connessione. Login,
+server, token e altri valori sensibili non vengono stampati integralmente. Non esistono chiamate
+`order_send`, `order_check`, `TRADE_ACTION_*` o endpoint che aprono, modificano o chiudono ordini:
+gli unici endpoint restano `GET /health`, `POST /v1/candles` e
 `POST /v1/trading/snapshot`.
 
 #### Test locale macOS con il terminale gia' aperto

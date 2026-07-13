@@ -118,6 +118,7 @@ def test_existing_connects_successfully_without_password(monkeypatch):
     assert fake.initialize_calls == [{"path": _WINDOWS_TERMINAL_PATH}]
     assert fake.account_info_calls == 1
     assert fake.login_calls == []
+    assert fake.symbol_select_calls == []
 
 
 def test_existing_requires_terminal_path(monkeypatch):
@@ -144,7 +145,7 @@ def test_existing_initializes_exact_terminal_and_never_calls_login(monkeypatch, 
     assert fake.initialize_calls == [{"path": _WINDOWS_TERMINAL_PATH}]
     assert fake.account_info_calls == 1
     assert fake.login_calls == []
-    assert fake.symbol_select_calls == [("EURUSD", True)]
+    assert fake.symbol_select_calls == []
     stderr = capsys.readouterr().err
     assert "123456" not in stderr
     assert "Broker-Demo" not in stderr
@@ -223,8 +224,8 @@ def test_login_mode_still_initializes_and_calls_login(monkeypatch):
 
     assert fake.initialize_calls == [{}]
     assert fake.login_calls == [(123456, "fake-investor-password", "Broker-Demo")]
-    # Il controllo account post-initialize appartiene solo alla modalita' existing.
-    assert fake.account_info_calls == 0
+    assert fake.account_info_calls == 1
+    assert fake.symbol_select_calls == []
 
 
 @pytest.mark.parametrize("missing", ["MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"])
