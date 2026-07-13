@@ -10,6 +10,7 @@ trade-sync worker quando questi env var non sono impostati (installazioni client
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Tuple
 
@@ -25,10 +26,80 @@ class ConfigError(ValueError):
     silenziosamente a un default che potrebbe mascherare un errore di deployment."""
 
 
-def _as_bool(raw: Optional[str], default: bool) -> bool:
+def _validate_secret_value(value: str, name: str) -> str:
+    if any(character in value for character in ("\r", "\n", "\x00")):
+        raise ConfigError(f"{name} deve contenere un secret non vuoto su una sola riga.")
+    return value
+
+
+def _read_secret(source: Mapping[str, str], name: str) -> Optional[str]:
+    """Risolve ``NAME``/``NAME_FILE`` senza mai includere il valore negli errori.
+
+    Questa implementazione resta nel package ``worker`` perche' l'immagine Linux copia soltanto
+    quella directory; importare ``bridge/common.py`` funzionerebbe nel checkout di sviluppo ma
+    romperebbe l'immagine pubblicata. I controlli sono intenzionalmente equivalenti a
+    ``bridge/common.py:read_secret_from_env``.
+    """
+    file_name = f"{name}_FILE"
+    direct_present = name in source
+    file_present = file_name in source
+
+    if direct_present and file_present:
+        raise ConfigError(
+            f"Configurazione ambigua: impostare solo {name} oppure {file_name}, non entrambe."
+        )
+    if direct_present:
+        value = source.get(name)
+        if value in (None, ""):
+            return None
+        return _validate_secret_value(value, name)
+    if not file_present:
+        return None
+
+    path = source.get(file_name, "")
+    if not path:
+        raise ConfigError(f"{file_name} e' impostata ma non contiene un path.")
+
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as secret_file:
+            mode = os.fstat(secret_file.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise ConfigError(f"{file_name} deve indicare un file regolare.")
+            if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ConfigError(
+                    f"{file_name} ha permessi non sicuri: il file non deve essere accessibile "
+                    "da group/world (usare 0400 o 0600)."
+                )
+            value = secret_file.read()
+    except FileNotFoundError:
+        raise ConfigError(f"{file_name} indica un file inesistente.") from None
+    except IsADirectoryError:
+        raise ConfigError(f"{file_name} deve indicare un file regolare.") from None
+    except PermissionError:
+        raise ConfigError(f"{file_name} indica un file non leggibile dal processo.") from None
+    except UnicodeError:
+        raise ConfigError(f"{file_name} deve contenere testo UTF-8 valido.") from None
+    except OSError:
+        raise ConfigError(f"Impossibile leggere il file indicato da {file_name}.") from None
+
+    if value.endswith("\r\n"):
+        value = value[:-2]
+    elif value.endswith(("\n", "\r")):
+        value = value[:-1]
+    if value == "":
+        return None
+    return _validate_secret_value(value, file_name)
+
+
+def _as_bool(raw: Optional[str], default: bool, name: str) -> bool:
     if raw is None or raw.strip() == "":
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} deve essere un booleano esplicito true oppure false.")
 
 
 def _as_int(raw: Optional[str], default: int) -> int:
@@ -157,7 +228,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         value = source.get(name)
         return value if value not in (None, "") else None
 
-    mock_mode = _as_bool(source.get("MOCK_MODE"), True)
+    mock_mode = _as_bool(source.get("MOCK_MODE"), True, "MOCK_MODE")
     # MOCK_MODE resta l'alias retrocompatibile quando MT5_CLIENT_SOURCE non e' impostato. Il
     # nuovo runtime raccomandato con MOCK_MODE=false e' il bridge HTTP; il client MetaTrader5
     # diretto resta disponibile soltanto scegliendo esplicitamente "direct".
@@ -165,23 +236,25 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
 
     return Config(
         mock_mode=mock_mode,
-        dry_run=_as_bool(source.get("DRY_RUN"), True),
+        dry_run=_as_bool(source.get("DRY_RUN"), True, "DRY_RUN"),
         mt5_login=get("MT5_LOGIN"),
-        mt5_password=get("MT5_PASSWORD"),
+        mt5_password=_read_secret(source, "MT5_PASSWORD"),
         mt5_server=get("MT5_SERVER"),
         tradejournal_api_url=get("TRADEJOURNAL_API_URL"),
-        tradejournal_bridge_token=get("TRADEJOURNAL_BRIDGE_TOKEN"),
+        tradejournal_bridge_token=_read_secret(source, "TRADEJOURNAL_BRIDGE_TOKEN"),
         poll_interval_seconds=_as_int(source.get("POLL_INTERVAL_SECONDS"), 5),
         log_level=get("LOG_LEVEL") or "INFO",
         app_mode=(get("APP_MODE") or "client").strip().lower(),
-        enable_market_data=_as_bool(source.get("ENABLE_MARKET_DATA"), False),
+        enable_market_data=_as_bool(
+            source.get("ENABLE_MARKET_DATA"), False, "ENABLE_MARKET_DATA"
+        ),
         database_url=get("DATABASE_URL"),
         market_symbols=_as_tuple(source.get("MARKET_SYMBOLS"), _DEFAULT_MARKET_SYMBOLS),
         market_timeframes=_as_tuple(source.get("MARKET_TIMEFRAMES"), _DEFAULT_MARKET_TIMEFRAMES),
         market_data_poll_seconds=_as_int(source.get("MARKET_DATA_POLL_SECONDS"), 60),
         market_data_source=(get("MARKET_DATA_SOURCE") or "mock").strip().lower(),
         mt5_bridge_url=get("MT5_BRIDGE_URL"),
-        mt5_bridge_token=get("MT5_BRIDGE_TOKEN"),
+        mt5_bridge_token=_read_secret(source, "MT5_BRIDGE_TOKEN"),
         mt5_bridge_timeout_seconds=_as_float(source.get("MT5_BRIDGE_TIMEOUT_SECONDS"), 10.0),
         eurusd_broker_symbol=get("EURUSD_BROKER_SYMBOL") or "EURUSD",
         mt5_client_source=mt5_client_source,

@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1
+
+# Ubuntu 24.04 is deliberately aligned with the validated VPS operating system. The image is
+# rebuilt by the operator to receive Ubuntu security updates; no MetaTrader/Python Windows
+# binary is downloaded or copied into this image.
+FROM ubuntu:24.04 AS real
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    WINEARCH=win64 \
+    WINEDEBUG=-all \
+    DISPLAY=:99 \
+    WINEPREFIX=/var/lib/tradejournal/wine-prefix/current
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gosu \
+        jq \
+        procps \
+        wine \
+        wine64 \
+        x11-utils \
+        xvfb \
+        zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 runtime \
+    && useradd --uid 1000 --gid runtime --create-home --shell /usr/sbin/nologin runtime \
+    && mkdir -p \
+        /app/bridge/windows \
+        /opt/tradejournal/runtime \
+        /opt/tradejournal/template \
+        /var/lib/tradejournal/wine-prefix \
+    && chown -R runtime:runtime /app /opt/tradejournal/runtime /home/runtime
+
+COPY bridge/common.py /app/bridge/common.py
+COPY bridge/windows/mt5_bridge.py /app/bridge/windows/mt5_bridge.py
+COPY deploy/instance/entrypoint-runtime.sh /opt/tradejournal/runtime/entrypoint-runtime.sh
+COPY deploy/instance/healthcheck-runtime.sh /opt/tradejournal/runtime/healthcheck-runtime.sh
+
+RUN chmod 0755 \
+        /opt/tradejournal/runtime/entrypoint-runtime.sh \
+        /opt/tradejournal/runtime/healthcheck-runtime.sh \
+    && chmod 0644 /app/bridge/common.py /app/bridge/windows/mt5_bridge.py
+
+EXPOSE 8090
+
+ENTRYPOINT ["/opt/tradejournal/runtime/entrypoint-runtime.sh"]
+
+
+# Exact Python patch release + Debian release are pinned for deterministic fake smoke tests.
+# This stage contains only the repository's standard-library fake bridge: no Wine, MT5 or
+# Windows Python and no network download at container startup.
+FROM python:3.11.9-slim-bookworm AS mock
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOST=0.0.0.0 \
+    PORT=8090
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 runtime \
+    && useradd --uid 1000 --gid runtime --create-home --shell /usr/sbin/nologin runtime \
+    && mkdir -p /app/bridge/fake /opt/tradejournal/runtime \
+    && chown -R runtime:runtime /app /opt/tradejournal/runtime
+
+COPY bridge/common.py /app/bridge/common.py
+COPY bridge/fake/fake_bridge.py /app/bridge/fake/fake_bridge.py
+COPY deploy/instance/entrypoint-mock.sh /opt/tradejournal/runtime/entrypoint-mock.sh
+COPY deploy/instance/healthcheck-runtime.sh /opt/tradejournal/runtime/healthcheck-runtime.sh
+
+RUN chmod 0755 \
+        /opt/tradejournal/runtime/entrypoint-mock.sh \
+        /opt/tradejournal/runtime/healthcheck-runtime.sh \
+    && chmod 0644 /app/bridge/common.py /app/bridge/fake/fake_bridge.py
+
+USER runtime
+
+EXPOSE 8090
+
+ENTRYPOINT ["/opt/tradejournal/runtime/entrypoint-mock.sh"]

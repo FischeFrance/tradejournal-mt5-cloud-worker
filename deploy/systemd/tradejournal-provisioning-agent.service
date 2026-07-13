@@ -1,0 +1,64 @@
+[Unit]
+Description=TradeJournal MT5 filesystem provisioning agent
+Documentation=file:///opt/tradejournal/tradejournal-mt5-cloud-worker/README.md
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+# Override User/Group with a systemd drop-in when the dedicated host account has another name.
+User=tradejournal-provisioner
+Group=tradejournal-provisioner
+SupplementaryGroups=docker
+WorkingDirectory=/opt/tradejournal/tradejournal-mt5-cloud-worker
+# Installation gate: this mandatory file must be root:root 0600. systemd reads it before the
+# service changes user, so the provisioning account never needs direct read access to it.
+EnvironmentFile=/etc/tradejournal/provisioning-agent.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DOCKER_CONFIG=/run/tradejournal-provisioning-agent/docker-config
+ExecStart=/opt/tradejournal/tradejournal-mt5-cloud-worker/.venv/bin/python -m provisioning.cli run-filesystem-agent
+Restart=on-failure
+RestartSec=5s
+# Longer than the default 300-second DockerRunner timeout, allowing an in-flight local CLI
+# operation to finish after SIGTERM. KillMode=mixed reserves SIGKILL for the final deadline.
+TimeoutStopSec=330s
+KillSignal=SIGTERM
+KillMode=mixed
+UMask=0027
+
+# The process remains on the host and talks only to the local Docker Unix socket. These paths
+# are the only persistent locations it may modify; the repository and template stay read-only.
+NoNewPrivileges=true
+PrivateTmp=true
+# `full` keeps /usr, /boot and /etc read-only while allowing the unprivileged agent to create its
+# configured /opt/tradejournal data roots on first start. Unix ownership on /opt/tradejournal is
+# still an installation prerequisite; the repository and template are explicitly read-only.
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/opt/tradejournal/tradejournal-mt5-cloud-worker
+ReadOnlyPaths=-/opt/tradejournal/templates
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=true
+RestrictNamespaces=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RuntimeDirectory=tradejournal-provisioning-agent
+RuntimeDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

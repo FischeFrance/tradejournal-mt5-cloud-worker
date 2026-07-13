@@ -13,10 +13,12 @@ Questo modulo non importa mai MetaTrader5 e non sa nulla di Wine: e' puro protoc
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 #: Durata di una candela per timeframe, in secondi. Stesse sigle usate da MARKET_TIMEFRAMES e da
 #: worker/market_data_source.py: EURUSD e' l'unico simbolo nello scope di questa fase.
@@ -46,6 +48,86 @@ MAX_DEAL_LOOKBACK_HOURS = 168
 #: del bridge, per verificare l'esclusione della candela corrente in formazione senza dipendere
 #: dall'orologio reale della macchina che esegue i test.
 NOW_OVERRIDE_HEADER = "X-Mt5-Bridge-Now-Override"
+
+# CPython Windows ricava ``st_mode`` dagli attributi Win32 e non puo' rappresentare in modo
+# affidabile owner/group/world POSIX. Sotto Wine un file host 0400 puo' quindi apparire 0444 o
+# 0666: in quel solo runtime il bridge emette un warning e delega l'enforcement al mount host.
+# Fake bridge e worker Linux applicano invece sempre il rifiuto rigoroso.
+_POSIX_SECRET_MODE_CHECK_SUPPORTED = os.name != "nt"
+
+
+def _validate_secret_value(value: str, name: str) -> str:
+    if any(character in value for character in ("\r", "\n", "\x00")):
+        raise ValueError(f"{name} deve contenere un secret non vuoto su una sola riga.")
+    return value
+
+
+def read_secret_from_env(
+    name: str,
+    source: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Legge un secret da ``NAME`` oppure da ``NAME_FILE`` in modo non ambiguo.
+
+    I bridge fake e Windows sono distribuiti separatamente dal worker Linux, ma entrambi
+    includono questo modulo standard-library-only. Tenere qui il caricamento evita che il
+    bridge Windows dipenda dal package ``worker`` (non presente nel suo runtime Wine).
+
+    Il contenuto non compare mai negli errori. Il controllo usa ``fstat`` sul file gia' aperto,
+    cosi' validazione e lettura riguardano lo stesso oggetto anche se il path viene sostituito
+    concorrentemente. Viene rimossa soltanto una terminazione di riga finale, senza fare
+    ``strip`` di spazi o altre righe significative per il secret.
+    """
+    env = os.environ if source is None else source
+    file_name = f"{name}_FILE"
+    direct_present = name in env
+    file_present = file_name in env
+
+    if direct_present and file_present:
+        raise ValueError(
+            f"Configurazione ambigua: impostare solo {name} oppure {file_name}, non entrambe."
+        )
+    if direct_present:
+        value = env.get(name, "")
+        return _validate_secret_value(value, name) if value else value
+    if not file_present:
+        return ""
+
+    path = env.get(file_name, "")
+    if not path:
+        raise ValueError(f"{file_name} e' impostata ma non contiene un path.")
+
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as secret_file:
+            mode = os.fstat(secret_file.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"{file_name} deve indicare un file regolare.")
+            if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                if _POSIX_SECRET_MODE_CHECK_SUPPORTED:
+                    raise ValueError(
+                        f"{file_name} ha permessi non sicuri: il file non deve essere accessibile "
+                        "da group/world (usare 0400 o 0600)."
+                    )
+                sys.stderr.write(
+                    f"[mt5-bridge] WARNING: {file_name}: Python Windows/Wine non espone "
+                    "permessi POSIX affidabili; proteggere il file lato host con 0400/0600.\n"
+                )
+            value = secret_file.read()
+    except FileNotFoundError:
+        raise ValueError(f"{file_name} indica un file inesistente.") from None
+    except IsADirectoryError:
+        raise ValueError(f"{file_name} deve indicare un file regolare.") from None
+    except PermissionError:
+        raise ValueError(f"{file_name} indica un file non leggibile dal processo.") from None
+    except UnicodeError:
+        raise ValueError(f"{file_name} deve contenere testo UTF-8 valido.") from None
+    except OSError:
+        raise ValueError(f"Impossibile leggere il file indicato da {file_name}.") from None
+
+    if value.endswith("\r\n"):
+        value = value[:-2]
+    elif value.endswith(("\n", "\r")):
+        value = value[:-1]
+    return _validate_secret_value(value, file_name) if value else value
 
 
 class BridgeError(Exception):

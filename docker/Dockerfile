@@ -18,7 +18,7 @@
 ########################################
 # Stage: base
 ########################################
-FROM python:3.11-slim AS base
+FROM python:3.11.9-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

@@ -8,7 +8,14 @@ import os
 import sys
 import urllib.request
 
-token = os.environ.get("MT5_BRIDGE_TOKEN", "")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from common import read_secret_from_env  # noqa: E402
+
+try:
+    token = read_secret_from_env("MT5_BRIDGE_TOKEN")
+except ValueError:
+    sys.exit(1)
 port = os.environ.get("PORT", "8080")
 url = f"http://127.0.0.1:{port}/health"
 

@@ -31,6 +31,20 @@ Nessun deploy o risorsa cloud e' stato creato. Nessuna credenziale reale e' inse
 repository, nei test o nella documentazione; la verifica macOS ha riusato una sessione gia'
 aperta senza fornire la password al bridge.
 
+## Provisioning per-account (branch `feature/mt5-provisioning-agent`)
+
+Il repository include ora un primo livello di provisioning host-side, indipendente da
+`tradejournal-drp`: package `provisioning`, CLI locale, coda filesystem crash-safe, template
+Compose isolato per `connection_id`, runtime MT5 reale predisposto e runtime fake per smoke test
+senza Wine o credenziali reali. Il provisioner usa soltanto la Docker CLI locale e non espone
+API, socket Docker o porte dei container.
+
+La runbook completa — architettura, golden template esterno, ownership dei secret, systemd,
+job V1, queue, recovery, rotazione, deprovision e smoke test di due account sulla VPS — e' in
+[`docs/provisioning.md`](docs/provisioning.md). Il runtime reale resta **prepared but
+unvalidated** fino all'esecuzione di quella checklist su Ubuntu 24.04 AMD64; il polling Supabase
+e l'endpoint del sito sono esplicitamente fuori scope.
+
 ## Contratto del payload
 
 Il worker produce esattamente i campi attesi dall'endpoint `trading-mt5-events` di TradeJournal
@@ -293,7 +307,10 @@ Sequenza simulata, in ordine:
 
 Con `DRY_RUN=true` (default), il worker **non esegue alcuna chiamata di rete**: ogni evento
 normalizzato viene stampato nel log, con `account_number` e `server` mascherati (es.
-`12****78`, `Mo***********mo`). Nessuna password o token compare mai nei log, in nessuna forma.
+`12****78`, `Mo***********mo`). Nel percorso bridge production l'evento resta nell'outbox
+persistente e viene consegnato, con lo stesso `event_id`, dopo il passaggio a `DRY_RUN=false` e
+un nuovo job `provision` che rigeneri `instance.env` (`start/restart` non lo modificano).
+Nessuna password o token compare mai nei log, in nessuna forma.
 
 Per validare il payload esatto che verrebbe inviato, ispezionare l'output di log: contiene il
 dizionario completo del payload (sanitizzato solo su `account_number`/`server`).
@@ -316,8 +333,8 @@ questo repository. Non committare mai `.env` (e' in `.gitignore`).
 
 Con `DRY_RUN=false`, `event_sender.py` esegue fino a 3 tentativi con backoff esponenziale
 limitato (0.5s, 1s, 2s, cap a 8s) sui soli errori transitori (timeout, errori di rete, HTTP
-5xx). Un HTTP 4xx (token invalido, payload rifiutato) non viene ritentato: e' un errore
-permanente finche' non si corregge la configurazione.
+408/425/429 e 5xx). I `401/403` conservano l'evento pending per una rotazione token; gli altri
+4xx non recuperabili finiscono nella dead-letter senza retry infinito.
 
 ## Build Docker
 

@@ -17,13 +17,15 @@ from bridge_mt5_client import BridgeMt5Client
 from config import load_config
 from event_detector import detect_events
 from event_normalizer import normalize_event
+from event_outbox import EventOutbox, OutboxError
 from event_sender import EventSender, mask_value
 from mock_mt5_client import MockMt5Client
 from mt5_client import Mt5Client, Mt5ConnectionError, RealMt5Client
-from snapshot_store import SnapshotStore
+from snapshot_store import SnapshotStore, SnapshotStoreError
 
 HEARTBEAT_FILE = "/tmp/mt5_worker_heartbeat"
 SNAPSHOT_FILE_REAL_MODE = "/app/data/snapshot.json"
+EVENT_OUTBOX_FILE_REAL_MODE = "/app/data/event_outbox.json"
 
 logger = logging.getLogger("mt5_worker.main")
 
@@ -64,41 +66,57 @@ def _build_client(config) -> Mt5Client:
     return RealMt5Client(config.mt5_login, config.mt5_password, config.mt5_server)
 
 
-def _process_snapshot(current_snapshot, account, snapshot_store: SnapshotStore, sender: EventSender) -> bool:
-    """Rileva/invia gli eventi e avanza il checkpoint solo se il poll e' stato consegnato.
+def _process_snapshot(
+    current_snapshot,
+    account,
+    snapshot_store: SnapshotStore,
+    sender: EventSender,
+    outbox: Optional[EventOutbox] = None,
+) -> bool:
+    """Rileva, persiste e prova a consegnare gli eventi del poll.
 
-    In caso di successo parziale lo snapshot precedente resta su disco: al poll seguente gli
-    eventi vengono rigenerati con lo stesso event_id deterministico. L'ingestion API puo' quindi
-    deduplicare quelli gia' accettati, mentre un evento fallito non viene perso.
+    L'ordine e' intenzionale: l'intero batch entra nell'outbox prima di avanzare lo snapshot.
+    Un crash in mezzo alle due scritture rigenera gli stessi ``event_id`` al riavvio e l'outbox
+    li deduplica. Errori transitori restano pendenti, mentre quelli permanenti finiscono nella
+    dead-letter senza bloccare per sempre l'avanzamento del checkpoint.
+
+    ``outbox=None`` mantiene la chiamata compatibile per mock/test tramite uno store in memoria;
+    il percorso di produzione passa sempre l'istanza persistente creata in ``run``.
     """
+    outbox = outbox or EventOutbox()
     previous_snapshot = snapshot_store.get()
     raw_events = detect_events(previous_snapshot, current_snapshot)
-    all_delivered = True
-
+    payloads = []
     for raw_event in raw_events:
-        payload = normalize_event(
-            raw_event,
-            account_number=account.get("login"),
-            server=account.get("server"),
+        payloads.append(
+            normalize_event(
+                raw_event,
+                account_number=account.get("login"),
+                server=account.get("server"),
+            )
         )
-        result = sender.send(payload)
-        logger.info(
-            "Evento %s (ticket=%s) -> esito invio: %s",
-            payload["event_type"],
-            payload["external_trade_id"],
-            result.status,
-        )
-        if result.status not in ("sent", "dry_run"):
-            all_delivered = False
 
-    if all_delivered:
-        snapshot_store.update(current_snapshot)
-    else:
-        logger.warning(
-            "Uno o piu' eventi del poll non sono stati consegnati: snapshot non aggiornato, "
-            "il prossimo poll li rigenerera' con event_id deterministico."
+    enqueued = outbox.enqueue_many(payloads)
+    snapshot_store.update(current_snapshot)
+    drain_result = outbox.drain(sender)
+
+    if enqueued or drain_result.pending:
+        logger.info(
+            "Outbox trade-sync: nuovi=%s inviati=%s dry_run=%s dead_letter=%s "
+            "fallimenti_transitori=%s pendenti=%s",
+            enqueued,
+            drain_result.sent,
+            drain_result.dry_run,
+            drain_result.dead_lettered,
+            drain_result.transient_failures,
+            drain_result.pending,
         )
-    return all_delivered
+    if drain_result.pending:
+        logger.warning(
+            "Uno o piu' eventi restano nell'outbox per dry-run o errori recuperabili; saranno "
+            "ritentati in un ciclo successivo."
+        )
+    return drain_result.pending == 0
 
 
 def _write_heartbeat() -> None:
@@ -133,14 +151,35 @@ def run(env: Optional[dict] = None) -> int:
     )
 
     client = _build_client(config)
-    snapshot_store = SnapshotStore(
-        file_path=None if config.mt5_client_source == "mock" else SNAPSHOT_FILE_REAL_MODE
-    )
     sender = EventSender(
         api_url=config.tradejournal_api_url,
         bridge_token=config.tradejournal_bridge_token,
         dry_run=config.dry_run,
     )
+    try:
+        snapshot_store = SnapshotStore(
+            file_path=None if config.mt5_client_source == "mock" else SNAPSHOT_FILE_REAL_MODE
+        )
+        outbox = EventOutbox(
+            file_path=None
+            if config.mt5_client_source == "mock"
+            else EVENT_OUTBOX_FILE_REAL_MODE
+        )
+    except (OutboxError, SnapshotStoreError, OSError) as exc:
+        logger.error("Impossibile caricare lo stato persistente del worker: %s", exc)
+        return 1
+
+    # Gli eventi sopravvissuti a un riavvio non dipendono da una nuova lettura MT5 e possono
+    # essere consegnati subito. Un fallimento transitorio li lascia semplicemente su disco.
+    try:
+        startup_drain = outbox.drain(sender)
+    except (OutboxError, OSError) as exc:
+        logger.error("Impossibile aggiornare l'outbox persistente: %s", exc)
+        return 1
+    if startup_drain.pending:
+        logger.warning(
+            "Outbox ripristinata con %s evento/i ancora pendenti.", startup_drain.pending
+        )
 
     try:
         client.connect()
@@ -169,7 +208,11 @@ def run(env: Optional[dict] = None) -> int:
                 time.sleep(config.poll_interval_seconds)
                 continue
 
-            _process_snapshot(current_snapshot, account, snapshot_store, sender)
+            try:
+                _process_snapshot(current_snapshot, account, snapshot_store, sender, outbox)
+            except (OutboxError, SnapshotStoreError, OSError) as exc:
+                logger.error("Impossibile aggiornare lo stato persistente del worker: %s", exc)
+                return 1
             _write_heartbeat()
 
             if (

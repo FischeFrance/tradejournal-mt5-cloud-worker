@@ -46,6 +46,7 @@ from common import (  # noqa: E402
     BridgeConfig,
     BridgeError,
     format_iso_utc,
+    read_secret_from_env,
 )
 
 T = TypeVar("T")
@@ -91,13 +92,13 @@ def _mask(value: Optional[str]) -> str:
 class Mt5BridgeConfig(BridgeConfig):
     def __init__(self) -> None:
         super().__init__(
-            token=os.environ.get("MT5_BRIDGE_TOKEN", ""),
+            token=read_secret_from_env("MT5_BRIDGE_TOKEN"),
             broker_symbol=os.environ.get("EURUSD_BROKER_SYMBOL") or "EURUSD",
             port=int(os.environ.get("PORT", "8080")),
             host=os.environ.get("HOST", "0.0.0.0"),
         )
         self.mt5_login = os.environ.get("MT5_LOGIN", "")
-        self.mt5_password = os.environ.get("MT5_PASSWORD", "")
+        self.mt5_password = read_secret_from_env("MT5_PASSWORD")
         self.mt5_server = os.environ.get("MT5_SERVER", "")
         self.mt5_terminal_path = os.environ.get("MT5_TERMINAL_PATH", "")
         self.mt5_session_mode = os.environ.get("MT5_SESSION_MODE", SESSION_MODE_LOGIN)

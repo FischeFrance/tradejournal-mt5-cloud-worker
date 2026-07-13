@@ -89,6 +89,8 @@ def test_missing_api_target_fails_without_network_call(mock_post):
     mock_post.assert_not_called()
     assert result.status == "failed"
     assert result.error == "missing_api_target"
+    assert result.failure_type == "transient"
+    assert result.retryable is True
 
 
 @patch("event_sender.requests.post")
@@ -126,19 +128,67 @@ def test_exhausts_retries_on_persistent_server_error(mock_post):
     result = sender.send(PAYLOAD)
 
     assert result.status == "failed"
+    assert result.failure_type == "transient"
     assert result.attempts == 3
     assert mock_post.call_count == 3
 
 
 @patch("event_sender.requests.post")
 def test_client_error_is_not_retried(mock_post):
-    mock_post.return_value = _response(401)
+    mock_post.return_value = _response(422)
     sender = _sender(max_retries=3)
 
     result = sender.send(PAYLOAD)
 
     assert result.status == "failed"
     assert result.error == "rejected_by_api"
+    assert result.failure_type == "permanent"
+    assert result.retryable is False
+    assert result.attempts == 1
+    mock_post.assert_called_once()
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 429])
+@patch("event_sender.requests.post")
+def test_retryable_client_statuses_are_transient(mock_post, status_code):
+    mock_post.return_value = _response(status_code)
+    sender = _sender(max_retries=2)
+
+    result = sender.send(PAYLOAD)
+
+    assert result.status == "failed"
+    assert result.failure_type == "transient"
+    assert result.http_status == status_code
+    assert result.error == f"http_{status_code}"
+    assert result.attempts == 2
+    assert mock_post.call_count == 2
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 409, 422])
+@patch("event_sender.requests.post")
+def test_other_client_statuses_are_permanent(mock_post, status_code):
+    mock_post.return_value = _response(status_code)
+    sender = _sender(max_retries=3)
+
+    result = sender.send(PAYLOAD)
+
+    assert result.failure_type == "permanent"
+    assert result.http_status == status_code
+    assert result.attempts == 1
+    mock_post.assert_called_once()
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+@patch("event_sender.requests.post")
+def test_auth_errors_remain_pending_for_token_rotation(mock_post, status_code):
+    mock_post.return_value = _response(status_code)
+    sender = _sender(max_retries=3)
+
+    result = sender.send(PAYLOAD)
+
+    assert result.failure_type == "transient"
+    assert result.error == "authentication_failed"
+    assert result.http_status == status_code
     assert result.attempts == 1
     mock_post.assert_called_once()
 
@@ -151,7 +201,23 @@ def test_network_exception_is_retried_then_fails(mock_post):
     result = sender.send(PAYLOAD)
 
     assert result.status == "failed"
+    assert result.failure_type == "transient"
     assert mock_post.call_count == 2
+
+
+@patch("event_sender.requests.post")
+def test_request_exception_cannot_echo_authorization_header(mock_post, caplog):
+    token = "never-log-this-token"
+    mock_post.side_effect = requests.exceptions.InvalidHeader(
+        f"Invalid header value: Bearer {token}"
+    )
+    sender = _sender(bridge_token=token, max_retries=1)
+
+    with caplog.at_level("WARNING"):
+        result = sender.send(PAYLOAD)
+
+    assert result.failure_type == "transient"
+    assert token not in caplog.text
 
 
 @patch("event_sender.requests.post")

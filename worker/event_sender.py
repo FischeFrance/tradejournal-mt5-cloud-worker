@@ -5,8 +5,9 @@ Regole di sicurezza (vedi README):
 - maschera sempre account_number e server nei log (il payload HTTP reale, cifrato in transito
   da TLS, contiene i valori veri perche' l'API li usa per validare la connessione);
 - in DRY_RUN=true non esegue alcuna chiamata di rete: stampa solo il payload sanitizzato;
-- esegue un numero limitato di retry con backoff esponenziale sui soli errori transitori
-  (timeout, errori di rete, 5xx). Un 4xx (token invalido, payload rifiutato) non viene ritentato.
+- esegue un numero limitato di retry con backoff esponenziale sugli errori transitori
+  (rete, 408, 425, 429 e 5xx); 401/403 restano recuperabili tramite rotazione token, mentre gli
+  altri 4xx sono rifiuti permanenti e non vengono ritentati.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import requests
 logger = logging.getLogger("mt5_worker.event_sender")
 
 _SECRET_KEY_MARKERS = ("password", "token", "secret")
+_TRANSIENT_HTTP_STATUSES = frozenset((408, 425, 429))
+_RECOVERABLE_AUTH_STATUSES = frozenset((401, 403))
 
 
 def mask_value(value: Optional[str]) -> str:
@@ -59,6 +62,11 @@ class SendResult:
     http_status: Optional[int] = None
     error: Optional[str] = None
     attempts: int = 0
+    failure_type: Optional[str] = None  # None | "transient" | "permanent"
+
+    @property
+    def retryable(self) -> bool:
+        return self.failure_type == "transient"
 
 
 class EventSender:
@@ -96,7 +104,14 @@ class EventSender:
                 "non configurati. Payload sanitizzato: %s",
                 sanitized,
             )
-            return SendResult(status="failed", error="missing_api_target", attempts=0)
+            # E' una configurazione correggibile al riavvio: l'outbox deve conservare l'evento,
+            # non archiviarlo definitivamente in dead-letter.
+            return SendResult(
+                status="failed",
+                error="missing_api_target",
+                attempts=0,
+                failure_type="transient",
+            )
 
         headers = {
             "Content-Type": "application/json",
@@ -104,6 +119,7 @@ class EventSender:
         }
 
         last_error: Optional[str] = None
+        last_http_status: Optional[int] = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = requests.post(
@@ -113,13 +129,15 @@ class EventSender:
                     timeout=self.timeout_seconds,
                 )
             except requests.RequestException as exc:
-                last_error = str(exc)
+                # Alcune eccezioni requests includono gli header (Authorization compreso) nella
+                # propria stringa. Registrare soltanto il tipo mantiene i secret fuori dai log.
+                last_error = type(exc).__name__
                 logger.warning(
-                    "Tentativo %s/%s fallito (errore di rete) per event_id=%s: %s",
+                    "Tentativo %s/%s fallito (errore %s) per event_id=%s.",
                     attempt,
                     self.max_retries,
+                    type(exc).__name__,
                     sanitized_event_id,
-                    exc,
                 )
             else:
                 if response.status_code < 300:
@@ -131,9 +149,30 @@ class EventSender:
                     )
                     return SendResult(status="sent", http_status=response.status_code, attempts=attempt)
 
-                if response.status_code < 500:
-                    # Errore del client (401 token invalido, 422 payload rifiutato, ecc.):
-                    # ritentare non cambierebbe l'esito, quindi ci si ferma subito.
+                if response.status_code in _RECOVERABLE_AUTH_STATUSES:
+                    logger.error(
+                        "Autenticazione API rifiutata (status=%s), event_id=%s; evento "
+                        "conservato per una rotazione token.",
+                        response.status_code,
+                        sanitized_event_id,
+                    )
+                    return SendResult(
+                        status="failed",
+                        http_status=response.status_code,
+                        error="authentication_failed",
+                        attempts=attempt,
+                        failure_type="transient",
+                    )
+
+                is_transient_http = (
+                    response.status_code in _TRANSIENT_HTTP_STATUSES
+                    or 500 <= response.status_code <= 599
+                )
+                if not is_transient_http:
+                    # Un 4xx non recuperabile (422 payload rifiutato, ecc.) non puo' migliorare
+                    # ritentando lo stesso payload. Anche una risposta
+                    # HTTP inattesa fuori da 2xx/4xx/5xx viene classificata fail-closed come
+                    # permanente, invece di creare un retry infinito.
                     logger.error(
                         "Evento rifiutato dall'API (status=%s, non ritentabile), event_id=%s. "
                         "Payload sanitizzato: %s",
@@ -146,9 +185,11 @@ class EventSender:
                         http_status=response.status_code,
                         error="rejected_by_api",
                         attempts=attempt,
+                        failure_type="permanent",
                     )
 
                 last_error = f"http_{response.status_code}"
+                last_http_status = response.status_code
                 logger.warning(
                     "Tentativo %s/%s fallito (status=%s) per event_id=%s",
                     attempt,
@@ -167,4 +208,10 @@ class EventSender:
             sanitized_event_id,
             last_error,
         )
-        return SendResult(status="failed", error=last_error, attempts=self.max_retries)
+        return SendResult(
+            status="failed",
+            http_status=last_http_status,
+            error=last_error,
+            attempts=self.max_retries,
+            failure_type="transient",
+        )

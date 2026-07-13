@@ -1,0 +1,184 @@
+name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}"
+
+x-logging: &instance-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-security: &instance-security
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  stop_grace_period: 45s
+
+services:
+  mt5-runtime:
+    <<: *instance-security
+    # The real entrypoint starts as root only to prepare the fresh named volume and then uses
+    # gosu to become UID/GID 1000. No capability remains useful after that transition.
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    build:
+      context: "${REPOSITORY_ROOT:?REPOSITORY_ROOT is required}"
+      dockerfile: deploy/instance/Dockerfile.runtime
+      target: "${MT5_RUNTIME_TARGET:-real}"
+    image: "${MT5_RUNTIME_IMAGE:-tradejournal/mt5-runtime:local}"
+    platform: linux/amd64
+    container_name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-runtime"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8090"
+      MT5_SESSION_MODE: "login"
+      MT5_LOGIN: "${MT5_LOGIN:?MT5_LOGIN is required}"
+      MT5_PASSWORD_FILE: "/run/secrets/mt5_password"
+      MT5_SERVER: "${MT5_SERVER:?MT5_SERVER is required}"
+      MT5_TERMINAL_PATH: "${MT5_TERMINAL_PATH:-C:\\Program Files\\MetaTrader 5\\terminal64.exe}"
+      PYTHON_WINDOWS_PATH: "${PYTHON_WINDOWS_PATH:-C:\\Python311Embed\\python.exe}"
+      MT5_BRIDGE_TOKEN_FILE: "/run/secrets/mt5_bridge_token"
+      MT5_TEMPLATE_SHA256: "${MT5_TEMPLATE_SHA256:-}"
+      DISPLAY: ":99"
+      WINEPREFIX: "/var/lib/tradejournal/wine-prefix/current"
+      TERMINAL_READY_TIMEOUT_SECONDS: "${TERMINAL_READY_TIMEOUT_SECONDS:-120}"
+    secrets:
+      # Compose file-backed secrets preserve host ownership/mode: uid/gid/mode declarations
+      # would be silently ignored. Release gate: these host files must be regular 0400/0600
+      # files owned by, and readable as, the container runtime UID 1000 before provisioning.
+      - source: mt5_password
+        target: mt5_password
+      - source: mt5_bridge_token
+        target: mt5_bridge_token
+    volumes:
+      - type: volume
+        source: wine-prefix
+        target: /var/lib/tradejournal/wine-prefix
+      # Il target mock ignora questo mount. /dev/null mantiene il mock avviabile anche su una
+      # VPS che non dispone ancora del golden template; il target real fallisce esplicitamente.
+      - type: bind
+        source: "${MT5_TEMPLATE_ARCHIVE:-/dev/null}"
+        target: /opt/tradejournal/template/mt5-prefix.tar.zst
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=1777
+      - /run:rw,nosuid,size=32m,mode=0755
+      - /home/runtime:rw,noexec,nosuid,size=64m,uid=1000,gid=1000,mode=0700
+    expose:
+      - "8090"
+    networks:
+      - instance-internal
+      - runtime-egress
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+      com.tradejournal.role: "mt5-runtime"
+    healthcheck:
+      test: ["CMD", "/opt/tradejournal/runtime/healthcheck-runtime.sh"]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 5
+    logging: *instance-logging
+    cpus: "${RUNTIME_CPUS:-2.0}"
+    mem_limit: "${RUNTIME_MEM_LIMIT:-3g}"
+    pids_limit: 512
+
+  worker:
+    <<: *instance-security
+    build:
+      context: "${REPOSITORY_ROOT:?REPOSITORY_ROOT is required}"
+      dockerfile: docker/Dockerfile
+      target: mock
+    image: "${WORKER_IMAGE:-tradejournal/mt5-worker:local}"
+    container_name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-worker"
+    environment:
+      MOCK_MODE: "false"
+      MT5_CLIENT_SOURCE: "bridge"
+      MT5_BRIDGE_URL: "http://mt5-runtime:8090"
+      MT5_BRIDGE_TOKEN_FILE: "/run/secrets/mt5_bridge_token"
+      MT5_BRIDGE_TIMEOUT_SECONDS: "${MT5_BRIDGE_TIMEOUT_SECONDS:-10}"
+      MT5_DEAL_LOOKBACK_HOURS: "${MT5_DEAL_LOOKBACK_HOURS:-24}"
+      TRADEJOURNAL_API_URL: "${TRADEJOURNAL_API_URL:?TRADEJOURNAL_API_URL is required}"
+      TRADEJOURNAL_BRIDGE_TOKEN_FILE: "/run/secrets/tradejournal_bridge_token"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      DRY_RUN: "${DRY_RUN:-false}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    secrets:
+      # The same host-side ownership release gate applies to worker secrets (container UID 1000).
+      - source: mt5_bridge_token
+        target: mt5_bridge_token
+      - source: tradejournal_bridge_token
+        target: tradejournal_bridge_token
+    volumes:
+      - type: volume
+        source: worker-data
+        target: /app/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=1777
+    networks:
+      - instance-internal
+      - worker-egress
+    depends_on:
+      mt5-runtime:
+        condition: service_healthy
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+      com.tradejournal.role: "worker"
+    healthcheck:
+      test: ["CMD", "/app/docker/healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    logging: *instance-logging
+    cpus: "${WORKER_CPUS:-0.5}"
+    mem_limit: "${WORKER_MEM_LIMIT:-512m}"
+    pids_limit: 128
+
+secrets:
+  mt5_password:
+    file: "${TJ_SECRET_DIR:?TJ_SECRET_DIR is required}/mt5_password"
+  mt5_bridge_token:
+    file: "${TJ_SECRET_DIR:?TJ_SECRET_DIR is required}/mt5_bridge_token"
+  tradejournal_bridge_token:
+    file: "${TJ_SECRET_DIR:?TJ_SECRET_DIR is required}/tradejournal_bridge_token"
+
+volumes:
+  wine-prefix:
+    name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-wine-prefix"
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+  worker-data:
+    name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-worker-data"
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+
+networks:
+  # Only this network is shared by the two services. Marking it internal prevents accidental
+  # routing through it while still allowing worker -> mt5-runtime DNS/service discovery.
+  instance-internal:
+    name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-internal"
+    internal: true
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+  # Separate egress networks let MT5 reach its broker and the worker reach TradeJournal without
+  # putting both services on a second shared network. Neither network publishes a host port.
+  runtime-egress:
+    name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-runtime-egress"
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+  worker-egress:
+    name: "${TJ_PROJECT_NAME:?TJ_PROJECT_NAME is required}-worker-egress"
+    labels:
+      com.tradejournal.managed-by: "provisioning-agent"
+      com.tradejournal.connection-id: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"

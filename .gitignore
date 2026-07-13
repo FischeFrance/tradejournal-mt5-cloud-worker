@@ -18,6 +18,26 @@ data/
 # mai versionato, vedi README "Preparazione runtime MT5".
 runtime/
 
+# Provisioning host-side: istanze, queue, lock, state, secret e golden template sono sempre
+# esterni al repository. Il template contiene binari proprietari e non deve mai entrare in Git.
+provisioning-data/
+instances/
+secrets/
+queue/
+state/
+locks/
+mt5-prefix*.tar.zst
+mt5-prefix*.tar.zst.sha256
+*.tar.zst
+*.tar.zst.sha256
+*.exe
+*.dll
+*.msi
+*.cab
+*.pyd
+wine-prefix*/
+*.processing.json
+
 # Editor / OS
 .DS_Store
 .vscode/

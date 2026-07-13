@@ -8,6 +8,9 @@ import uuid
 
 import pytest
 
+REPOSITORY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, REPOSITORY_ROOT)
+
 WORKER_DIR = os.path.join(os.path.dirname(__file__), "..", "worker")
 sys.path.insert(0, os.path.abspath(WORKER_DIR))
 

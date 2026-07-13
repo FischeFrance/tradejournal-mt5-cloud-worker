@@ -12,12 +12,14 @@ from windows.mt5_bridge import Mt5BridgeConfig, _Mt5Session
 
 _CONFIG_ENV_KEYS = {
     "MT5_BRIDGE_TOKEN",
+    "MT5_BRIDGE_TOKEN_FILE",
     "EURUSD_BROKER_SYMBOL",
     "HOST",
     "PORT",
     "MT5_SESSION_MODE",
     "MT5_LOGIN",
     "MT5_PASSWORD",
+    "MT5_PASSWORD_FILE",
     "MT5_SERVER",
     "MT5_TERMINAL_PATH",
     "MT5_EXPECTED_LOGIN",

@@ -36,6 +36,7 @@ from common import (  # noqa: E402
     BridgeConfig,
     BridgeError,
     format_iso_utc,
+    read_secret_from_env,
 )
 
 #: Epoca fissa usata solo per seminare la generazione deterministica dei prezzi (stesso stile di
@@ -277,7 +278,7 @@ class Handler(BaseBridgeHandler):
 
 def make_config_from_env() -> BridgeConfig:
     return BridgeConfig(
-        token=os.environ.get("MT5_BRIDGE_TOKEN", ""),
+        token=read_secret_from_env("MT5_BRIDGE_TOKEN"),
         broker_symbol=os.environ.get("EURUSD_BROKER_SYMBOL") or "EURUSD",
         port=int(os.environ.get("PORT", "8080")),
         host=os.environ.get("HOST", "0.0.0.0"),
