@@ -1,6 +1,9 @@
-"""mt5-bridge reale: PREDISPOSTO, NON VALIDATO in questa fase (nessun ambiente Windows/Wine/MT5
-disponibile in questa sessione, arm64). Vedi README, sezione "mt5-bridge reale (AMD64, non
-validato)" per lo stato esatto e i passi manuali richiesti prima di un test vero.
+"""mt5-bridge reale per il runtime Python Windows/MetaTrader5 sotto Wine.
+
+L'integrazione di base (import del package, initialize, letture account/terminale/posizioni/ordini
+e shutdown) e' stata validata anche con il Wine dell'app ufficiale MetaTrader 5 su macOS Apple
+Silicon. Restano separati i test automatici di questo modulo, che usano un doppio MetaTrader5 e
+non dipendono mai da Wine, da un terminale reale o da credenziali.
 
 Pensato per girare come Python Windows sotto Wine (`wine python.exe bridge\\windows\\mt5_bridge.py`),
 nello stesso WINEPREFIX del terminale MetaTrader 5, perche' il pacchetto Python `MetaTrader5' e'
@@ -12,11 +15,12 @@ Implementa lo stesso contratto HTTP di bridge/fake/fake_bridge.py (vedi bridge/c
 GET /health, POST /v1/candles e POST /v1/trading/snapshot. Nessun endpoint di trading e nessuna
 chiamata a order_send in questo file, deliberatamente: questo servizio e' di sola lettura.
 
-Credenziali (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_TERMINAL_PATH) lette solo da qui, mai dal
-market-data-worker Linux (vedi worker/config.py, che non le legge affatto) e mai stampate: solo
-mascherate, con lo stesso schema di worker/event_sender.py:mask_value (duplicato qui apposta,
-vedi _mask piu' sotto, per mantenere bridge/ indipendente da worker/ -- sono due processi/
-macchine potenzialmente diverse, non devono condividere codice ne' un ambiente Python comune).
+Configurazione della sessione MT5 letta solo da qui, mai dal market-data-worker Linux (vedi
+worker/config.py, che non la legge affatto). ``MT5_SESSION_MODE=login`` conserva il login
+esplicito con MT5_LOGIN / MT5_PASSWORD / MT5_SERVER; ``MT5_SESSION_MODE=existing`` si collega
+invece alla sessione gia' aperta nel terminale indicato da MT5_TERMINAL_PATH, senza mai chiamare
+``mt5.login()``. Login, server, password e token non vengono mai stampati in chiaro: i valori
+identificativi sono mascherati e i segreti redatti (vedi _mask e _Mt5Session._sanitize_error).
 
 Sicurezza: usare esclusivamente la password INVESTOR (sola lettura) dell'account MT5, mai quella
 di trading (stesso principio di worker/mt5_client.py e README).
@@ -60,6 +64,9 @@ _TIMEFRAME_MT5_CONSTANT_NAMES = {
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+SESSION_MODE_LOGIN = "login"
+SESSION_MODE_EXISTING = "existing"
+SESSION_MODES = {SESSION_MODE_LOGIN, SESSION_MODE_EXISTING}
 
 
 def _epoch_to_utc_z(epoch_seconds: Any) -> str:
@@ -93,24 +100,54 @@ class Mt5BridgeConfig(BridgeConfig):
         self.mt5_password = os.environ.get("MT5_PASSWORD", "")
         self.mt5_server = os.environ.get("MT5_SERVER", "")
         self.mt5_terminal_path = os.environ.get("MT5_TERMINAL_PATH", "")
+        self.mt5_session_mode = os.environ.get("MT5_SESSION_MODE", SESSION_MODE_LOGIN)
+        self.mt5_expected_login = os.environ.get("MT5_EXPECTED_LOGIN", "")
+        self.mt5_expected_server = os.environ.get("MT5_EXPECTED_SERVER", "")
 
-        if not self.mt5_login or not self.mt5_password or not self.mt5_server:
+        if self.mt5_session_mode not in SESSION_MODES:
             raise ValueError(
-                "MT5_LOGIN / MT5_PASSWORD / MT5_SERVER sono obbligatori per avviare mt5-bridge. "
-                "MT5_PASSWORD deve essere la password INVESTOR (sola lettura), mai quella di "
-                "trading (vedi README)."
+                "MT5_SESSION_MODE non valido: i valori ammessi sono 'login' ed 'existing'."
             )
+
+        if self.mt5_session_mode == SESSION_MODE_EXISTING and not self.mt5_terminal_path:
+            raise ValueError(
+                "MT5_TERMINAL_PATH e' obbligatorio quando MT5_SESSION_MODE=existing."
+            )
+
+        if self.mt5_session_mode == SESSION_MODE_LOGIN and (
+            not self.mt5_login or not self.mt5_password or not self.mt5_server
+        ):
+            raise ValueError(
+                "MT5_LOGIN / MT5_PASSWORD / MT5_SERVER sono obbligatori quando "
+                "MT5_SESSION_MODE=login. MT5_PASSWORD deve essere la password INVESTOR "
+                "(sola lettura), mai quella di trading (vedi README)."
+            )
+        if self.mt5_session_mode == SESSION_MODE_LOGIN:
+            try:
+                int(self.mt5_login)
+            except ValueError:
+                raise ValueError(
+                    "MT5_LOGIN deve essere un identificativo numerico quando "
+                    "MT5_SESSION_MODE=login."
+                ) from None
 
 
 class _Mt5Session:
-    """Incapsula lo stato di connessione al terminale MT5 (lazy import + login + shutdown), con
-    un numero limitato di retry sulle operazioni potenzialmente transitorie (IPC col terminale
-    non ancora pronto). Stesso schema di worker/mt5_client.py:RealMt5Client, non condiviso via
-    import per la stessa ragione di _mask (bridge/ indipendente da worker/)."""
+    """Incapsula lo stato di connessione al terminale MT5 (lazy import, selezione della sessione
+    e shutdown), con un numero limitato di retry sulle operazioni potenzialmente transitorie
+    (IPC col terminale non ancora pronto). Stesso schema di
+    worker/mt5_client.py:RealMt5Client, non condiviso via import per la stessa ragione di _mask
+    (bridge/ indipendente da worker/)."""
 
-    def __init__(self, config: Mt5BridgeConfig, sleep_fn: Callable[[float], None] = time.sleep) -> None:
+    def __init__(
+        self,
+        config: Mt5BridgeConfig,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        mt5_module: Any = None,
+    ) -> None:
         self._config = config
         self._sleep = sleep_fn
+        self._injected_mt5 = mt5_module
         self._mt5 = None
         self._connected = False
         # MetaTrader5 condivide una singola sessione IPC. ThreadingHTTPServer puo' servire
@@ -119,6 +156,8 @@ class _Mt5Session:
         self._operation_lock = threading.RLock()
 
     def _import_mt5(self):
+        if self._injected_mt5 is not None:
+            return self._injected_mt5
         try:
             import MetaTrader5 as mt5  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -130,20 +169,63 @@ class _Mt5Session:
             ) from exc
         return mt5
 
+    def _sanitize_error(self, error: BaseException) -> str:
+        """Rimuove dalla diagnostica qualunque valore sensibile noto alla configurazione.
+
+        Anche un'eccezione sollevata direttamente dall'estensione MetaTrader5 potrebbe includere
+        gli argomenti della chiamata nel proprio testo. La sanitizzazione viene quindi applicata
+        sia ai messaggi di retry sia all'errore finale restituito dal bridge.
+        """
+        text = str(error)
+        replacements = [
+            (getattr(self._config, "mt5_password", ""), "<redacted>"),
+            (getattr(self._config, "token", ""), "<redacted>"),
+            (
+                getattr(self._config, "mt5_login", ""),
+                _mask(getattr(self._config, "mt5_login", "")),
+            ),
+            (
+                getattr(self._config, "mt5_server", ""),
+                _mask(getattr(self._config, "mt5_server", "")),
+            ),
+            (
+                getattr(self._config, "mt5_expected_login", ""),
+                _mask(getattr(self._config, "mt5_expected_login", "")),
+            ),
+            (
+                getattr(self._config, "mt5_expected_server", ""),
+                _mask(getattr(self._config, "mt5_expected_server", "")),
+            ),
+        ]
+        # Sostituire prima i valori piu' lunghi evita che un identificativo contenuto in un
+        # altro valore impedisca la redazione completa di quest'ultimo.
+        for raw_value, replacement in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+            if raw_value:
+                text = text.replace(raw_value, replacement)
+        return text
+
     def _call_with_retry(self, description: str, fn: Callable[[], T]) -> T:
-        last_error: Optional[BaseException] = None
+        last_error = "errore sconosciuto"
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return fn()
             except Exception as exc:  # noqa: BLE001 - qualunque errore del pacchetto MetaTrader5
-                last_error = exc
-                sys.stderr.write(f"[mt5-bridge] tentativo {attempt}/{MAX_RETRIES} fallito per '{description}': {exc}\n")
+                last_error = self._sanitize_error(exc)
+                sys.stderr.write(
+                    f"[mt5-bridge] tentativo {attempt}/{MAX_RETRIES} fallito per "
+                    f"'{description}': {last_error}\n"
+                )
                 if attempt < MAX_RETRIES:
                     self._sleep(RETRY_DELAY_SECONDS * attempt)
         raise BridgeError(502, "mt5_error", f"'{description}' fallita dopo {MAX_RETRIES} tentativi: {last_error}")
 
     def connect(self) -> None:
-        login_id = int(self._config.mt5_login)
+        session_mode = self._config.mt5_session_mode
+        login_id = int(self._config.mt5_login) if session_mode == SESSION_MODE_LOGIN else None
+        connected_identity = {
+            "login": _mask(self._config.mt5_login),
+            "server": _mask(self._config.mt5_server),
+        }
 
         def _do_connect() -> None:
             mt5 = self._import_mt5()
@@ -152,9 +234,44 @@ class _Mt5Session:
                 init_kwargs["path"] = self._config.mt5_terminal_path
             if not mt5.initialize(**init_kwargs):
                 raise RuntimeError(f"initialize() fallito: {mt5.last_error()}")
-            authorized = mt5.login(login_id, password=self._config.mt5_password, server=self._config.mt5_server)
-            if not authorized:
-                raise RuntimeError(f"login() fallito: {mt5.last_error()} (credenziali non stampate per sicurezza)")
+
+            if session_mode == SESSION_MODE_LOGIN:
+                authorized = mt5.login(
+                    login_id,
+                    password=self._config.mt5_password,
+                    server=self._config.mt5_server,
+                )
+                if not authorized:
+                    raise RuntimeError(
+                        f"login() fallito: {mt5.last_error()} "
+                        "(credenziali non stampate per sicurezza)"
+                    )
+            else:
+                account = mt5.account_info()
+                if account is None:
+                    raise RuntimeError(
+                        f"account_info() dopo initialize() ha restituito None: {mt5.last_error()}"
+                    )
+
+                actual_login = str(account.login)
+                actual_server = str(account.server)
+                expected_login = self._config.mt5_expected_login
+                expected_server = self._config.mt5_expected_server
+                if expected_login and actual_login != expected_login:
+                    raise RuntimeError(
+                        "MT5_EXPECTED_LOGIN non coincide con l'account della sessione "
+                        f"esistente (atteso={_mask(expected_login)}, "
+                        f"effettivo={_mask(actual_login)})."
+                    )
+                if expected_server and actual_server != expected_server:
+                    raise RuntimeError(
+                        "MT5_EXPECTED_SERVER non coincide con il server della sessione "
+                        f"esistente (atteso={_mask(expected_server)}, "
+                        f"effettivo={_mask(actual_server)})."
+                    )
+                connected_identity["login"] = _mask(actual_login)
+                connected_identity["server"] = _mask(actual_server)
+
             if not mt5.symbol_select(self._config.broker_symbol, True):
                 raise RuntimeError(f"symbol_select({self._config.broker_symbol!r}) fallito: {mt5.last_error()}")
             self._mt5 = mt5
@@ -162,8 +279,8 @@ class _Mt5Session:
         self._call_with_retry("connessione al terminale MT5", _do_connect)
         self._connected = True
         sys.stderr.write(
-            f"[mt5-bridge] Connesso al terminale MT5 (server={_mask(self._config.mt5_server)}, "
-            f"login={_mask(self._config.mt5_login)}).\n"
+            f"[mt5-bridge] Connesso al terminale MT5 (session_mode={session_mode}, "
+            f"server={connected_identity['server']}, login={connected_identity['login']}).\n"
         )
 
     def health(self) -> dict:
@@ -172,11 +289,14 @@ class _Mt5Session:
 
     def _health_unlocked(self) -> dict:
         if not self._connected or self._mt5 is None:
+            server_hint = getattr(self._config, "mt5_server", "") or getattr(
+                self._config, "mt5_expected_server", ""
+            )
             return {
                 "status": "degraded",
                 "terminal_connected": False,
                 "account_connected": False,
-                "server": _mask(self._config.mt5_server),
+                "server": _mask(server_hint),
                 "version": "unknown",
             }
         info = self._mt5.account_info()
@@ -188,7 +308,10 @@ class _Mt5Session:
             # info.server e' gia' il nome server MT5: mascherato comunque, coerente con la
             # sanitizzazione applicata ovunque in questo repository ai nomi server (vedi
             # worker/event_sender.py:mask_value).
-            "server": _mask(info.server) if info is not None else _mask(self._config.mt5_server),
+            "server": _mask(info.server) if info is not None else _mask(
+                getattr(self._config, "mt5_server", "")
+                or getattr(self._config, "mt5_expected_server", "")
+            ),
             "version": str(self._mt5.version()) if hasattr(self._mt5, "version") else "unknown",
         }
 
@@ -359,7 +482,10 @@ class _Mt5Session:
                 try:
                     self._mt5.shutdown()
                 except Exception as exc:  # noqa: BLE001 - shutdown deve essere best-effort
-                    sys.stderr.write(f"[mt5-bridge] shutdown() ha sollevato un errore (ignorato): {exc}\n")
+                    sys.stderr.write(
+                        "[mt5-bridge] shutdown() ha sollevato un errore (ignorato): "
+                        f"{self._sanitize_error(exc)}\n"
+                    )
             self._connected = False
 
 

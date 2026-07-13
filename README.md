@@ -2,19 +2,21 @@
 
 POC **isolato** per un Cloud Sync self-hosted di MetaTrader 5: un worker Python che rileva eventi
 di trading (apertura/modifica/chiusura posizioni, ordini pendenti) e li invia all'API di
-ingestion di TradeJournal, in esecuzione dentro un container Docker (Wine + MT5 in una fase
-futura). Questo repository e' **indipendente** dal repository principale `tradejournal-drp`, che
-non viene mai modificato da questo progetto.
+ingestion di TradeJournal. Il worker applicativo gira in Docker; con MT5 reale usa un bridge
+HTTP read-only eseguito da Python Windows nello stesso Wine prefix del terminale. Questo
+repository e' **indipendente** dal repository principale `tradejournal-drp`, che non viene mai
+modificato da questo progetto.
 
 Stato attuale:
 - **Fase 1 (fatta): modalita' mock.** Nessuna dipendenza da Wine/MT5. Simula una sequenza
   completa di eventi e li invia (o stampa, in dry-run) verso l'API TradeJournal.
-- **Fase 2 (branch `feature/mt5-wine-runtime`): infrastruttura MT5 reale + Wine predisposta e
-  costruibile.** Lo stage `real-mt5` del Dockerfile, `RealMt5Client` (retry limitato, mapping
-  completo dei campi, nessun segreto nei log) e il compose dedicato sono implementati e validati
-  per quanto possibile su macOS (config, build sintattica, nessuna regressione mock). Il test
-  end-to-end contro un terminale MT5 vero resta da fare su una **VPS Ubuntu amd64** -- vedi
-  "Fase 2: MT5 reale + Wine" piu' sotto per la differenza esatta tra "predisposto" e "testato".
+- **Fase 2 (branch `feature/mt5-wine-runtime`): infrastruttura MT5 reale + Wine.** Lo stage
+  `real-mt5` del Dockerfile e il client legacy `RealMt5Client` restano predisposti per una VPS
+  Ubuntu amd64. Il percorso raccomandato e' ora il bridge con Python Windows: su macOS Apple
+  Silicon e' stata verificata realmente la connessione IPC al terminale ufficiale tramite
+  `initialize(path=...)`, con letture `terminal_info()`/`account_info()`/`positions_get()`/
+  `orders_get()` e `shutdown()`. Snapshot HTTP completo e stabilita' prolungata restano da
+  validare; vedi "mt5-bridge reale".
 - **Fase 3 (fatta, validata su Docker locale arm64): modalita' research (dati di mercato).**
   Processo separato (`market-data-worker`, `worker/market_data_main.py`) che raccoglie candele
   OHLC e le salva su un Postgres locale, dietro `APP_MODE=research` + `ENABLE_MARKET_DATA=true`
@@ -22,10 +24,12 @@ Stato attuale:
   fase (nessuna dipendenza da Wine/MT5): vedi "Modalita' research (dati di mercato)" piu' sotto.
 - **Trade-sync via bridge HTTP:** il worker Linux usa `GET /health` e una sola
   `POST /v1/trading/snapshot` per poll. Il fake deterministico e il compose locale girano anche
-  su ARM64; il bridge Windows reale resta predisposto ma non validato su VPS AMD64.
+  su ARM64. Il core IPC del bridge Windows e' stato verificato sul terminale MT5 ufficiale per
+  macOS; il flusso HTTP reale completo e il deployment VPS AMD64 restano da validare.
 
-Nessun deploy, nessuna risorsa cloud, nessuna credenziale reale sono stati usati per costruire
-questo POC.
+Nessun deploy o risorsa cloud e' stato creato. Nessuna credenziale reale e' inserita nel
+repository, nei test o nella documentazione; la verifica macOS ha riusato una sessione gia'
+aperta senza fornire la password al bridge.
 
 ## Contratto del payload
 
@@ -78,8 +82,8 @@ bridge/
                          Wine/MT5, gira su qualunque architettura (usato per i test/ARM64)
     Dockerfile             Immagine del fake bridge (SOLO test/validazione locale)
   windows/
-    mt5_bridge.py          Bridge reale: PREDISPOSTO, NON VALIDATO (richiede Windows Python
-                         sotto Wine + pacchetto MetaTrader5, vedi sezione "mt5-bridge")
+    mt5_bridge.py          Bridge reale: core IPC validato su macOS; snapshot HTTP completo e
+                         runtime prolungato ancora da validare (vedi sezione "mt5-bridge")
 ```
 
 Il trade-sync worker (`main.py`) e il market-data-worker (`market_data_main.py`) sono due
@@ -99,7 +103,7 @@ su ogni chiamata al pacchetto `MetaTrader5`, e non stampa mai `MT5_LOGIN`/`MT5_P
 chiaro (sempre mascherati via `event_sender.mask_value`). Resta pero' **non testabile
 end-to-end** senza un terminale MT5 reale: vedi "Fase 2: MT5 reale + Wine" per cosa e' stato
 effettivamente validato (mapping dei campi e retry, con un modulo `MetaTrader5` finto iniettato
-nei test) e cosa no (la connessione IPC reale al terminale).
+nei test) e cosa no (la connessione IPC reale di questo client Linux legacy al terminale).
 
 ## Trade-sync tramite mt5-bridge HTTP
 
@@ -114,8 +118,10 @@ MetaTrader 5 + Windows Python (stesso WINEPREFIX)
 ```
 
 Il worker Linux non contiene credenziali MT5 e non importa mai `MetaTrader5`: conosce soltanto
-`MT5_BRIDGE_URL` e `MT5_BRIDGE_TOKEN`. Login, server, password investor e percorso del terminale
-vivono esclusivamente nel processo bridge Windows. `MT5_BRIDGE_TOKEN` autentica worker -> bridge;
+`MT5_BRIDGE_URL` e `MT5_BRIDGE_TOKEN`. Percorso del terminale e configurazione della sessione
+vivono esclusivamente nel processo bridge Windows. In `MT5_SESSION_MODE=login` anche login,
+server e password investor appartengono solo al bridge; in `existing` non e' richiesta alcuna
+password e il bridge non esegue `mt5.login()`. `MT5_BRIDGE_TOKEN` autentica worker -> bridge;
 `TRADEJOURNAL_BRIDGE_TOKEN` autentica worker -> app e deve essere un valore differente.
 
 `MT5_CLIENT_SOURCE` accetta `mock`, `bridge` o `direct`. `MOCK_MODE` resta accettato come alias
@@ -230,11 +236,13 @@ snapshot persistito, il worker emette `trade_opened`: lo snapshot iniziale vuoto
 
 Questo test resta obbligatorio prima di dichiarare funzionante il runtime reale:
 
-1. usare Ubuntu AMD64 e un account demo con password investor, mai un account live;
+1. usare Ubuntu AMD64, un terminale separato e un account demo con
+   `MT5_SESSION_MODE=login` e password investor, mai un account live;
 2. installare terminale MT5 e Python Windows nello stesso `WINEPREFIX` e installare
    `bridge/windows/requirements.txt` con quel Python Windows;
-3. avviare `bridge/windows/mt5_bridge.py` nello stesso prefix, con credenziali MT5 e
-   `MT5_BRIDGE_TOKEN` nell'ambiente del solo bridge; non esporre la porta 8080 su Internet;
+3. avviare `bridge/windows/mt5_bridge.py` nello stesso prefix, con
+   `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`, percorso terminale e `MT5_BRIDGE_TOKEN`
+   nell'ambiente del solo bridge; non esporre la porta 8080 su Internet;
 4. verificare da una rete privata `GET /health`, auth 401 con token errato e uno snapshot con
    ticket stringa/timestamp UTC/array vuoti; confrontare account, posizioni, pending e deal con
    il terminale;
@@ -246,7 +254,8 @@ Questo test resta obbligatorio prima di dichiarare funzionante il runtime reale:
 7. riavviare soltanto il worker e verificare volume snapshot, event_id stabili, zero eventi
    duplicati e comportamento corretto dopo disconnessione/riconnessione.
 
-Il bridge reale e' quindi **prepared but unvalidated** fino al completamento di questa checklist.
+Il core IPC e' gia' stato verificato localmente su macOS; il deployment VPS e il flusso HTTP
+completo restano **prepared but unvalidated** fino al completamento di questa checklist.
 Una chiusura parziale non e' rappresentata correttamente dal contratto attuale: il detector non
 tratta ancora una riduzione di volume come chiusura parziale e questa fase non ne amplia il
 contratto. Nell'app corrente `trade_opened` crea una notifica dedicata; modifica e chiusura
@@ -337,7 +346,7 @@ Il container gira con un **utente non-root** (`worker`, uid 1000), ha un `HEALTH
 un file di heartbeat aggiornato a ogni ciclo di poll (`worker/main.py:HEARTBEAT_FILE`,
 verificato da `docker/healthcheck.sh`) e `restart: unless-stopped`.
 
-## Limiti del test su macOS
+## Stato del test su macOS
 
 Questo POC e' stato verificato su macOS Apple Silicon con Colima e Docker CLI. In particolare:
 
@@ -346,22 +355,27 @@ Questo POC e' stato verificato su macOS Apple Silicon con Colima e Docker CLI. I
   7 eventi) — vedi la sezione "Verifiche eseguite" piu' sotto per l'esito esatto.
 - I comandi Docker (`docker compose -f docker-compose.mock.yml config|build|up|down`) sono stati
   eseguiti con runtime Linux `aarch64`; build, healthcheck e arresto sono risultati corretti.
-- MetaTrader 5 non gira nativamente su macOS (e' un eseguibile Windows) ne' sotto Docker su
-  macOS senza un layer Windows/Wine aggiuntivo con supporto grafico — per questo la Fase 2
-  (MT5 reale) e' esplicitamente rimandata a un test su **Ubuntu** (vedi sotto), dove Wine e'
-  supportato nativamente da Docker senza virtualizzazione annidata.
+- L'app ufficiale MetaTrader 5 fornisce il proprio Wine prefix. Usando quel runtime e un Python
+  Windows 3.11 AMD64 embeddable installato nello stesso prefix sono stati verificati realmente
+  import di `MetaTrader5` e NumPy, `initialize(path=...)`, `terminal_info()`, `account_info()`,
+  `positions_get()`, `orders_get()` e `shutdown()` contro il terminale principale gia' aperto.
+- Questa prova convalida la compatibilita' IPC di base del bridge su Apple Silicon, non ancora
+  l'intero server HTTP: restano da esercitare end-to-end `/v1/candles` e
+  `/v1/trading/snapshot` (inclusi deal reali), riconnessioni e una sessione prolungata 24/48 ore.
+  Il deployment separato/headless resta da provare su **Ubuntu AMD64**.
 
 ## Fase 2: MT5 reale + Wine
 
 Sviluppata sul branch `feature/mt5-wine-runtime`, a partire dalla base mock gia' verificata
 (Fase 1, invariata). Copre l'infrastruttura container (Wine, Xvfb, directory persistente,
-entrypoint/healthcheck dedicati) e il client Python (`RealMt5Client`), ma **il test end-to-end
-contro un terminale MT5 vero non e' stato eseguito**: richiede una VPS Ubuntu amd64, non
-disponibile in questa sessione di sviluppo (macOS Apple Silicon).
+entrypoint/healthcheck dedicati) e il client Python legacy (`RealMt5Client`). Il suo test
+end-to-end containerizzato contro un terminale MT5 vero non e' stato eseguito e richiede una
+VPS Ubuntu amd64. Questo limite riguarda il percorso legacy `direct`; il percorso bridge con
+Python Windows ha invece superato la prova IPC di base sul Mac descritta sopra.
 
-### Differenza tra modalita' mock e reale
+### Differenza tra mock e percorso `direct` legacy
 
-| | Mock (Fase 1) | Reale (Fase 2) |
+| | Mock (Fase 1) | `direct` legacy (Fase 2) |
 |---|---|---|
 | Stage Dockerfile | `mock` | `real-mt5` |
 | Compose | `docker-compose.mock.yml` | `docker-compose.yml` |
@@ -508,11 +522,10 @@ prolungato contro un terminale MT5 reale:
   affidabile solo quando il processo Python che lo importa gira anch'esso dentro Wine (Python
   Windows eseguito via `wine python.exe`), non come processo Python Linux nativo che parla con
   un terminale Wine "esterno". Questo Dockerfile/worker eseguono oggi un Python Linux nativo
-  (`python:3.11-slim`): predispone Wine/Xvfb/la directory persistente, ma la scelta tra
-  "eseguire il worker stesso dentro Wine" e "un bridge IPC/HTTP verso un piccolo processo
-  Python-Windows dedicato" resta un lavoro architetturale aperto, da risolvere durante il primo
-  test reale su VPS. `RealMt5Client._import_mt5()` fallira' con un errore chiaro (non un crash
-  silenzioso) finche' questo non e' risolto.
+  (`python:3.11-slim`) e quindi il percorso `direct` non puo' importare quel pacchetto. Il
+  percorso raccomandato risolve il confine tramite il bridge Python-Windows dedicato descritto
+  piu' sotto; `RealMt5Client._import_mt5()` continua a fallire con un errore chiaro nel runtime
+  Linux legacy.
 - **Build riuscita su macOS Apple Silicon (Colima, emulazione QEMU `linux/amd64`), ma resta solo
   un test d'infrastruttura.** `docker compose -f docker-compose.yml config` e `build` sono stati
   validati con successo (Wine `11.0.0.0~bookworm-1` installato correttamente, ~230s sotto
@@ -520,7 +533,7 @@ prolungato contro un terminale MT5 reale:
   avvia, l'assenza di `terminal64.exe` viene segnalata chiaramente, `RealMt5Client.connect()`
   fallisce in modo pulito e senza segreti nei log, e l'entrypoint propaga l'exit code
   correttamente. Questo valida l'infrastruttura del container, **non** la connessione IPC a un
-  terminale MT5 vero (mai disponibile in questa sessione) — vedi "Verifiche eseguite" per il
+  terminale MT5 vero del percorso container `direct` — vedi "Verifiche eseguite" per il
   dettaglio. Il test definitivo va comunque rifatto nativamente su una VPS Ubuntu amd64 (build
   nativa piu' veloce, e soprattutto un terminale MT5 reale da fornire).
 - **Xvfb stampa un avviso innocuo in fase di avvio da utente non-root**
@@ -546,12 +559,12 @@ alcun modo la sincronizzazione dei trade verso TradeJournal (sezioni precedenti 
 README): sono due processi Docker separati, con due compose file separati.
 
 **Cosa NON e' (ancora) questa fase**: nessuna AI, nessun Bias Engine, nessun pattern recognition,
-nessuna connessione a Supabase, nessun deploy cloud, e **nessun runtime MT5 reale validato**: la
-sorgente `mt5` parla con un servizio bridge separato via HTTP (vedi "mt5-bridge" piu' sotto), che
-per i test locali e' un *fake* deterministico (nessuna dipendenza da Wine/MT5, gira anche su
-Ubuntu ARM64); il bridge *reale* (`bridge/windows/mt5_bridge.py`) e' scritto e predisposto ma non
-e' mai stato eseguito contro un terminale MT5 vero in questa fase (richiede Windows Python sotto
-Wine su una VPS AMD64, non disponibile in questa sessione di sviluppo arm64).
+nessuna connessione a Supabase e nessun deploy cloud. La sorgente `mt5` parla con un servizio
+bridge separato via HTTP (vedi "mt5-bridge" piu' sotto), che nei test automatici resta un *fake*
+deterministico (nessuna dipendenza da Wine/MT5, gira anche su Ubuntu ARM64). Del bridge reale
+(`bridge/windows/mt5_bridge.py`) e' stata verificata localmente su macOS la connessione IPC di
+base al terminale; l'intero percorso research via `/v1/candles`, lo snapshot HTTP e la stabilita'
+prolungata non sono ancora stati validati contro dati reali.
 
 ### Principio di isolamento
 
@@ -586,13 +599,17 @@ Wine su una VPS AMD64, non disponibile in questa sessione di sviluppo arm64).
 | `MT5_BRIDGE_TOKEN` | *(vuoto)* | richiesto per i client bridge; stesso valore sul worker e sul bridge, distinto dal token ingestion |
 | `MT5_BRIDGE_TIMEOUT_SECONDS` | `10` | timeout per singola richiesta HTTP al bridge |
 | `MT5_DEAL_LOOKBACK_HOURS` | `24` | trade-sync snapshot; intero 1..168 |
+| `MT5_SESSION_MODE` | `login` | bridge reale: `login` oppure `existing`; valori diversi bloccano l'avvio |
+| `MT5_TERMINAL_PATH` | *(vuoto)* | bridge reale: obbligatorio in `existing`, opzionale (raccomandato) in `login` |
+| `MT5_EXPECTED_LOGIN` / `MT5_EXPECTED_SERVER` | *(vuoto)* | controlli opzionali della sessione gia' aperta in modalita' `existing` |
 | `EURUSD_BROKER_SYMBOL` | `EURUSD` | simbolo con cui il bridge interroga MT5 (puo' differire dal canonico, es. `EURUSD.a`) |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
 
-Con `MT5_CLIENT_SOURCE=bridge`, `MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` /
-`MT5_TERMINAL_PATH` (vedi `.env.example`) appartengono esclusivamente al servizio
-`mt5-bridge` reale (`bridge/windows/mt5_bridge.py`), mai ai worker Linux. Soltanto il percorso
-legacy `direct` legge le prime tre nel trade-sync worker.
+Con `MT5_CLIENT_SOURCE=bridge`, `MT5_SESSION_MODE`, le variabili `MT5_EXPECTED_*` e
+`MT5_TERMINAL_PATH` appartengono esclusivamente al servizio `mt5-bridge` reale
+(`bridge/windows/mt5_bridge.py`), mai ai worker Linux. `MT5_LOGIN` / `MT5_PASSWORD` /
+`MT5_SERVER` sono richieste al bridge soltanto in modalita' `login`; il percorso legacy `direct`
+continua a leggere queste tre variabili nel trade-sync worker.
 
 ### Due sorgenti dati: mock (in-process) e mt5 (bridge HTTP)
 
@@ -627,7 +644,7 @@ Tre pezzi, stesso contratto HTTP (vedi `bridge/common.py`):
 | Servizio | Codice | Dove gira | Dipendenze | Stato |
 |---|---|---|---|---|
 | `mt5-bridge-fake` | `bridge/fake/fake_bridge.py` | Qualunque architettura, incluso Ubuntu ARM64 | Solo standard library | **Funzionante**, usato per i test |
-| `mt5-bridge` (reale) | `bridge/windows/mt5_bridge.py` | Windows Python sotto Wine, VPS AMD64 | Pacchetto `MetaTrader5` | **Predisposto, NON validato** |
+| `mt5-bridge` (reale) | `bridge/windows/mt5_bridge.py` | Windows Python sotto Wine (macOS ufficiale o VPS AMD64) | Pacchetto `MetaTrader5` | **IPC base validato su macOS; HTTP completo da validare** |
 | Client Linux | `worker/market_data_source.py:Mt5MarketDataSource` | market-data-worker (qualunque architettura) | `requests` (gia' presente) | **Funzionante** |
 
 ### Contratto API
@@ -697,43 +714,100 @@ timeout, errore MT5, payload malformato, candela duplicata) tramite un header di
 (`X-Mt5-Fake-Scenario`) usato **solo** dai test automatici (`tests/test_fake_bridge.py`): il
 client di produzione non lo invia mai.
 
-### mt5-bridge reale (AMD64, non validato)
+### mt5-bridge reale: modalita' di sessione
 
 `bridge/windows/mt5_bridge.py` implementa lo stesso contratto usando il pacchetto `MetaTrader5`
-reale: `initialize()` con `MT5_TERMINAL_PATH`, `login()` con `MT5_LOGIN`/`MT5_PASSWORD`/
-`MT5_SERVER`, snapshot read-only via `account_info()`/`positions_get()`/`orders_get()`/
-`history_deals_get()`, `symbol_select()` sul broker symbol, lettura candele via `copy_rates_from_pos`
-(quando `since` e' assente: le candele piu' recenti disponibili, **non** l'intero storico --
-MT5 non ha un'epoca sintetica fissa come il mock/fake) o `copy_rates_range` (quando `since` e'
-presente), esclusione esplicita della candela in formazione, `last_error()` in caso di
-fallimento, `shutdown()` pulito alla chiusura. **Nessuna chiamata di trading** (`order_send` e
-affini non compaiono nel file, verificato anche da un test statico dedicato).
+reale. `MT5_SESSION_MODE` accetta soltanto i due valori seguenti; il default conservativo e'
+`login` e qualunque altro valore blocca l'avvio con un errore esplicito.
 
-**Non ancora impacchettato in un'immagine Docker ne' in un compose file**: a differenza dello
-stage `real-mt5` del trade-sync worker, in questa fase esiste solo lo script Python
-(`bridge/windows/requirements.txt` elenca la sola dipendenza `MetaTrader5`, da installare dentro
-il Python Windows sotto Wine, mai nel Python Linux del market-data-worker). Passi manuali ancora
-da fare prima di un primo test reale su una VPS Ubuntu **AMD64** (mai ARM64: stesso vincolo gia'
-noto per `real-mt5`, vedi "Requisiti VPS Ubuntu amd64" piu' sopra):
+- `MT5_SESSION_MODE=existing`: richiede `MT5_TERMINAL_PATH`, che deve indicare `terminal64.exe`
+  nello stesso `WINEPREFIX` del Python Windows. Esegue
+  `mt5.initialize(path=MT5_TERMINAL_PATH)` e usa l'account gia' collegato nel terminale. Non
+  chiama mai `mt5.login()`, non richiede `MT5_PASSWORD` e non cambia account o tipo di sessione.
+  Dopo l'inizializzazione `account_info()` deve restituire un account, altrimenti l'avvio
+  fallisce. `MT5_EXPECTED_LOGIN` e `MT5_EXPECTED_SERVER` sono
+  controlli opzionali: se impostati devono coincidere rispettivamente con `account_info().login`
+  e, con confronto esatto, `account_info().server`. E' la modalita' adatta al test locale con il
+  terminale principale gia' aperto e collegato.
+- `MT5_SESSION_MODE=login`: mantiene il comportamento storico, eseguendo `initialize()` e poi
+  `mt5.login()`; richiede `MT5_LOGIN`, `MT5_PASSWORD` e `MT5_SERVER`. `MT5_TERMINAL_PATH` resta
+  opzionale: se assente `initialize()` viene chiamato senza `path`, anche se specificarlo e'
+  raccomandato per selezionare il terminale corretto. Va usata con un terminale separato, per
+  esempio su una VPS, e `MT5_PASSWORD` deve essere esclusivamente la password **investor** (sola
+  lettura), mai quella principale/di trading.
 
-1. predisporre Wine + un terminale MT5 funzionante (stesso procedimento di "Preparazione runtime
-   MT5" piu' sopra, stesso `WINEPREFIX`);
-2. installare un Python Windows sotto quel `WINEPREFIX` (es. `wine python-3.11.msi` o
-   equivalente) **senza versionarlo** in questo repository;
-3. `wine python.exe -m pip install -r bridge/windows/requirements.txt` dentro il `WINEPREFIX`;
-4. avviare con `wine python.exe bridge\windows\mt5_bridge.py`, con
-   `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`/`MT5_TERMINAL_PATH`/`MT5_BRIDGE_TOKEN` nell'ambiente
-   di **quel** processo (mai in quello di market-data-worker);
-5. solo a quel punto puntare `MT5_BRIDGE_URL` del market-data-worker verso quell'indirizzo.
+Dopo la connessione il bridge offre snapshot read-only via `account_info()`/`positions_get()`/
+`orders_get()`/`history_deals_get()`, selezione del broker symbol e lettura candele tramite
+`copy_rates_from_pos` o `copy_rates_range`; `shutdown()` chiude la connessione. Login, server,
+token e altri valori sensibili non vengono stampati integralmente. Non esistono chiamate
+`order_send`, `order_check`, `TRADE_ACTION_*` o endpoint che aprono, modificano o chiudono
+ordini: gli unici endpoint restano `GET /health`, `POST /v1/candles` e
+`POST /v1/trading/snapshot`.
 
-Fino a quel test, questo bridge resta **scritto ma non validato**: nessuna riga di questo
-repository dichiara o simula il contrario.
+#### Test locale macOS con il terminale gia' aperto
 
-**Investor password, sempre**: `MT5_PASSWORD` deve essere la password INVESTOR (sola lettura)
-dell'account, mai quella di trading -- stesso principio gia' vale ovunque in questo repository
-(vedi anche `.env.example`). Il bridge legge solo account/snapshot/candele storiche: non ha ne'
-bisogno ne' possibilita' di operare sull'account (nessun endpoint di trading esiste nel
-contratto HTTP).
+L'installazione ufficiale MetaTrader 5 su macOS usa questi valori, gia' configurati come default
+in `scripts/run_mt5_bridge_macos.sh`:
+
+```text
+WINEPREFIX=$HOME/Library/Application Support/net.metaquotes.wine.metatrader5
+WINE_BIN=/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine
+PYTHON_WINDOWS_PATH=C:\Python311Embed\python.exe
+MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+```
+
+Il Python Windows 3.11 AMD64 embeddable e il terminale devono appartenere allo stesso
+`WINEPREFIX`. Il test locale usa la sessione principale gia' collegata senza trasformarla in una
+sessione investor e senza effettuare un nuovo login. Configurazione di esempio richiesta al
+processo bridge:
+
+```dotenv
+MT5_SESSION_MODE=existing
+MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+MT5_EXPECTED_LOGIN=<login>
+MT5_EXPECTED_SERVER=<server esatto>
+MT5_BRIDGE_TOKEN=<token locale>
+HOST=0.0.0.0
+PORT=8090
+```
+
+Esportare le variabili nella shell (quotare i percorsi Windows e quelli macOS con spazi) e poi
+avviare:
+
+```bash
+export MT5_SESSION_MODE=existing
+export MT5_TERMINAL_PATH='C:\Program Files\MetaTrader 5\terminal64.exe'
+export MT5_EXPECTED_LOGIN='<login>'
+export MT5_EXPECTED_SERVER='<server esatto>'
+export MT5_BRIDGE_TOKEN='<token locale>'
+export HOST=0.0.0.0
+export PORT=8090
+
+scripts/run_mt5_bridge_macos.sh
+```
+
+Lo script non contiene credenziali, usa soltanto le variabili gia' esportate, verifica Wine,
+Python Windows e file del bridge, e mostra solo configurazioni non sensibili o mascherate.
+`WINEPREFIX`, `WINE_BIN` e `PYTHON_WINDOWS_PATH` possono essere sovrascritti nell'ambiente. Con
+`HOST=0.0.0.0` proteggere la porta tramite firewall e limitarla alla rete privata; per un test
+solo locale preferire `HOST=127.0.0.1`.
+
+Sul Mac Apple Silicon reale sono gia' riusciti import `MetaTrader5`/NumPy,
+`initialize(path=...)`, `terminal_info()`, `account_info()`, `positions_get()`, `orders_get()` e
+`shutdown()`. Questo dimostra che Python Windows e il terminale comunicano nello stesso prefix;
+non equivale ancora alla validazione di richieste HTTP complete a `/v1/candles` e
+`/v1/trading/snapshot`, di `history_deals_get()` con uscite reali, delle riconnessioni o di una
+prova continuativa 24/48 ore.
+
+#### Deployment separato/VPS in modalita' login
+
+Il bridge non e' ancora impacchettato in un'immagine Docker o compose dedicato. Su una VPS
+Ubuntu **AMD64**, predisporre Wine, terminale MT5 e Python Windows nello stesso `WINEPREFIX`,
+installare `bridge/windows/requirements.txt` con quel Python e avviare il bridge con
+`MT5_SESSION_MODE=login`, `MT5_LOGIN`, `MT5_PASSWORD` investor, `MT5_SERVER`,
+`MT5_BRIDGE_TOKEN` e, raccomandato ma opzionale in questa modalita', `MT5_TERMINAL_PATH`
+nell'ambiente del solo processo bridge. Il worker Linux deve ricevere soltanto URL e token del
+bridge. Esporre la porta esclusivamente su loopback o rete privata, mai direttamente su Internet.
 
 ### Schema database
 
@@ -860,22 +934,22 @@ docker run --rm -v tradejournal-mt5-cloud-worker_mt5-research-postgres-data:/dat
 
 ### Limitazioni note
 
-- **MT5 reale non e' validato**, ne' in modalita' client (vedi "Fase 2: MT5 reale + Wine" piu'
-  sopra) ne' in modalita' research: `mt5-bridge` reale (`bridge/windows/mt5_bridge.py`) e' scritto
-  e sintatticamente verificato (`python -m py_compile`, senza il pacchetto `MetaTrader5`
-  installato: l'import e' lazy), ma non e' mai stato eseguito contro un terminale MT5 vero. Solo
-  `MARKET_DATA_SOURCE=mock` e `MARKET_DATA_SOURCE=mt5` **contro il fake bridge** sono stati
-  effettivamente testati ed eseguiti in questa fase.
+- **Il percorso MT5 reale non e' ancora validato end-to-end.** Il bridge reale e' stato eseguito
+  nel runtime ufficiale macOS fino alle letture IPC di account, terminale, posizioni e ordini;
+  non sono ancora stati verificati contro dati reali il server HTTP, `/v1/candles`, lo snapshot
+  completo (inclusi deal) e il salvataggio research. I test automatici research continuano a
+  usare `MARKET_DATA_SOURCE=mock` o `MARKET_DATA_SOURCE=mt5` contro il fake bridge.
 - **Il bridge reale non ha ancora un'immagine Docker/compose dedicati**: richiede prima Wine +
   Windows Python + il pacchetto `MetaTrader5` installati manualmente sotto lo stesso `WINEPREFIX`
-  del terminale (vedi "mt5-bridge reale (AMD64, non validato)" piu' sopra) -- impacchettarlo in
+  del terminale (vedi "mt5-bridge reale: modalita' di sessione" piu' sopra) -- impacchettarlo in
   un Dockerfile non validabile in questa sessione avrebbe rischiato di sembrare "pronto" senza
   esserlo davvero.
 - **Nessuna limitazione Wine/ARM64 per la modalita' research in se'** (ne' per lo stage
   `research-market-data` ne' per `mt5-bridge-fake`): entrambi sono Python standard library/stdlib
   HTTP, nessuna dipendenza da Wine, girano nativamente su Ubuntu ARM64 (e su qualunque altra
-  architettura con Docker). Il limite ARM64/AMD64 resta interamente confinato a
-  `RealMt5Client`/stage `real-mt5` (trade-sync worker) e al futuro bridge reale.
+  architettura con Docker). Il limite AMD64 resta per `RealMt5Client`/stage `real-mt5` e per il
+  Python Windows del bridge; sul Mac Apple Silicon quest'ultimo gira attraverso il Wine fornito
+  dall'app ufficiale, non come binario ARM64 nativo.
 - Un solo processo market-data-worker e un solo bridge per deployment (nessuna orchestrazione
   multi-istanza), coerente con il limite gia' noto del trade-sync worker.
 - Il mock/fake bridge non riproducono condizioni di errore realistiche della fonte dati (simboli
@@ -928,13 +1002,11 @@ scripts/benchmark.sh --real   # compose reale (Fase 2)
 
 ## Rischi noti
 
-- **MT5 reale non testato end-to-end.** Lo stage `real-mt5`, `RealMt5Client` e
+- **Percorso legacy `direct` non testato end-to-end.** Lo stage `real-mt5`, `RealMt5Client` e
   `docker-compose.yml` sono implementati, con retry limitato e mapping dei campi verificati via
-  test unitari (modulo `MetaTrader5` finto, vedi `tests/test_mt5_client.py`), ma la connessione
-  IPC reale a un terminale MT5 sotto Wine non e' mai stata esercitata (nessun ambiente
-  Linux+Wine con MT5 disponibile in questa sessione). Vedi "Fase 2: MT5 reale + Wine" per il
-  dettaglio completo, inclusa l'incognita architetturale su come eseguire il pacchetto Python
-  `MetaTrader5` (estensione nativa Windows) contro un worker Linux nativo.
+  test unitari (modulo `MetaTrader5` finto, vedi `tests/test_mt5_client.py`), ma il worker Python
+  Linux nativo non puo' importare l'estensione Windows. La connessione IPC reale e' stata invece
+  esercitata dal Python Windows del bridge sul Mac; vedi "mt5-bridge reale" per il perimetro.
 - **Nessuna gestione multiutente/orchestrazione**, nessun Kubernetes, nessuna persistenza di
   credenziali su database: questo worker e' pensato per un singolo processo/singolo account,
   come da requisiti di questo POC.
@@ -943,13 +1015,13 @@ scripts/benchmark.sh --real   # compose reale (Fase 2)
 - **cpus/mem_limit nei compose file** sono limiti indicativi; vanno ricalibrati per l'hardware
   reale di destinazione (laptop di sviluppo per il mock, VPS Ubuntu per il reale) prima di un
   uso prolungato.
-- **mt5-bridge reale non validato.** Il client Linux (`Mt5MarketDataSource`) e il fake bridge
+- **mt5-bridge reale validato solo a livello IPC di base.** Il client Linux
+  (`Mt5MarketDataSource`) e il fake bridge
   (`bridge/fake/fake_bridge.py`) sono implementati e testati (unitari, contratto HTTP,
-  end-to-end contro Postgres reale, e manualmente via Docker Compose). Il bridge reale
-  (`bridge/windows/mt5_bridge.py`) e' scritto e sintatticamente verificato ma **mai eseguito**
-  contro Wine/Windows Python/un terminale MT5 vero: richiede una VPS Ubuntu AMD64, non disponibile
-  in questa sessione (arm64). Nessuna immagine Docker/compose esiste ancora per il bridge reale
-  (vedi "mt5-bridge reale (AMD64, non validato)").
+  end-to-end contro Postgres reale, e manualmente via Docker Compose). Il bridge reale e' stato
+  collegato al terminale ufficiale sul Mac e ha letto terminale/account/posizioni/ordini, ma il
+  contratto HTTP completo, i deal, le riconnessioni e il funzionamento prolungato restano da
+  provare. Nessuna immagine Docker/compose esiste ancora per il bridge reale.
 - **Log "Backfill" del market-data-worker e' riusato anche per il ciclo immediatamente dopo un
   riavvio**, anche quando esiste gia' un checkpoint: il comportamento e' corretto (riparte dal
   checkpoint reale letto da Postgres via `MAX(open_time)`, nessuna candela persa ne' duplicata,
@@ -1011,9 +1083,9 @@ In macOS Apple Silicon, Colima + Docker CLI (build amd64 sotto emulazione QEMU):
   investor password, `RealMt5Client.connect()` fallisce in modo pulito
   (`MT5_LOGIN / MT5_PASSWORD / MT5_SERVER non configurati.`, nessun segreto in chiaro dato che
   erano tutti vuoti), l'entrypoint propaga l'exit code (1) e arresta Xvfb ordinatamente.
-- **Non verificato** (richiede una VPS Ubuntu amd64 con un vero terminale MT5, vedi "Fase 2: MT5
-  reale + Wine"): connessione IPC reale al terminale, `account_info`/posizioni/ordini/deal
-  contro un account demo vero, comportamento di `reconnect()` su una disconnessione reale.
+- **Non verificato per il client `direct`** (richiede una VPS Ubuntu amd64 con un vero terminale
+  MT5, vedi "Fase 2: MT5 reale + Wine"): connessione IPC del worker Linux legacy,
+  `account_info`/posizioni/ordini/deal e `reconnect()` su una disconnessione reale.
 - Dopo la verifica, network/volume Docker creati per il test e la directory `runtime/` locale
   sono stati rimossi: nessuna risorsa lasciata in esecuzione.
 - `git diff --check`: nessun conflitto/whitespace error (invariato dalla Fase 1).
@@ -1132,13 +1204,11 @@ ne' `platform: linux/amd64`, a differenza dello stage `real-mt5`**):
 - Dopo la verifica, container/rete/volume/immagini di test sono stati fermati e il volume
   Postgres di test rimosso (conteneva solo dati sintetici generati durante la validazione):
   nessuna risorsa lasciata in esecuzione.
-- **Non verificato** (richiede Windows Python sotto Wine + un terminale MT5 reale su una VPS
-  Ubuntu AMD64, non disponibile in questa sessione arm64): l'intero bridge reale
-  (`bridge/windows/mt5_bridge.py`) -- `initialize()`/`login()`/`symbol_select()` contro un
-  terminale vero, `copy_rates_from_pos`/`copy_rates_range` contro dati di mercato reali,
-  `last_error()` su un fallimento reale, comportamento di `shutdown()` in chiusura. Solo
-  `python -m py_compile` (sintassi) e un controllo statico sull'assenza di chiamate di trading
-  sono stati eseguiti su questo file.
+- **In quella fase non verificato contro MT5 reale**: successivamente, sul Mac Apple Silicon con
+  il Wine dell'app ufficiale, un Python Windows 3.11 AMD64 nello stesso prefix ha completato
+  `initialize(path=...)`, letture terminale/account/posizioni/ordini e `shutdown()`. Restano non
+  verificati end-to-end il server HTTP, `symbol_select()`/candele reali, deal/snapshot completo,
+  errori e riconnessioni reali.
 
 ```bash
 docker compose -f docker-compose.mock.yml -f docker-compose.research.yml \
@@ -1171,5 +1241,19 @@ Verifica eseguita localmente su Docker arm64 con soli dati e token throwaway:
 - container, rete e volume throwaway rimossi al termine. Le immagini locali costruite possono
   essere riusate per un test successivo.
 
-Il bridge Windows reale resta **prepared but unvalidated** fino al test su VPS Ubuntu AMD64 con
-Python Windows e terminale MT5 nello stesso `WINEPREFIX`.
+Il bridge Windows reale ha superato la prova IPC di base sul Mac, ma resta **prepared but
+unvalidated end-to-end** per snapshot HTTP completo e deployment VPS Ubuntu AMD64 con Python
+Windows e terminale MT5 nello stesso `WINEPREFIX`.
+
+### Verifica IPC reale macOS (`existing`)
+
+Sul Mac Apple Silicon sono stati usati il Wine prefix dell'app ufficiale, il terminale
+`C:\Program Files\MetaTrader 5\terminal64.exe` gia' aperto e un Python Windows 3.11 AMD64
+embeddable in `C:\Python311Embed\python.exe`. Sono riusciti import di `MetaTrader5` e NumPy,
+`mt5.initialize(path=terminal_path)`, `terminal_info()`, `account_info()`, `positions_get()`,
+`orders_get()` e `mt5.shutdown()` con dati reali. Non e' stato effettuato un nuovo login ne'
+cambiato l'account del terminale principale.
+
+Questa verifica non certifica ancora `POST /v1/trading/snapshot` completo, deal di uscita,
+`POST /v1/candles`, errori/retry/reconnect reali o stabilita' 24/48 ore. Questi punti e il
+deployment VPS AMD64 restano esplicitamente nella checklist successiva.
