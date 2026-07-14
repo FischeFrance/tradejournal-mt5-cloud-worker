@@ -76,7 +76,6 @@ class ProvisioningConfig:
     worker_dry_run: bool = True
     worker_poll_seconds: int = 5
     mt5_terminal_path: str = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-    python_windows_path: str = r"C:\Python311Embed\python.exe"
 
     def ensure_host_directories(self) -> None:
         modes = {
@@ -154,6 +153,4 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ProvisioningConfig:
         ),
         mt5_terminal_path=source.get("MT5_TERMINAL_PATH", "").strip()
         or r"C:\Program Files\MetaTrader 5\terminal64.exe",
-        python_windows_path=source.get("PYTHON_WINDOWS_PATH", "").strip()
-        or r"C:\Python311Embed\python.exe",
     )

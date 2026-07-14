@@ -1,11 +1,10 @@
-"""Scaffolding HTTP condiviso tra bridge/fake/fake_bridge.py e bridge/windows/mt5_bridge.py.
+"""Scaffolding HTTP condiviso tra bridge/fake/fake_bridge.py e bridge/files/file_bridge.py.
 
 Stesso contratto (GET /health, POST /v1/candles, POST /v1/trading/snapshot, autenticazione
 Bearer, envelope JSON e validazione richieste) per entrambi: cio' che cambia tra fake e reale e'
 solo la sorgente dei dati e lo stato di salute riportato, mai il protocollo HTTP. Solo standard
-library: nessuna dipendenza da installare, ne' nell'immagine Docker del fake bridge ne' in un
-futuro Windows Python sotto Wine (dove installare pacchetti extra oltre a `MetaTrader5` e' un
-passo manuale in piu' da evitare quando non necessario).
+library: nessuna dipendenza da installare, ne' nell'immagine Docker del fake bridge ne' in quella
+del bridge reale.
 
 Questo modulo non importa mai MetaTrader5 e non sa nulla di Wine: e' puro protocollo HTTP.
 """
@@ -143,8 +142,10 @@ class BridgeError(Exception):
 
 class BridgeConfig:
     """Configurazione minima condivisa da fake e reale: token di autenticazione e simbolo broker
-    accettato. Deliberatamente NON contiene mai credenziali MT5 (login/password/server/terminal
-    path): quelle sono lette solo da bridge/windows/mt5_bridge.py, mai da questo modulo comune."""
+    accettato. Deliberatamente NON contiene mai credenziali MT5 (login/password/server): nel
+    bridge reale quelle vivono solo nello startup.ini generato da
+    deploy/instance/entrypoint-runtime.sh, mai in un processo Python (vedi
+    bridge/files/file_bridge.py)."""
 
     def __init__(self, token: str, broker_symbol: str, port: int = 8080, host: str = "0.0.0.0") -> None:
         if not token:
@@ -180,9 +181,9 @@ def format_iso_utc(value: datetime) -> str:
 
 class BaseBridgeHandler(BaseHTTPRequestHandler):
     """Helper HTTP/auth/parsing condivisi dal contratto mt5-bridge. Le sottoclassi concrete
-    (bridge/fake/fake_bridge.py, bridge/windows/mt5_bridge.py) implementano do_GET/do_POST
+    (bridge/fake/fake_bridge.py, bridge/files/file_bridge.py) implementano do_GET/do_POST
     usando questi helper e forniscono la propria sorgente di candele/stato di salute: nessuna
-    logica di business (dati sintetici o MetaTrader5 reale) vive in questa classe."""
+    logica di business (dati sintetici o file scritti dall'EA) vive in questa classe."""
 
     server_version = "Mt5Bridge/1.0"
     config: BridgeConfig  # impostata dalla sottoclasse concreta prima di avviare il server

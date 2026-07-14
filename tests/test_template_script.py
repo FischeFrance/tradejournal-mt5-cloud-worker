@@ -100,11 +100,14 @@ PY
 def _clean_prefix(tmp_path: Path) -> Path:
     prefix = tmp_path / "source-prefix"
     terminal = prefix / "drive_c" / "Program Files" / "MetaTrader 5" / "terminal64.exe"
-    python = prefix / "drive_c" / "Python311Embed" / "python.exe"
+    compiled_ea = (
+        prefix / "drive_c" / "Program Files" / "MetaTrader 5"
+        / "MQL5" / "Experts" / "TradeJournal" / "TradeJournalBridge.ex5"
+    )
     terminal.parent.mkdir(parents=True)
-    python.parent.mkdir(parents=True)
+    compiled_ea.parent.mkdir(parents=True)
     terminal.write_bytes(b"fake-terminal")
-    python.write_bytes(b"fake-python")
+    compiled_ea.write_bytes(b"fake-compiled-ea")
     dosdevices = prefix / "dosdevices"
     dosdevices.mkdir()
     (dosdevices / "z:").symlink_to("/")
@@ -217,6 +220,39 @@ def test_active_runtime_is_rejected_without_process_details(tmp_path, fake_toolc
     assert not output.exists()
 
 
+def test_missing_compiled_ea_is_rejected(tmp_path, fake_toolchain):
+    prefix = _clean_prefix(tmp_path)
+    compiled_ea = (
+        prefix / "drive_c" / "Program Files" / "MetaTrader 5"
+        / "MQL5" / "Experts" / "TradeJournal" / "TradeJournalBridge.ex5"
+    )
+    compiled_ea.unlink()
+    output = tmp_path / "mt5-prefix.tar.zst"
+
+    completed = _run(prefix, output, fake_toolchain)
+
+    assert completed.returncode != 0
+    assert "TradeJournalBridge.ex5" in completed.stderr
+    assert not output.exists()
+
+
+def test_stale_ea_sandbox_files_are_rejected(tmp_path, fake_toolchain):
+    prefix = _clean_prefix(tmp_path)
+    stale_dir = (
+        prefix / "drive_c" / "Program Files" / "MetaTrader 5"
+        / "MQL5" / "Files" / "TradeJournal"
+    )
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "account.json").write_text('{"login": "12345678"}', encoding="utf-8")
+    output = tmp_path / "mt5-prefix.tar.zst"
+
+    completed = _run(prefix, output, fake_toolchain)
+
+    assert completed.returncode != 0
+    assert "denylist rule matched" in completed.stderr
+    assert not output.exists()
+
+
 def test_cleanup_and_activity_checks_bracket_all_temporary_work():
     source = SCRIPT.read_text(encoding="utf-8")
     assert source.index("trap cleanup EXIT") < source.index('WORK_DIR="$(mktemp')
@@ -225,7 +261,6 @@ def test_cleanup_and_activity_checks_bracket_all_temporary_work():
     assert source.find("assert_runtime_inactive", copy_index) > copy_index
     for process_name in (
         "wine64-preloader",
-        "python.exe",
         "terminal64.exe",
         "rpcss.exe",
         "plugplay.exe",

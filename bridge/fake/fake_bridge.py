@@ -1,5 +1,5 @@
 """Fake bridge: implementa lo stesso contratto HTTP di mt5-bridge (vedi bridge/common.py e
-bridge/windows/mt5_bridge.py) con dati sintetici deterministici, senza alcuna dipendenza da
+bridge/files/file_bridge.py) con dati sintetici deterministici, senza alcuna dipendenza da
 MetaTrader5/Wine. Gira nativamente su qualunque architettura, incluso Ubuntu ARM64: usato per
 validare in locale sia market-data-worker sia trade-sync worker prima di avere un vero terminale
 MT5 su una VPS AMD64 (vedi i compose fake dedicati e README). Oltre alle candele espone uno
@@ -101,7 +101,7 @@ def _generate_candles(symbol: str, timeframe: str, since: Optional[datetime], no
     step = TIMEFRAME_SECONDS[timeframe]
     start_index = 0 if since is None else int((since - _EPOCH).total_seconds() // step) + 1
     # La candela "corrente" (in formazione a 'now') non e' mai completa: esclusa esattamente come
-    # dovra' fare bridge/windows/mt5_bridge.py con un vero terminale MT5 (vedi quel modulo).
+    # fa bridge/files/file_bridge.py con le candele scritte dall'EA (vedi quel modulo).
     last_complete_index = int((now - _EPOCH).total_seconds() // step) - 1
 
     candles = []

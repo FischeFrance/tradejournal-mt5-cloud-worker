@@ -6,7 +6,9 @@ readonly RUNTIME_GROUP="runtime"
 readonly PREFIX_ROOT="/var/lib/tradejournal/wine-prefix"
 readonly TEMPLATE_ARCHIVE="/opt/tradejournal/template/mt5-prefix.tar.zst"
 readonly TEMPLATE_VERSION="tradejournal-mt5-prefix-v1"
-readonly BRIDGE_SCRIPT_UNIX="/app/bridge/windows/mt5_bridge.py"
+readonly BRIDGE_SCRIPT_UNIX="/app/bridge/files/file_bridge.py"
+readonly RUNTIME_HOME="/home/runtime"
+readonly STARTUP_INI_PATH="${RUNTIME_HOME}/startup.ini"
 readonly CHILD_STOP_TIMEOUT_SECONDS=5
 readonly WINESERVER_STOP_TIMEOUT_SECONDS=3
 
@@ -48,6 +50,44 @@ unix_path_to_wine_z() {
   printf 'Z:%s\n' "$windows_path"
 }
 
+# Genera lo startup.ini letto da terminal64.exe via /config (vedi piu' sotto). Isolata in una
+# funzione cosi' da poter essere testata (in un test dedicato, sourcing solo questa funzione)
+# senza dover avviare Wine/Xvfb: verifica che il contenuto non venga mai stampato e che il file
+# risulti sempre 0600. La password viene letta una sola volta dal file gia' validato dal
+# chiamante e non lascia mai questa funzione se non scritta nel file di destinazione.
+generate_startup_ini() {
+  local login="$1" server="$2" password_file="$3" symbol="$4" ini_path="$5"
+  local password
+
+  password="$(cat -- "$password_file")"
+  case "$password" in
+    *$'\n'*|*$'\r'*) fail "MT5_PASSWORD_FILE must contain a single-line secret" ;;
+  esac
+
+  install -m 0600 /dev/null "$ini_path"
+  {
+    printf '[Common]\n'
+    printf 'Login=%s\n' "$login"
+    printf 'Server=%s\n' "$server"
+    printf 'Password=%s\n' "$password"
+    printf 'KeepPrivate=0\n'
+    printf '\n'
+    printf '[Experts]\n'
+    printf 'Enabled=1\n'
+    printf 'AllowLiveTrading=0\n'
+    printf 'AllowDllImport=0\n'
+    printf 'Account=0\n'
+    printf 'Profile=0\n'
+    printf '\n'
+    printf '[StartUp]\n'
+    printf 'Expert=TradeJournal\\TradeJournalBridge\n'
+    printf 'Symbol=%s\n' "$symbol"
+    printf 'Period=M1\n'
+  } > "$ini_path"
+  chmod 0600 "$ini_path"
+  unset password
+}
+
 if [ "$(id -u)" -eq 0 ]; then
   mkdir -p "$PREFIX_ROOT"
   chown "$RUNTIME_USER:$RUNTIME_GROUP" "$PREFIX_ROOT"
@@ -57,7 +97,7 @@ fi
 umask 077
 
 MT5_TERMINAL_PATH="${MT5_TERMINAL_PATH:-C:\\Program Files\\MetaTrader 5\\terminal64.exe}"
-PYTHON_WINDOWS_PATH="${PYTHON_WINDOWS_PATH:-C:\\Python311Embed\\python.exe}"
+EURUSD_BROKER_SYMBOL="${EURUSD_BROKER_SYMBOL:-EURUSD}"
 TERMINAL_READY_TIMEOUT_SECONDS="${TERMINAL_READY_TIMEOUT_SECONDS:-120}"
 
 case "$TERMINAL_READY_TIMEOUT_SECONDS" in
@@ -66,6 +106,20 @@ esac
 if [ "$TERMINAL_READY_TIMEOUT_SECONDS" -lt 1 ]; then
   fail "TERMINAL_READY_TIMEOUT_SECONDS must be a positive integer"
 fi
+for value_name in MT5_LOGIN MT5_SERVER EURUSD_BROKER_SYMBOL TJ_CONNECTION_ID \
+  TJ_EXPECTED_MT5_LOGIN TJ_EXPECTED_MT5_SERVER; do
+  value="${!value_name:-}"
+  case "$value" in
+    *$'\n'*|*$'\r'*) fail "$value_name must be a single line value" ;;
+  esac
+done
+# TJ_EXPECTED_MT5_LOGIN/SERVER sono il controllo obbligatorio di identita' dell'account, applicato
+# lato bridge (vedi bridge/files/file_bridge.py): l'entrypoint si limita a garantirne la presenza
+# qui, cosi' una configurazione incompleta fallisce subito con un errore chiaro invece che
+# lasciare il bridge servire dati senza mai poter verificare a quale account appartengono.
+[ -n "${TJ_CONNECTION_ID:-}" ] || fail "TJ_CONNECTION_ID is required"
+[ -n "${TJ_EXPECTED_MT5_LOGIN:-}" ] || fail "TJ_EXPECTED_MT5_LOGIN is required"
+[ -n "${TJ_EXPECTED_MT5_SERVER:-}" ] || fail "TJ_EXPECTED_MT5_SERVER is required"
 
 if [ ! -f "$TEMPLATE_ARCHIVE" ] || [ ! -r "$TEMPLATE_ARCHIVE" ]; then
   fail "golden template archive is missing or unreadable"
@@ -113,26 +167,47 @@ if [ "$(cat "$WINEPREFIX/.tradejournal-template-sha256" 2>/dev/null || true)" !=
   fail "persisted Wine prefix was created from a different golden template"
 fi
 
+# Cartella di installazione del terminale (senza assumere un nome fisso per l'eseguibile):
+# usata sia per individuare l'EA compilato sia per calcolare il sandbox file dell'EA piu' sotto.
+mt5_install_dir="${MT5_TERMINAL_PATH%\\*}"
+ea_compiled_windows_path="${mt5_install_dir}\\MQL5\\Experts\\TradeJournal\\TradeJournalBridge.ex5"
+
 terminal_unix="$(windows_path_in_prefix "$MT5_TERMINAL_PATH")" \
   || fail "MT5_TERMINAL_PATH must be an absolute C:\\ path without traversal"
-python_unix="$(windows_path_in_prefix "$PYTHON_WINDOWS_PATH")" \
-  || fail "PYTHON_WINDOWS_PATH must be an absolute C:\\ path without traversal"
+ea_compiled_unix="$(windows_path_in_prefix "$ea_compiled_windows_path")" \
+  || fail "MT5_TERMINAL_PATH must be an absolute C:\\ path without traversal"
 [ -f "$terminal_unix" ] || fail "terminal64.exe is missing from the persisted Wine prefix"
-[ -f "$python_unix" ] || fail "Windows Python is missing from the persisted Wine prefix"
-[ -f "$BRIDGE_SCRIPT_UNIX" ] || fail "Windows bridge script is missing from the image"
+[ -f "$ea_compiled_unix" ] || fail "compiled TradeJournalBridge.ex5 is missing from the persisted Wine prefix (see scripts/compile_mt5_expert.sh)"
+[ -f "$BRIDGE_SCRIPT_UNIX" ] || fail "Linux file-bridge script is missing from the image"
 
-# Python Windows needs Wine paths for host-mounted secret files. Only paths are converted and
-# exported; secret contents are never read or printed by this entrypoint. Conversion is purely
-# lexical so Wine is not started before Xvfb and the explicit wineserver startup below.
 [ -e "$WINEPREFIX/dosdevices/z:" ] \
   || fail "golden template does not expose the standard Wine Z: drive"
-for secret_var in MT5_PASSWORD_FILE MT5_BRIDGE_TOKEN_FILE; do
-  secret_path="${!secret_var:-}"
-  [ -n "$secret_path" ] || fail "$secret_var is required"
-  [ -f "$secret_path" ] && [ -r "$secret_path" ] || fail "$secret_var is not readable"
-  printf -v "$secret_var" '%s' "$(unix_path_to_wine_z "$secret_path")"
-  export "$secret_var"
-done
+
+[ -n "${MT5_PASSWORD_FILE:-}" ] || fail "MT5_PASSWORD_FILE is required"
+[ -f "$MT5_PASSWORD_FILE" ] && [ -r "$MT5_PASSWORD_FILE" ] || fail "MT5_PASSWORD_FILE is not readable"
+[ -n "${MT5_BRIDGE_TOKEN_FILE:-}" ] || fail "MT5_BRIDGE_TOKEN_FILE is required"
+[ -f "$MT5_BRIDGE_TOKEN_FILE" ] && [ -r "$MT5_BRIDGE_TOKEN_FILE" ] || fail "MT5_BRIDGE_TOKEN_FILE is not readable"
+
+# Solo MT5_PASSWORD_FILE deve diventare un path Wine (Z:): lo legge esclusivamente startup.ini
+# sotto Wine, generato piu' sotto. MT5_BRIDGE_TOKEN_FILE resta un path Unix: lo legge solo il
+# processo bridge nativo Linux avviato in fondo a questo script, che non sa nulla di Wine (vedi
+# bridge/files/file_bridge.py) e non viene mai eseguito sotto wine.
+mt5_password_file_wine="$(unix_path_to_wine_z "$MT5_PASSWORD_FILE")"
+
+# Sandbox file dell'EA (MQL5/Files/TradeJournal), condiviso in sola lettura col processo bridge
+# nativo Linux tramite MT5_EA_FILES_DIR: un semplice path Unix, calcolato qui una sola volta,
+# perche' file_bridge.py non deve mai conoscere convenzioni Wine/WINEPREFIX (vedi il docstring
+# di quel modulo).
+ea_files_windows_path="${mt5_install_dir}\\MQL5\\Files\\TradeJournal"
+ea_files_unix="$(windows_path_in_prefix "$ea_files_windows_path")" \
+  || fail "MT5_TERMINAL_PATH must be an absolute C:\\ path without traversal"
+mkdir -p -- "$ea_files_unix" || log "WARNING: could not pre-create the EA sandbox directory; the EA will create it on first run"
+
+# connection_id non e' un segreto (solo un UUID di connessione, gia' un label Docker non
+# sensibile): scritto qui perche' MQL5 non puo' leggere le variabili d'ambiente del container
+# ospitante. Deve esistere PRIMA che il terminale (e quindi l'EA) venga avviato, cosi' e' gia'
+# presente al primo OnInit (vedi mt5/experts/TradeJournalBridge.mq5:ReadConnectionId).
+printf '%s' "$TJ_CONNECTION_ID" > "$ea_files_unix/connection_id"
 
 XVFB_PID=""
 TERMINAL_PID=""
@@ -198,6 +273,12 @@ on_signal() {
 trap on_signal INT TERM
 trap 'cleanup $?' EXIT
 
+# Lo startup.ini vive solo in /home/runtime, un tmpfs (vedi deploy/instance/compose.yaml):
+# non tocca mai il volume Wine persistente ne' il golden template, e sparisce con il container.
+generate_startup_ini \
+  "$MT5_LOGIN" "$MT5_SERVER" "$MT5_PASSWORD_FILE" "$EURUSD_BROKER_SYMBOL" "$STARTUP_INI_PATH"
+startup_ini_wine="$(unix_path_to_wine_z "$STARTUP_INI_PATH")"
+
 Xvfb "$DISPLAY" -screen 0 1024x768x16 -nolisten tcp > /tmp/xvfb.log 2>&1 &
 XVFB_PID=$!
 for _ in $(seq 1 50); do
@@ -210,25 +291,37 @@ done
 xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || fail "Xvfb did not become ready"
 
 wineserver -p
-wine "$MT5_TERMINAL_PATH" > /tmp/terminal.log 2>&1 &
+# /portable rende deterministico il sandbox file dell'EA (niente hash %APPDATA%, vedi
+# ea_files_unix sopra). /config punta a startup.ini per login, avvio automatico dell'Expert
+# Advisor sul simbolo/timeframe richiesti e disabilitazione esplicita del trading live
+# ([Experts] AllowLiveTrading=0/AllowDllImport=0): nessuna delle due chiavi e' necessaria a un
+# EA read-only, ma la loro presenza documenta esplicitamente l'intento anche a chi ispeziona la
+# configurazione runtime senza leggere il sorgente MQL5.
+wine "$MT5_TERMINAL_PATH" /portable /config:"$startup_ini_wine" > /tmp/terminal.log 2>&1 &
 TERMINAL_PID=$!
 
-log "waiting for the terminal IPC endpoint"
+# La readiness del container NON dipende piu' da questa attesa (a differenza della precedente
+# mt5.initialize() sotto Python Windows, il meccanismo che falliva con IPC timeout): e' solo
+# diagnostica, bounded da TERMINAL_READY_TIMEOUT_SECONDS, e non fa mai fallire l'avvio. Il vero
+# gate di readiness resta l'healthcheck Docker (heartbeat.json recente + GET /health positivo,
+# vedi healthcheck-runtime.sh e il relativo start_period/retries in compose.yaml).
+log "waiting up to ${TERMINAL_READY_TIMEOUT_SECONDS}s for the EA's first heartbeat (diagnostic only)"
+heartbeat_path="$ea_files_unix/heartbeat.json"
 deadline=$((SECONDS + TERMINAL_READY_TIMEOUT_SECONDS))
-while ! wine "$PYTHON_WINDOWS_PATH" -c \
-  'import sys, MetaTrader5 as mt5; ok=mt5.initialize(path=sys.argv[1]); info=mt5.terminal_info() if ok else None; mt5.shutdown() if ok else None; raise SystemExit(0 if info is not None else 1)' \
-  "$MT5_TERMINAL_PATH" >/dev/null 2>&1; do
+while [ ! -f "$heartbeat_path" ] && [ "$SECONDS" -lt "$deadline" ]; do
   process_is_live "$TERMINAL_PID" || fail "MetaTrader terminal exited during startup"
-  process_is_live "$XVFB_PID" || fail "Xvfb exited during terminal startup"
-  if [ "$SECONDS" -ge "$deadline" ]; then
-    fail "MetaTrader terminal did not become available before the startup timeout"
-  fi
+  process_is_live "$XVFB_PID" || fail "Xvfb exited during startup"
   sleep 1
 done
+if [ -f "$heartbeat_path" ]; then
+  log "EA heartbeat detected"
+else
+  log "WARNING: no EA heartbeat yet after ${TERMINAL_READY_TIMEOUT_SECONDS}s; starting the file-bridge anyway, the Docker healthcheck will keep the container unhealthy until one appears"
+fi
 
-bridge_windows_path="$(unix_path_to_wine_z "$BRIDGE_SCRIPT_UNIX")"
-log "starting the read-only MT5 bridge on the internal port ${PORT:-8090}"
-wine "$PYTHON_WINDOWS_PATH" "$bridge_windows_path" &
+export MT5_EA_FILES_DIR="$ea_files_unix"
+log "starting the read-only Linux file-bridge on the internal port ${PORT:-8090}"
+python3 "$BRIDGE_SCRIPT_UNIX" &
 BRIDGE_PID=$!
 
 # The container is healthy only while all three long-lived children are alive. Reap the first

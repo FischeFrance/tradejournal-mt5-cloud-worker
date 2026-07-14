@@ -2,9 +2,9 @@
 #
 # Immagine del fake bridge (bridge/fake/fake_bridge.py): SOLO per test/validazione locale su
 # qualunque architettura, incluso Ubuntu ARM64. Nessuna dipendenza da Wine/MT5, solo Python
-# standard library (vedi bridge/common.py). NON e' il bridge reale: quello e'
-# bridge/windows/mt5_bridge.py, predisposto per un Windows Python sotto Wine su AMD64, non
-# ancora impacchettato in un'immagine Docker (vedi README).
+# standard library (vedi bridge/common.py). NON e' il bridge reale: quello e' l'Expert Advisor
+# mt5/experts/TradeJournalBridge.mq5 + bridge/files/file_bridge.py, impacchettato dal runtime
+# per-account in deploy/instance (vedi README).
 #
 # Contesto di build atteso: la ROOT del repository (non bridge/fake/), perche' serve sia
 # bridge/common.py sia bridge/fake/*.py. Vedi docker-compose.research-mt5-fake.yml.

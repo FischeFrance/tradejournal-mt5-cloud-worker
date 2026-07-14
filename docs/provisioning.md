@@ -6,7 +6,7 @@ espone API HTTP. Ogni `connection_id` valido crea un progetto Docker Compose ind
 ```text
 provisioning agent (host, systemd, Docker CLI locale)
   -> tjmt5-<uuid-senza-trattini>-runtime
-       Wine + Xvfb + MT5 + Python Windows + bridge read-only :8090
+       Wine + Xvfb + MT5 (EA read-only) + bridge Linux read-only :8090
   -> tjmt5-<uuid-senza-trattini>-worker
        bridge HTTP -> detector -> outbox persistente -> TradeJournal
 ```
@@ -79,10 +79,14 @@ variabile e la corrispondente `*_FILE` e' un errore.
 
 ## Golden template esterno
 
-Il repository e le immagini non contengono MT5, Python Windows o un Wine prefix. Preparare una
-volta un prefix pulito sulla VPS, senza sessioni o account collegati, quindi creare l'archivio:
+Il repository e le immagini non contengono MT5 o un Wine prefix: l'unico artefatto aggiuntivo
+richiesto e' l'Expert Advisor gia' compilato (`mt5/experts/TradeJournalBridge.mq5` ->
+`TradeJournalBridge.ex5`, nessun Python Windows/pacchetto `MetaTrader5` in questa architettura).
+Preparare una volta un prefix pulito sulla VPS, senza sessioni o account collegati, compilare
+l'EA, quindi creare l'archivio:
 
 ```bash
+scripts/compile_mt5_expert.sh /home/ubuntu/.mt5
 sudo install -d -o "$USER" -g tradejournal-provisioner -m 0750 \
   /opt/tradejournal/templates
 scripts/create_mt5_runtime_template.sh \
@@ -93,11 +97,17 @@ sudo chown 1000:tradejournal-provisioner \
 sudo chmod 0440 /opt/tradejournal/templates/mt5-prefix.tar.zst{,.sha256}
 ```
 
-Prima di copiare, lo script rifiuta processi Wine/MT5 attivi, controlla terminale, Python
-Windows e import di `MetaTrader5` su una copia privata. Una allowlist top-level e una denylist
-case-insensitive bloccano artefatti noti di account, sessione, profili, log e credential store;
-il controllo dei registry cerca soltanto nomi di chiavi noti e non ne stampa i valori. Un match
-non viene cancellato automaticamente: pulire deliberatamente il prefix sorgente e rilanciare.
+`compile_mt5_expert.sh` non richiede alcuna credenziale MT5: usa MetaEditor sotto Wine
+(`metaeditor64.exe /compile`) per pubblicare `TradeJournalBridge.ex5` nel prefix indicato; se la
+compilazione headless non fosse disponibile o affidabile in un dato ambiente, il fallback
+documentato e' MetaEditor in modalita' grafica (F7, verificare "0 error(s)"). Prima di copiare il
+prefix, `create_mt5_runtime_template.sh` rifiuta processi Wine/MT5 attivi, controlla la presenza
+del terminale e del `.ex5` compilato su una copia privata. Una allowlist top-level e una denylist
+case-insensitive bloccano artefatti noti di account, sessione, profili, log, credential store e
+file residui dell'EA (`MQL5/Files/TradeJournal`, che potrebbe contenere dati di una sessione gia'
+eseguita); il controllo dei registry cerca soltanto nomi di chiavi noti e non ne stampa i valori.
+Un match non viene cancellato automaticamente: pulire deliberatamente il prefix sorgente e
+rilanciare.
 
 Lo script non segue i symlink `dosdevices`, non modifica il prefix originale, pubblica archivio
 e sidecar `.sha256` con rename atomici e aggiunge il marker
@@ -173,6 +183,13 @@ Esempio `provision` senza secret:
 `job_id` e `connection_id` sono UUID canonici. `provision` richiede account, server e URL
 HTTPS; HTTP e' accettato soltanto con la modalita' test esplicita. Azioni supportate:
 `provision`, `start`, `stop`, `restart`, `status`, `deprovision`.
+
+`account_number`/`server`/`connection_id` del job vengono scritti in `instance.env` sia come
+`MT5_LOGIN`/`MT5_SERVER`/`TJ_CONNECTION_ID` (letti dall'entrypoint per lo `startup.ini`) sia come
+`TJ_EXPECTED_MT5_LOGIN`/`TJ_EXPECTED_MT5_SERVER` (letti dal bridge Linux per verificare che
+l'account effettivamente connesso coincida con quello richiesto): nessuna azione manuale e'
+necessaria, il provisioner tiene i due lati sempre coerenti. Vedi README, sezione "Verifica
+obbligatoria dell'identita' dell'account", per cosa succede in caso di mismatch.
 
 ```bash
 .venv/bin/python -m provisioning.cli validate-job JOB.json

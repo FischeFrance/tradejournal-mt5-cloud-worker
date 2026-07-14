@@ -95,9 +95,14 @@ bridge/
     fake_bridge.py        Bridge finto: dati sintetici deterministici, nessuna dipendenza da
                          Wine/MT5, gira su qualunque architettura (usato per i test/ARM64)
     Dockerfile             Immagine del fake bridge (SOLO test/validazione locale)
-  windows/
-    mt5_bridge.py          Bridge reale: core IPC validato su macOS; snapshot HTTP completo e
-                         runtime prolungato ancora da validare (vedi sezione "mt5-bridge")
+  files/
+    file_bridge.py         Bridge reale: legge i file JSON scritti dall'EA (vedi sotto), stdlib
+                         only, nessuna dipendenza da Wine/MetaTrader5 in questo processo
+
+mt5/
+  experts/
+    TradeJournalBridge.mq5 Expert Advisor read-only: scrive account/posizioni/ordini/eventi/
+                         candele sotto MQL5/Files/TradeJournal, nessuna funzione di trading
 ```
 
 Il trade-sync worker (`main.py`) e il market-data-worker (`market_data_main.py`) sono due
@@ -125,18 +130,20 @@ Il percorso raccomandato con un terminale reale separa nettamente Windows/Wine d
 applicativo Linux:
 
 ```text
-MetaTrader 5 + Windows Python (stesso WINEPREFIX)
-  -> mt5-bridge: GET /health, POST /v1/trading/snapshot
+MetaTrader 5
+  -> Expert Advisor MQL5 (mt5/experts/TradeJournalBridge.mq5, read-only)
+  -> file JSON nel sandbox MQL5/Files/TradeJournal
+  -> bridge Linux (bridge/files/file_bridge.py): GET /health, POST /v1/trading/snapshot
   -> trade-sync worker Linux: diff, normalizzazione, event_id, retry ingestion
   -> TradeJournal ingestion API
 ```
 
 Il worker Linux non contiene credenziali MT5 e non importa mai `MetaTrader5`: conosce soltanto
-`MT5_BRIDGE_URL` e `MT5_BRIDGE_TOKEN`. Percorso del terminale e configurazione della sessione
-vivono esclusivamente nel processo bridge Windows. In `MT5_SESSION_MODE=login` anche login,
-server e password investor appartengono solo al bridge; in `existing` non e' richiesta alcuna
-password e il bridge non esegue `mt5.login()`. `MT5_BRIDGE_TOKEN` autentica worker -> bridge;
-`TRADEJOURNAL_BRIDGE_TOKEN` autentica worker -> app e deve essere un valore differente.
+`MT5_BRIDGE_URL` e `MT5_BRIDGE_TOKEN`, esattamente come prima. Login/password/server vivono solo
+nello `startup.ini` generato dall'entrypoint del runtime (tmpfs, 0600, mai stampato): nessun
+processo Python li legge mai, ne' il bridge ne' tantomeno il worker. `MT5_BRIDGE_TOKEN` autentica
+worker -> bridge; `TRADEJOURNAL_BRIDGE_TOKEN` autentica worker -> app e deve essere un valore
+differente.
 
 `MT5_CLIENT_SOURCE` accetta `mock`, `bridge` o `direct`. `MOCK_MODE` resta accettato come alias
 di configurazione: se la nuova variabile non e' impostata, `true` seleziona `mock` e `false`
@@ -250,26 +257,26 @@ snapshot persistito, il worker emette `trade_opened`: lo snapshot iniziale vuoto
 
 Questo test resta obbligatorio prima di dichiarare funzionante il runtime reale:
 
-1. usare Ubuntu AMD64, un terminale separato e un account demo con
-   `MT5_SESSION_MODE=login` e password investor, mai un account live;
-2. installare terminale MT5 e Python Windows nello stesso `WINEPREFIX` e installare
-   `bridge/windows/requirements.txt` con quel Python Windows;
-3. avviare `bridge/windows/mt5_bridge.py` nello stesso prefix, con
-   `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`, percorso terminale e `MT5_BRIDGE_TOKEN`
-   nell'ambiente del solo bridge; non esporre la porta 8080 su Internet;
-4. verificare da una rete privata `GET /health`, auth 401 con token errato e uno snapshot con
-   ticket stringa/timestamp UTC/array vuoti; confrontare account, posizioni, pending e deal con
-   il terminale;
-5. avviare il worker Linux con `MT5_CLIENT_SOURCE=bridge`, URL privato del bridge, token bridge,
-   token ingestion distinto e inizialmente `DRY_RUN=true`; verificare una sola POST snapshot per
-   poll e nessuna credenziale/token nei log;
+1. usare Ubuntu AMD64, un account demo con password **investor**, mai un account live;
+2. compilare l'EA con `scripts/compile_mt5_expert.sh WINEPREFIX` (o via MetaEditor GUI, F7) e
+   costruire il golden template con `scripts/create_mt5_runtime_template.sh` (vedi
+   `docs/provisioning.md`);
+3. avviare lo stack `deploy/instance` con `MT5_RUNTIME_TARGET=real`, `MT5_LOGIN`/`MT5_SERVER` e i
+   secret file-backed richiesti; non esporre alcuna porta su Internet (nessuna `ports:` in
+   Compose);
+4. verificare da rete privata `GET /health`, auth 401 con token errato e uno snapshot con ticket
+   stringa/timestamp UTC/array vuoti; confrontare account, posizioni, pending e deal con il
+   terminale;
+5. verificare che il worker riceva una sola POST snapshot per poll e nessuna credenziale/token nei
+   log, inizialmente con `DRY_RUN=true`;
 6. con un account demo aprire/modificare/chiudere una posizione e creare/modificare/cancellare un
    pending; solo dopo il dry-run impostare `DRY_RUN=false` verso un'API DEV;
 7. riavviare soltanto il worker e verificare volume snapshot, event_id stabili, zero eventi
-   duplicati e comportamento corretto dopo disconnessione/riconnessione.
+   duplicati e comportamento corretto dopo un riavvio del runtime.
 
-Il core IPC e' gia' stato verificato localmente su macOS; il deployment VPS e il flusso HTTP
-completo restano **prepared but unvalidated** fino al completamento di questa checklist.
+Il terminale MT5 si avvia regolarmente sotto Wine 11.13 Staging; il flusso completo EA -> file ->
+bridge Linux -> worker resta **prepared but unvalidated end-to-end** fino al completamento di
+questa checklist (vedi anche "Limiti noti Wine/MT5" piu' sotto).
 Una chiusura parziale non e' rappresentata correttamente dal contratto attuale: il detector non
 tratta ancora una riduzione di volume come chiusura parziale e questa fase non ne amplia il
 contratto. Nell'app corrente `trade_opened` crea una notifica dedicata; modifica e chiusura
@@ -578,10 +585,10 @@ README): sono due processi Docker separati, con due compose file separati.
 **Cosa NON e' (ancora) questa fase**: nessuna AI, nessun Bias Engine, nessun pattern recognition,
 nessuna connessione a Supabase e nessun deploy cloud. La sorgente `mt5` parla con un servizio
 bridge separato via HTTP (vedi "mt5-bridge" piu' sotto), che nei test automatici resta un *fake*
-deterministico (nessuna dipendenza da Wine/MT5, gira anche su Ubuntu ARM64). Del bridge reale
-(`bridge/windows/mt5_bridge.py`) e' stata verificata localmente su macOS la connessione IPC di
-base al terminale; l'intero percorso research via `/v1/candles`, lo snapshot HTTP e la stabilita'
-prolungata non sono ancora stati validati contro dati reali.
+deterministico (nessuna dipendenza da Wine/MT5, gira anche su Ubuntu ARM64). Il bridge reale
+(EA MQL5 + `bridge/files/file_bridge.py`, vedi sotto) si avvia regolarmente sotto Wine, ma
+l'intero percorso research via `/v1/candles`, lo snapshot HTTP e la stabilita' prolungata non
+sono ancora stati validati contro dati reali.
 
 ### Principio di isolamento
 
@@ -616,17 +623,18 @@ prolungata non sono ancora stati validati contro dati reali.
 | `MT5_BRIDGE_TOKEN` | *(vuoto)* | richiesto per i client bridge; stesso valore sul worker e sul bridge, distinto dal token ingestion |
 | `MT5_BRIDGE_TIMEOUT_SECONDS` | `10` | timeout per singola richiesta HTTP al bridge |
 | `MT5_DEAL_LOOKBACK_HOURS` | `24` | trade-sync snapshot; intero 1..168 |
-| `MT5_SESSION_MODE` | `login` | bridge reale: `login` oppure `existing`; valori diversi bloccano l'avvio |
-| `MT5_TERMINAL_PATH` | *(vuoto)* | bridge reale: obbligatorio in `existing`, opzionale (raccomandato) in `login` |
-| `MT5_EXPECTED_LOGIN` / `MT5_EXPECTED_SERVER` | *(vuoto)* | controlli opzionali dell'account connesso, dopo initialize/login |
-| `EURUSD_BROKER_SYMBOL` | `EURUSD` | nome broker esatto richiesto a `/v1/candles` (es. `EURUSD.a`); non e' un probe di connessione |
+| `MT5_TERMINAL_PATH` | *(vuoto)* | runtime reale: percorso di `terminal64.exe` nel golden template, usato anche per individuare l'EA compilato |
+| `MT5_HEARTBEAT_MAX_AGE_SECONDS` | `15` | runtime reale: eta' massima ammessa di `heartbeat.json` prima che `/health` riporti `degraded` |
+| `TJ_CONNECTION_ID` | *(vuoto, obbligatoria)* | runtime reale: UUID di connessione, propagato all'EA via file (non leggibile da MQL5 come env var) |
+| `TJ_EXPECTED_MT5_LOGIN` / `TJ_EXPECTED_MT5_SERVER` | *(vuoto, obbligatorie)* | runtime reale: identita' attesa dell'account, verificata contro `account.json`; un mismatch rende l'istanza `degraded` e blocca snapshot/eventi (vedi sotto) |
+| `EURUSD_BROKER_SYMBOL` | `EURUSD` | nome broker esatto richiesto a `/v1/candles`; nel runtime reale e' anche il simbolo su cui si aggancia l'EA (`Symbol=` in `startup.ini`) |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `tradejournal_research` / `research` / *(nessun default)* | credenziali del Postgres locale in `docker-compose.research.yml`; `POSTGRES_PASSWORD` e' obbligatoria, `up`/`config` falliscono subito se mancante |
 
-Con `MT5_CLIENT_SOURCE=bridge`, `MT5_SESSION_MODE`, le variabili `MT5_EXPECTED_*` e
-`MT5_TERMINAL_PATH` appartengono esclusivamente al servizio `mt5-bridge` reale
-(`bridge/windows/mt5_bridge.py`), mai ai worker Linux. `MT5_LOGIN` / `MT5_PASSWORD` /
-`MT5_SERVER` sono richieste al bridge soltanto in modalita' `login`; il percorso legacy `direct`
-continua a leggere queste tre variabili nel trade-sync worker.
+Con `MT5_CLIENT_SOURCE=bridge`, `MT5_TERMINAL_PATH` appartiene esclusivamente al runtime reale
+per-account (`deploy/instance`, EA + `bridge/files/file_bridge.py`), mai ai worker Linux.
+`MT5_LOGIN` / `MT5_PASSWORD` / `MT5_SERVER` sono lette solo dall'entrypoint del runtime per
+generare `startup.ini`; il percorso legacy `direct` continua a leggere queste tre variabili nel
+trade-sync worker.
 
 ### Due sorgenti dati: mock (in-process) e mt5 (bridge HTTP)
 
@@ -648,20 +656,22 @@ logga un errore e ritenta al ciclo di poll successivo, senza mai far cadere l'in
 
 ## mt5-bridge
 
-Il pacchetto Python ufficiale `MetaTrader5` e' un'estensione nativa **Windows**: comunica via IPC
-direttamente con il processo del terminale MetaTrader 5. **Non e' importabile da un interprete
-Python Linux**, nemmeno dentro lo stesso container Wine, se il processo Python che lo importa non
-e' anch'esso un Python Windows (stesso limite gia' descritto per `RealMt5Client` in "Fase 2: MT5
-reale + Wine" piu' sopra). Per questo il market-data-worker Linux **non tenta mai** di importare
-`MetaTrader5`: parla con un servizio HTTP separato, `mt5-bridge`, che nella sua forma reale gira
-come **Windows Python sotto Wine**, nello stesso `WINEPREFIX` del terminale MT5.
+Il pacchetto Python ufficiale `MetaTrader5` e' un'estensione nativa **Windows** che comunica via
+IPC diretto col processo del terminale: sotto Wine containerizzato quell'IPC fallisce in modo
+stabile (`-10005, "IPC timeout"`), anche quando il terminale stesso si avvia regolarmente. Il
+bridge reale evita del tutto questo IPC: un Expert Advisor MQL5 di sola lettura
+(`mt5/experts/TradeJournalBridge.mq5`) gira **dentro** il terminale e scrive account, posizioni,
+ordini, eventi e candele su file JSON nel proprio sandbox (`MQL5/Files/TradeJournal`); un
+processo Linux nativo separato (`bridge/files/file_bridge.py`, stdlib only) legge quei file ed
+espone lo stesso contratto HTTP di sempre. Nessun processo Python Windows, nessun pacchetto
+`MetaTrader5`, nessuna IPC diretta col terminale in questa architettura.
 
 Tre pezzi, stesso contratto HTTP (vedi `bridge/common.py`):
 
 | Servizio | Codice | Dove gira | Dipendenze | Stato |
 |---|---|---|---|---|
 | `mt5-bridge-fake` | `bridge/fake/fake_bridge.py` | Qualunque architettura, incluso Ubuntu ARM64 | Solo standard library | **Funzionante**, usato per i test |
-| `mt5-bridge` (reale) | `bridge/windows/mt5_bridge.py` | Windows Python sotto Wine (macOS ufficiale o VPS AMD64) | Pacchetto `MetaTrader5` | **IPC base validato su macOS; HTTP completo da validare** |
+| `mt5-bridge` (reale) | EA `mt5/experts/TradeJournalBridge.mq5` + `bridge/files/file_bridge.py` | EA dentro il terminale (Wine); bridge come processo Linux nativo nello stesso container | Nessuna (stdlib only sul lato Linux) | Il terminale si avvia regolarmente sotto Wine 11.13 Staging; flusso end-to-end da validare su VPS (vedi checklist sopra) |
 | Client Linux | `worker/market_data_source.py:Mt5MarketDataSource` | market-data-worker (qualunque architettura) | `requests` (gia' presente) | **Funzionante** |
 
 ### Contratto API
@@ -733,106 +743,100 @@ timeout, errore MT5, payload malformato, candela duplicata) tramite un header di
 (`X-Mt5-Fake-Scenario`) usato **solo** dai test automatici (`tests/test_fake_bridge.py`): il
 client di produzione non lo invia mai.
 
-### mt5-bridge reale: modalita' di sessione
+### mt5-bridge reale: Expert Advisor + bridge Linux
 
-`bridge/windows/mt5_bridge.py` implementa lo stesso contratto usando il pacchetto `MetaTrader5`
-reale. `MT5_SESSION_MODE` accetta soltanto i due valori seguenti; il default conservativo e'
-`login` e qualunque altro valore blocca l'avvio con un errore esplicito.
+`mt5/experts/TradeJournalBridge.mq5` e' un EA di sola lettura: usa `OnInit`/`OnDeinit`/`OnTimer`/
+`OnTradeTransaction`, non chiama mai `OrderSend`/`OrderSendAsync`/`OrderModify`/`OrderClose` e non
+importa alcuna DLL (`tests/test_mql5_ea_no_trading.py` lo verifica staticamente a ogni modifica).
+Ogni `OnTimer` (default 2s, `InpTimerSeconds`) riscrive in modo atomico (file `.tmp` poi rename)
+`heartbeat.json`, `account.json`, `positions.json`, `orders.json` e `candles.json`; ogni
+transazione rilevante (`TRADE_TRANSACTION_DEAL_ADD/ORDER_ADD/ORDER_UPDATE/ORDER_DELETE/POSITION/
+HISTORY_ADD`) aggiunge una riga a `events.jsonl`. Al primo avvio esegue un backfill configurabile
+dello storico (`InpBackfillHours`, default 168h). Tutto sotto `MQL5/Files/TradeJournal` (sandbox
+nativo, `/portable` rende il percorso deterministico: niente hash `%APPDATA%`).
 
-- `MT5_SESSION_MODE=existing`: richiede `MT5_TERMINAL_PATH`, che deve indicare `terminal64.exe`
-  nello stesso `WINEPREFIX` del Python Windows. Esegue
-  `mt5.initialize(path=MT5_TERMINAL_PATH)` e usa l'account gia' collegato nel terminale. Non
-  chiama mai `mt5.login()`, non richiede `MT5_PASSWORD` e non cambia account o tipo di sessione.
-  Dopo l'inizializzazione `account_info()` deve restituire un account, altrimenti l'avvio
-  fallisce. E' la modalita' adatta al test locale con il terminale principale gia' aperto e
-  collegato.
-- `MT5_SESSION_MODE=login`: mantiene il comportamento storico, eseguendo `initialize()` e poi
-  `mt5.login()`; richiede `MT5_LOGIN`, `MT5_PASSWORD` e `MT5_SERVER`. `MT5_TERMINAL_PATH` resta
-  opzionale: se assente `initialize()` viene chiamato senza `path`, anche se specificarlo e'
-  raccomandato per selezionare il terminale corretto. Va usata con un terminale separato, per
-  esempio su una VPS, e `MT5_PASSWORD` deve essere esclusivamente la password **investor** (sola
-  lettura), mai quella principale/di trading.
+`bridge/files/file_bridge.py` legge questi file (nessuna dipendenza da Wine/MetaTrader5, nessuna
+credenziale MT5 in questo processo) e mantiene lo stesso contratto HTTP di sempre: `GET /health`
+riporta `ok` solo se `heartbeat.json` e' piu' recente di `MT5_HEARTBEAT_MAX_AGE_SECONDS` (default
+15s), `account.json` e' valido **e** coincide con l'identita' attesa (vedi sotto); `POST
+/v1/trading/snapshot` ricostruisce l'array `deals` filtrando `events.jsonl` per i soli deal di
+uscita (`entry` `OUT`/`OUT_BY`) dentro `deal_lookback_hours`, con lettura incrementale e cursore
+persistito; `POST /v1/candles` legge `candles.json[symbol][timeframe]` con la stessa semantica di
+sempre (`since` esclusivo, candela in formazione mai inclusa, `limit` troncato). `login`/`server`
+in `account.json` **non** sono mascherati (viaggiano solo sulla rete Docker interna verso il
+worker, che li richiede non vuoti); sono invece sempre mascherati nella risposta di `/health` e in
+ogni messaggio di log.
 
-In entrambe le modalita', dopo `initialize()` e l'eventuale `login()`, `account_info()` deve
-restituire un account valido. `MT5_EXPECTED_LOGIN` e `MT5_EXPECTED_SERVER` sono controlli
-opzionali applicati all'account connesso: se impostati devono coincidere rispettivamente con
-`account_info().login` e, con confronto esatto, `account_info().server`.
+Login, server e password vivono esclusivamente nello `startup.ini` generato dall'entrypoint del
+runtime (`/home/runtime`, tmpfs, 0600, contenuto mai stampato in nessun log): nessun processo
+Python li legge mai. Il terminale viene avviato con `wine terminal64.exe /portable
+/config:startup.ini`, che contiene anche `[Experts] AllowLiveTrading=0` e `AllowDllImport=0` --
+non necessarie a un EA read-only, ma esplicite per chi ispeziona la configurazione senza leggere
+il sorgente MQL5.
 
-Dopo la connessione il bridge offre snapshot read-only via `account_info()`/`positions_get()`/
-`orders_get()`/`history_deals_get()` senza dipendere da alcun simbolo. Solo durante
-`POST /v1/candles` verifica con `symbol_info()` il nome esatto ricevuto e, se il simbolo esiste ma
-non e' visibile, prova `symbol_select(requested_symbol, True)` prima di leggere le candele con
-`copy_rates_from_pos` o `copy_rates_range`. Un simbolo inesistente o non selezionabile produce un
-errore esplicito, senza tentare alias o suffissi. `shutdown()` chiude la connessione. Login,
-server, token e altri valori sensibili non vengono stampati integralmente. Non esistono chiamate
-`order_send`, `order_check`, `TRADE_ACTION_*` o endpoint che aprono, modificano o chiudono ordini:
-gli unici endpoint restano `GET /health`, `POST /v1/candles` e
-`POST /v1/trading/snapshot`.
+#### Verifica obbligatoria dell'identita' dell'account
 
-#### Test locale macOS con il terminale gia' aperto
+`TJ_EXPECTED_MT5_LOGIN`/`TJ_EXPECTED_MT5_SERVER` (stessi valori di `MT5_LOGIN`/`MT5_SERVER`, resi
+disponibili al bridge sotto nomi distinti perche' li legge un processo diverso dall'entrypoint)
+devono coincidere **esattamente** con `login`/`server` in `account.json`. Se non coincidono:
+`/health` riporta `status: "degraded"` e `account_connected: false`; `POST /v1/trading/snapshot`
+rifiuta con `503 account_mismatch` invece di restituire uno snapshot; ogni mismatch viene loggato
+con login/server mascherati, mai in chiaro. Una configurazione errata (secret montato sul
+container sbagliato, golden template riusato per un altro account) blocca cosi' l'istanza invece
+di far arrivare a TradeJournal dati attribuiti silenziosamente alla connessione sbagliata.
 
-L'installazione ufficiale MetaTrader 5 su macOS usa questi valori, gia' configurati come default
-in `scripts/run_mt5_bridge_macos.sh`:
+#### event_id, deduplica e rotazione di events.jsonl
 
-```text
-WINEPREFIX=$HOME/Library/Application Support/net.metaquotes.wine.metatrader5
-WINE_BIN=/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine
-PYTHON_WINDOWS_PATH=C:\Python311Embed\python.exe
-MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
-```
+Ogni riga di `events.jsonl` include `connection_id` (letto dall'EA da un file scritto
+dall'entrypoint: MQL5 non ha accesso alle variabili d'ambiente del container), `login`, `server` e
+`timestamp_msc` (dalle proprieta' `_MSC` di MT5: `DEAL_TIME_MSC`, `ORDER_TIME_SETUP_MSC`/
+`ORDER_TIME_DONE_MSC`, `POSITION_TIME_UPDATE_MSC`), oltre al tipo di transazione e al ticket.
+`event_id` e' quindi `connection_id|login|server|tipo|ticket|timestamp_msc|sequenza` --
+deterministico e mai riusabile fra connessioni/account diversi anche in presenza di ticket
+numericamente coincidenti (broker/demo differenti). La deduplica interna del bridge (l'indice dei
+deal usato per costruire `deals`) usa la stessa quadrupla `(connection_id, login, server,
+deal_ticket)` come chiave, **non** il solo `deal_ticket`: un ticket ripetuto su una connessione
+diversa non viene mai fuso con quello della connessione corrente, e solo gli eventi la cui
+identita' coincide con quella attesa vengono esposti da questa istanza. La deduplica finale e
+definitiva (event_id lato worker/TradeJournal) resta invariata lato API/database.
 
-Il Python Windows 3.11 AMD64 embeddable e il terminale devono appartenere allo stesso
-`WINEPREFIX`. Il test locale usa la sessione principale gia' collegata senza trasformarla in una
-sessione investor e senza effettuare un nuovo login. Configurazione di esempio richiesta al
-processo bridge:
+`events.jsonl` ruota quando supera `InpEventsMaxBytes` (default 10MB): l'EA rinomina il file
+corrente in `events.jsonl.1` (sovrascrivendo un'eventuale rotazione precedente) e ne crea uno
+nuovo. Il bridge riconosce la rotazione dal cambio di identita' POSIX (device+inode, non solo la
+dimensione) del file `events.jsonl` e, se `events.jsonl.1` e' esattamente il file che stava
+leggendo, ne consuma la coda non ancora letta prima di ripartire da zero sul nuovo file: nessuna
+riga completa scritta prima della rotazione va persa. Il cursore persistito
+(`bridge_cursor.json`, proprieta' del solo bridge, mai scritto dall'EA) combina identita' del
+file, offset in byte e un'impronta hash degli ultimi byte prima dell'offset: quest'ultima rileva
+anche un troncamento-e-riscrittura sul posto il cui nuovo contenuto non sia piu' corto del
+precedente, caso in cui il solo confronto della dimensione non basterebbe. Una riga finale ancora
+senza newline (scrittura in corso) non viene mai processata: resta in coda e viene riletta al
+giro successivo. Se il bridge stesso viene riavviato fra una lettura e il salvataggio del cursore
+aggiornato, la ripresa dal cursore precedente (piu' vecchio) rilegge le stesse righe: essendo la
+deduplica per chiave "ultimo valore vince", il risultato finale resta corretto e senza duplicati.
+Limite noto: se il bridge resta fermo abbastanza a lungo da perdere **piu' di una** rotazione, la
+generazione intermedia (sovrascritta da `events.jsonl.1` piu' recente) non e' piu' recuperabile;
+viene loggato un avviso esplicito, mai un fallimento silente.
 
-```dotenv
-MT5_SESSION_MODE=existing
-MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
-MT5_EXPECTED_LOGIN=<login>
-MT5_EXPECTED_SERVER=<server esatto>
-MT5_BRIDGE_TOKEN=<token locale>
-HOST=0.0.0.0
-PORT=8090
-```
-
-Esportare le variabili nella shell (quotare i percorsi Windows e quelli macOS con spazi) e poi
-avviare:
+#### Compilare l'EA e preparare il golden template
 
 ```bash
-export MT5_SESSION_MODE=existing
-export MT5_TERMINAL_PATH='C:\Program Files\MetaTrader 5\terminal64.exe'
-export MT5_EXPECTED_LOGIN='<login>'
-export MT5_EXPECTED_SERVER='<server esatto>'
-export MT5_BRIDGE_TOKEN='<token locale>'
-export HOST=0.0.0.0
-export PORT=8090
-
-scripts/run_mt5_bridge_macos.sh
+scripts/compile_mt5_expert.sh /percorso/al/WINEPREFIX
+scripts/create_mt5_runtime_template.sh /percorso/al/WINEPREFIX /opt/tradejournal/templates/mt5-prefix.tar.zst
 ```
 
-Lo script non contiene credenziali, usa soltanto le variabili gia' esportate, verifica Wine,
-Python Windows e file del bridge, e mostra solo configurazioni non sensibili o mascherate.
-`WINEPREFIX`, `WINE_BIN` e `PYTHON_WINDOWS_PATH` possono essere sovrascritti nell'ambiente. Con
-`HOST=0.0.0.0` proteggere la porta tramite firewall e limitarla alla rete privata; per un test
-solo locale preferire `HOST=127.0.0.1`.
-
-Sul Mac Apple Silicon reale sono gia' riusciti import `MetaTrader5`/NumPy,
-`initialize(path=...)`, `terminal_info()`, `account_info()`, `positions_get()`, `orders_get()` e
-`shutdown()`. Questo dimostra che Python Windows e il terminale comunicano nello stesso prefix;
-non equivale ancora alla validazione di richieste HTTP complete a `/v1/candles` e
-`/v1/trading/snapshot`, di `history_deals_get()` con uscite reali, delle riconnessioni o di una
-prova continuativa 24/48 ore.
-
-#### Deployment separato/VPS in modalita' login
-
-Il bridge non e' ancora impacchettato in un'immagine Docker o compose dedicato. Su una VPS
-Ubuntu **AMD64**, predisporre Wine, terminale MT5 e Python Windows nello stesso `WINEPREFIX`,
-installare `bridge/windows/requirements.txt` con quel Python e avviare il bridge con
-`MT5_SESSION_MODE=login`, `MT5_LOGIN`, `MT5_PASSWORD` investor, `MT5_SERVER`,
-`MT5_BRIDGE_TOKEN` e, raccomandato ma opzionale in questa modalita', `MT5_TERMINAL_PATH`
-nell'ambiente del solo processo bridge. Il worker Linux deve ricevere soltanto URL e token del
-bridge. Esporre la porta esclusivamente su loopback o rete privata, mai direttamente su Internet.
+Il primo script compila `mt5/experts/TradeJournalBridge.mq5` con MetaEditor sotto Wine
+(`metaeditor64.exe /compile`) e pubblica `TradeJournalBridge.ex5` dentro
+`MQL5/Experts/TradeJournal/` nel prefix indicato; nessuna credenziale MT5 e' coinvolta in questo
+passo. Se la compilazione headless non fosse disponibile o affidabile in un dato ambiente CI, il
+fallback documentato e' MetaEditor in modalita' grafica (aprire il file, F7, verificare "0
+error(s)" nel pannello Errors) seguito dalla stessa pubblicazione manuale del `.ex5`. Il secondo
+script (invariato nella sua logica di sicurezza: denylist/allowlist, nessun processo Wine attivo,
+nessuna credenziale nel prefix sorgente) verifica ora la presenza del `.ex5` compilato al posto
+del vecchio Python Windows, e rifiuta un prefix con file residui sotto
+`MQL5/Files/TradeJournal` (possibili dati di una sessione EA gia' eseguita). Vedi
+`docs/provisioning.md` per la procedura completa, incluso il calcolo/la verifica del checksum
+SHA-256 del template.
 
 ### Schema database
 

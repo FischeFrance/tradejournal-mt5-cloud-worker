@@ -21,6 +21,7 @@ mt5-prefix*.tar.zst.sha256
 *.msi
 *.cab
 *.pyd
+*.ex5
 wine-prefix*/
 .env
 *.log

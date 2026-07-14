@@ -4,7 +4,6 @@ set -euo pipefail
 readonly TEMPLATE_VERSION="tradejournal-mt5-prefix-v1"
 readonly STAGED_WINE_STOP_TIMEOUT_SECONDS=5
 
-WINE_BIN="${WINE_BIN:-wine}"
 WINESERVER_BIN="${WINESERVER_BIN:-wineserver}"
 WORK_DIR=""
 STAGED_PREFIX=""
@@ -65,7 +64,10 @@ SOURCE_PREFIX="$(realpath "$1")" || fail "source Wine prefix cannot be resolved"
 OUTPUT_PATH="$(realpath -m "$2")" || fail "output path cannot be resolved"
 OUTPUT_DIR="$(dirname "$OUTPUT_PATH")"
 MT5_TERMINAL_PATH="${MT5_TERMINAL_PATH:-C:\\Program Files\\MetaTrader 5\\terminal64.exe}"
-PYTHON_WINDOWS_PATH="${PYTHON_WINDOWS_PATH:-C:\\Python311Embed\\python.exe}"
+# Nessun Python Windows in questa architettura (vedi mt5/experts/TradeJournalBridge.mq5 e
+# bridge/files/file_bridge.py): l'unico artefatto aggiuntivo richiesto nel golden template e'
+# l'Expert Advisor gia' compilato, prodotto da scripts/compile_mt5_expert.sh.
+EA_COMPILED_WINDOWS_PATH="${MT5_TERMINAL_PATH%\\*}\\MQL5\\Experts\\TradeJournal\\TradeJournalBridge.ex5"
 
 [ -d "$SOURCE_PREFIX" ] || fail "source Wine prefix is not a directory"
 [ "$SOURCE_PREFIX" != "/" ] || fail "the filesystem root cannot be used as a Wine prefix"
@@ -78,7 +80,7 @@ esac
 
 for command_name in \
   realpath pgrep find grep cp tar zstd sha256sum mktemp timeout \
-  "$WINE_BIN" "$WINESERVER_BIN"; do
+  "$WINESERVER_BIN"; do
   command -v "$command_name" >/dev/null 2>&1 \
     || fail "a required command is unavailable"
 done
@@ -90,7 +92,7 @@ done
 ACTIVE_PROCESS_NAMES=(
   wine wine64 wine-preloader wine64-preloader wineserver wineserver64
   terminal.exe terminal64.exe metaeditor.exe metaeditor64.exe
-  metatester.exe metatester64.exe python.exe pythonw.exe
+  metatester.exe metatester64.exe
   services.exe explorer.exe winedevice.exe winedevice64.exe
   plugplay.exe rpcss.exe svchost.exe conhost.exe wineboot.exe start.exe cmd.exe
 )
@@ -98,7 +100,7 @@ ACTIVE_PROCESS_PATTERNS=(
   '(^|/)(wine|wine64|wine-preloader|wine64-preloader)([[:space:]]|$)'
   '(^|/)(wineserver|wineserver64)([[:space:]]|$)'
   '(^|/)(terminal|terminal64|metaeditor|metaeditor64|metatester|metatester64)\.exe([[:space:]]|$)'
-  '(^|/)(python|pythonw|services|explorer|winedevice|winedevice64|plugplay|rpcss|svchost|conhost|wineboot|start|cmd)\.exe([[:space:]]|$)'
+  '(^|/)(services|explorer|winedevice|winedevice64|plugplay|rpcss|svchost|conhost|wineboot|start|cmd)\.exe([[:space:]]|$)'
 )
 
 assert_runtime_inactive() {
@@ -156,6 +158,9 @@ DENYLIST_GLOBS=(
   '*/logs/*'
   '*/mql5/logs/*'
   '*/mql5/profiles/*'
+  # Sandbox file dell'EA (mt5/experts/TradeJournalBridge.mq5): un template preparato dopo aver
+  # gia' avviato l'EA una volta potrebbe contenere account/positions/deal reali di quella sessione.
+  '*/mql5/files/tradejournal/*'
   '*/appdata/roaming/microsoft/credentials/*'
   '*/appdata/roaming/microsoft/protect/*'
 )
@@ -245,12 +250,12 @@ assert_runtime_inactive
 
 source_terminal="$(windows_path_in_prefix "$SOURCE_PREFIX" "$MT5_TERMINAL_PATH")" \
   || fail "MT5_TERMINAL_PATH must be an absolute C:\\ path without traversal"
-source_python="$(windows_path_in_prefix "$SOURCE_PREFIX" "$PYTHON_WINDOWS_PATH")" \
-  || fail "PYTHON_WINDOWS_PATH must be an absolute C:\\ path without traversal"
+source_ea="$(windows_path_in_prefix "$SOURCE_PREFIX" "$EA_COMPILED_WINDOWS_PATH")" \
+  || fail "MT5_TERMINAL_PATH must be an absolute C:\\ path without traversal"
 [ -f "$source_terminal" ] && path_is_confined "$SOURCE_PREFIX" "$source_terminal" \
   || fail "terminal64.exe is missing or escapes the source prefix"
-[ -f "$source_python" ] && path_is_confined "$SOURCE_PREFIX" "$source_python" \
-  || fail "Windows Python is missing or escapes the source prefix"
+[ -f "$source_ea" ] && path_is_confined "$SOURCE_PREFIX" "$source_ea" \
+  || fail "compiled TradeJournalBridge.ex5 is missing or escapes the source prefix (see scripts/compile_mt5_expert.sh)"
 check_prefix_policy "$SOURCE_PREFIX"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tj-mt5-template.XXXXXXXX")"
@@ -266,15 +271,10 @@ assert_runtime_inactive
 cp -a --reflink=auto "$SOURCE_PREFIX/." "$STAGED_PREFIX/"
 assert_runtime_inactive
 
-staged_python="$(windows_path_in_prefix "$STAGED_PREFIX" "$PYTHON_WINDOWS_PATH")" \
-  || fail "staged Windows Python path is invalid"
-[ -f "$staged_python" ] && path_is_confined "$STAGED_PREFIX" "$staged_python" \
-  || fail "staged Windows Python is missing or escapes the staging prefix"
-
-WINEPREFIX="$STAGED_PREFIX" WINEDEBUG=-all "$WINE_BIN" "$PYTHON_WINDOWS_PATH" \
-  -c 'import MetaTrader5' >/dev/null 2>&1 \
-  || fail "Windows Python cannot import MetaTrader5 from the staged prefix"
-stop_staged_wine
+staged_ea="$(windows_path_in_prefix "$STAGED_PREFIX" "$EA_COMPILED_WINDOWS_PATH")" \
+  || fail "staged Expert Advisor path is invalid"
+[ -f "$staged_ea" ] && path_is_confined "$STAGED_PREFIX" "$staged_ea" \
+  || fail "staged TradeJournalBridge.ex5 is missing or escapes the staging prefix"
 assert_runtime_inactive
 
 check_prefix_policy "$STAGED_PREFIX"

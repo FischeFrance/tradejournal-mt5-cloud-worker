@@ -223,7 +223,7 @@ def _error_summary(response: "requests.Response") -> str:
 
 class Mt5MarketDataSource(MarketDataSource):
     """Client HTTP verso mt5-bridge (fake o reale, stesso contratto -- vedi bridge/common.py,
-    bridge/fake/fake_bridge.py, bridge/windows/mt5_bridge.py e README). Non importa mai
+    bridge/fake/fake_bridge.py, bridge/files/file_bridge.py e README). Non importa mai
     MetaTrader5 ne' apre connessioni Wine/IPC direttamente: parla solo HTTP con un servizio
     separato, cosi' il market-data-worker resta un processo Linux puro indipendentemente da dove
     e come gira il bridge.

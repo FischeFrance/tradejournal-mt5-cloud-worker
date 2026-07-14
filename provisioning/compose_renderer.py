@@ -80,6 +80,8 @@ class ComposeRenderer:
             "MT5_PASSWORD_FILE",
             "MT5_BRIDGE_TOKEN_FILE",
             "TRADEJOURNAL_BRIDGE_TOKEN_FILE",
+            "TJ_EXPECTED_MT5_LOGIN",
+            "TJ_EXPECTED_MT5_SERVER",
         )
         for fragment in required:
             if fragment not in text:
@@ -127,8 +129,12 @@ class ComposeRenderer:
             "MT5_RUNTIME_TARGET": self.config.runtime_target,
             "MT5_LOGIN": job.account_number,
             "MT5_SERVER": job.server,
+            # Stessi valori di MT5_LOGIN/MT5_SERVER sopra: l'identita' che il bridge deve
+            # verificare contro account.json e' per definizione quella richiesta al provisioning
+            # (vedi bridge/files/file_bridge.py e deploy/instance/compose.yaml).
+            "TJ_EXPECTED_MT5_LOGIN": job.account_number,
+            "TJ_EXPECTED_MT5_SERVER": job.server,
             "MT5_TERMINAL_PATH": self.config.mt5_terminal_path,
-            "PYTHON_WINDOWS_PATH": self.config.python_windows_path,
             "TRADEJOURNAL_API_URL": job.tradejournal_api_url,
             "DRY_RUN": "true" if self.config.worker_dry_run else "false",
             "POLL_INTERVAL_SECONDS": self.config.worker_poll_seconds,

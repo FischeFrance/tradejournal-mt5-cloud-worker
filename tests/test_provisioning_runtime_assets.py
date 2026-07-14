@@ -52,6 +52,8 @@ def resolved_compose(tmp_path_factory):
             "MT5_RUNTIME_TARGET": "mock",
             "MT5_LOGIN": "123456",
             "MT5_SERVER": "Broker-Demo",
+            "TJ_EXPECTED_MT5_LOGIN": "123456",
+            "TJ_EXPECTED_MT5_SERVER": "Broker-Demo",
             "TRADEJOURNAL_API_URL": "https://example.test/api/mt5-events",
             "TJ_SECRET_DIR": str(secret_dir),
             "MT5_TEMPLATE_ARCHIVE": "/dev/null",

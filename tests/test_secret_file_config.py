@@ -6,20 +6,19 @@ import pytest
 
 import common
 import fake_bridge
+import file_bridge
 from common import read_secret_from_env
 from config import ConfigError, _read_secret, load_config
-from windows.mt5_bridge import Mt5BridgeConfig
 
 
 _BRIDGE_ENV_NAMES = {
     "MT5_BRIDGE_TOKEN",
     "MT5_BRIDGE_TOKEN_FILE",
-    "MT5_LOGIN",
-    "MT5_PASSWORD",
-    "MT5_PASSWORD_FILE",
-    "MT5_SERVER",
-    "MT5_SESSION_MODE",
-    "MT5_TERMINAL_PATH",
+    "MT5_EA_FILES_DIR",
+    "MT5_HEARTBEAT_MAX_AGE_SECONDS",
+    "TJ_CONNECTION_ID",
+    "TJ_EXPECTED_MT5_LOGIN",
+    "TJ_EXPECTED_MT5_SERVER",
     "EURUSD_BROKER_SYMBOL",
     "HOST",
     "PORT",
@@ -128,47 +127,80 @@ def test_windows_wine_mode_limit_emits_safe_warning_instead_of_rejecting(
     assert str(path) not in warning
 
 
-def test_windows_bridge_reads_token_and_password_files(monkeypatch, tmp_path):
+def test_file_bridge_reads_bridge_token_file_and_ea_files_dir(monkeypatch, tmp_path):
+    """FileBridgeConfig (bridge/files/file_bridge.py) non legge mai MT5_LOGIN/MT5_PASSWORD:
+    a differenza del vecchio bridge Windows, questo processo non ha alcuna credenziale MT5,
+    solo il token bridge e il percorso dei file scritti dall'EA (vedi MT5_EA_FILES_DIR,
+    impostato dall'entrypoint, mai dall'operatore)."""
     for name in _BRIDGE_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     token = _secret_file(tmp_path, "bridge-token", "bridge-token-da-file\n")
-    password = _secret_file(tmp_path, "investor-password", "  password con spazi  \n")
     monkeypatch.setenv("MT5_BRIDGE_TOKEN_FILE", str(token))
-    monkeypatch.setenv("MT5_PASSWORD_FILE", str(password))
-    monkeypatch.setenv("MT5_LOGIN", "123456")
-    monkeypatch.setenv("MT5_SERVER", "Broker-Demo")
+    monkeypatch.setenv("MT5_EA_FILES_DIR", str(tmp_path / "TradeJournal"))
+    monkeypatch.setenv("TJ_CONNECTION_ID", "11111111-1111-4111-8111-111111111111")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_LOGIN", "123456")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_SERVER", "Broker-Demo")
 
-    config = Mt5BridgeConfig()
+    config = file_bridge.FileBridgeConfig()
 
     assert config.token == "bridge-token-da-file"
-    assert config.mt5_password == "  password con spazi  "
+    assert not hasattr(config, "mt5_password")
+    assert not hasattr(config, "mt5_login")
 
 
-@pytest.mark.parametrize(
-    ("direct_name", "file_name"),
-    [
-        ("MT5_BRIDGE_TOKEN", "MT5_BRIDGE_TOKEN_FILE"),
-        ("MT5_PASSWORD", "MT5_PASSWORD_FILE"),
-    ],
-)
-def test_windows_bridge_rejects_ambiguous_secret_sources(
-    monkeypatch, tmp_path, direct_name, file_name
-):
+def test_file_bridge_rejects_ambiguous_token_sources(monkeypatch, tmp_path):
     for name in _BRIDGE_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     token = _secret_file(tmp_path, "default-token", "token-da-file\n")
-    password = _secret_file(tmp_path, "default-password", "password-da-file\n")
     monkeypatch.setenv("MT5_BRIDGE_TOKEN_FILE", str(token))
-    monkeypatch.setenv("MT5_PASSWORD_FILE", str(password))
-    monkeypatch.setenv("MT5_LOGIN", "123456")
-    monkeypatch.setenv("MT5_SERVER", "Broker-Demo")
-    monkeypatch.setenv(direct_name, "valore-diretto-test")
-    monkeypatch.setenv(file_name, str(token if "TOKEN" in file_name else password))
+    monkeypatch.setenv("MT5_EA_FILES_DIR", str(tmp_path / "TradeJournal"))
+    monkeypatch.setenv("TJ_CONNECTION_ID", "11111111-1111-4111-8111-111111111111")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_LOGIN", "123456")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_SERVER", "Broker-Demo")
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN", "valore-diretto-test")
 
-    with pytest.raises(ValueError, match=f"{direct_name}.*{file_name}") as exc_info:
-        Mt5BridgeConfig()
+    with pytest.raises(ValueError, match="MT5_BRIDGE_TOKEN.*MT5_BRIDGE_TOKEN_FILE") as exc_info:
+        file_bridge.FileBridgeConfig()
 
     assert "valore-diretto-test" not in str(exc_info.value)
+
+
+def test_file_bridge_requires_ea_files_dir(monkeypatch, tmp_path):
+    for name in _BRIDGE_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    token = _secret_file(tmp_path, "bridge-token", "token-da-file\n")
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN_FILE", str(token))
+    monkeypatch.setenv("TJ_CONNECTION_ID", "11111111-1111-4111-8111-111111111111")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_LOGIN", "123456")
+    monkeypatch.setenv("TJ_EXPECTED_MT5_SERVER", "Broker-Demo")
+
+    with pytest.raises(ValueError, match="MT5_EA_FILES_DIR"):
+        file_bridge.FileBridgeConfig()
+
+
+@pytest.mark.parametrize(
+    "missing_name", ["TJ_CONNECTION_ID", "TJ_EXPECTED_MT5_LOGIN", "TJ_EXPECTED_MT5_SERVER"]
+)
+def test_file_bridge_requires_account_identity_env_vars(monkeypatch, tmp_path, missing_name):
+    """Requisito di hardening: senza TJ_CONNECTION_ID/TJ_EXPECTED_MT5_LOGIN/TJ_EXPECTED_MT5_SERVER
+    il bridge non deve avviarsi affatto, cosi' una configurazione incompleta non puo' mai
+    risultare in un'istanza che serve dati senza poter verificare a quale account appartengono."""
+    for name in _BRIDGE_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    token = _secret_file(tmp_path, "bridge-token", "token-da-file\n")
+    monkeypatch.setenv("MT5_BRIDGE_TOKEN_FILE", str(token))
+    monkeypatch.setenv("MT5_EA_FILES_DIR", str(tmp_path / "TradeJournal"))
+    all_present = {
+        "TJ_CONNECTION_ID": "11111111-1111-4111-8111-111111111111",
+        "TJ_EXPECTED_MT5_LOGIN": "123456",
+        "TJ_EXPECTED_MT5_SERVER": "Broker-Demo",
+    }
+    for name, value in all_present.items():
+        if name != missing_name:
+            monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=missing_name):
+        file_bridge.FileBridgeConfig()
 
 
 def test_fake_bridge_reads_token_file(monkeypatch, tmp_path):

@@ -16,8 +16,10 @@ sys.path.insert(0, os.path.abspath(WORKER_DIR))
 
 BRIDGE_DIR = os.path.join(os.path.dirname(__file__), "..", "bridge")
 BRIDGE_FAKE_DIR = os.path.join(BRIDGE_DIR, "fake")
+BRIDGE_FILES_DIR = os.path.join(BRIDGE_DIR, "files")
 sys.path.insert(0, os.path.abspath(BRIDGE_DIR))
 sys.path.insert(0, os.path.abspath(BRIDGE_FAKE_DIR))
+sys.path.insert(0, os.path.abspath(BRIDGE_FILES_DIR))
 
 
 def _wait_for_postgres_ready(database_url: str, timeout_seconds: float = 30.0) -> None:
@@ -141,6 +143,45 @@ def fake_bridge_server():
     try:
         yield f"http://127.0.0.1:{port}", FAKE_BRIDGE_TEST_TOKEN
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+FILE_BRIDGE_TEST_TOKEN = "test-file-bridge-token-not-a-secret"
+
+
+@pytest.fixture
+def file_bridge_factory(tmp_path):
+    """Factory per avviare bridge/files/file_bridge.py in-process contro una directory temporanea
+    che sostituisce MT5_EA_FILES_DIR: nessun Wine/MT5 richiesto, i test scrivono direttamente i
+    file JSON che l'EA scriverebbe (vedi mt5/experts/TradeJournalBridge.mq5). Stesso principio di
+    `fake_bridge_server` sopra (vero server HTTP, socket reali, bind solo su loopback), ma
+    parametrizzabile per test: ogni chiamata a `start(...)` avvia un server indipendente."""
+    import file_bridge
+
+    servers = []
+
+    def start(*, heartbeat_max_age_seconds: float = 15.0, token: str = FILE_BRIDGE_TEST_TOKEN,
+               broker_symbol: str = "EURUSD", base_dir=None,
+               connection_id: str = "test-connection-id",
+               expected_login: str = "12345678", expected_server: str = "Broker-Demo"):
+        files_dir = base_dir if base_dir is not None else (tmp_path / "TradeJournal")
+        files_dir.mkdir(parents=True, exist_ok=True)
+        config = file_bridge.BridgeConfig(token=token, broker_symbol=broker_symbol, port=0, host="127.0.0.1")
+        source = file_bridge.FileSnapshotSource(
+            files_dir, heartbeat_max_age_seconds, connection_id, expected_login, expected_server
+        )
+        server = file_bridge.make_server(config, source)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        servers.append((server, thread))
+        return f"http://127.0.0.1:{port}", token, files_dir
+
+    yield start
+
+    for server, thread in servers:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

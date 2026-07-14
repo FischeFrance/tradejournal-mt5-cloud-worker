@@ -178,8 +178,9 @@ def test_eurusd_broker_symbol_default_and_parsing():
 
 def test_config_never_reads_mt5_credentials_for_bridge_purposes():
     """worker/config.py non deve MAI leggere MT5_LOGIN/MT5_PASSWORD/MT5_SERVER come parte della
-    configurazione del bridge: quelle credenziali appartengono esclusivamente al servizio bridge
-    (bridge/windows/mt5_bridge.py), mai al market-data-worker."""
+    configurazione del bridge: quelle credenziali appartengono esclusivamente allo startup.ini
+    generato da deploy/instance/entrypoint-runtime.sh (mai a un processo Python, vedi
+    bridge/files/file_bridge.py), mai al market-data-worker."""
     config = load_config(_research_mt5_env(MT5_LOGIN="99999", MT5_PASSWORD="投資家", MT5_SERVER="Broker-Demo"))
     # I campi esistono (ereditati dal trade-sync worker, invariati), ma nulla nella validazione
     # o nel funzionamento della modalita' mt5 dipende da essi: il test chiave e' che

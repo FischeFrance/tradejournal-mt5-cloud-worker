@@ -35,17 +35,26 @@ services:
     environment:
       HOST: "0.0.0.0"
       PORT: "8090"
-      MT5_SESSION_MODE: "login"
       MT5_LOGIN: "${MT5_LOGIN:?MT5_LOGIN is required}"
       MT5_PASSWORD_FILE: "/run/secrets/mt5_password"
       MT5_SERVER: "${MT5_SERVER:?MT5_SERVER is required}"
       MT5_TERMINAL_PATH: "${MT5_TERMINAL_PATH:-C:\\Program Files\\MetaTrader 5\\terminal64.exe}"
-      PYTHON_WINDOWS_PATH: "${PYTHON_WINDOWS_PATH:-C:\\Python311Embed\\python.exe}"
+      EURUSD_BROKER_SYMBOL: "${EURUSD_BROKER_SYMBOL:-EURUSD}"
       MT5_BRIDGE_TOKEN_FILE: "/run/secrets/mt5_bridge_token"
+      MT5_HEARTBEAT_MAX_AGE_SECONDS: "${MT5_HEARTBEAT_MAX_AGE_SECONDS:-15}"
       MT5_TEMPLATE_SHA256: "${MT5_TEMPLATE_SHA256:-}"
       DISPLAY: ":99"
       WINEPREFIX: "/var/lib/tradejournal/wine-prefix/current"
       TERMINAL_READY_TIMEOUT_SECONDS: "${TERMINAL_READY_TIMEOUT_SECONDS:-120}"
+      # Identita' attesa dell'account, verificata dal bridge contro account.json scritto dall'EA
+      # (vedi bridge/files/file_bridge.py): stessi valori di MT5_LOGIN/MT5_SERVER sopra, passati
+      # sotto nomi distinti perche' li consuma un processo diverso (il bridge Linux, non
+      # l'entrypoint/startup.ini). TJ_CONNECTION_ID e' gia' un'etichetta Docker qui sotto, non
+      # sensibile: ripetuto come env var perche' l'EA lo legge da un file scritto
+      # dall'entrypoint (MQL5 non ha accesso alle variabili d'ambiente del container).
+      TJ_CONNECTION_ID: "${TJ_CONNECTION_ID:?TJ_CONNECTION_ID is required}"
+      TJ_EXPECTED_MT5_LOGIN: "${TJ_EXPECTED_MT5_LOGIN:?TJ_EXPECTED_MT5_LOGIN is required}"
+      TJ_EXPECTED_MT5_SERVER: "${TJ_EXPECTED_MT5_SERVER:?TJ_EXPECTED_MT5_SERVER is required}"
     secrets:
       # Compose file-backed secrets preserve host ownership/mode: uid/gid/mode declarations
       # would be silently ignored. Release gate: these host files must be regular 0400/0600

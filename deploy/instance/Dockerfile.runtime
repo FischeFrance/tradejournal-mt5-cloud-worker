@@ -11,6 +11,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:99 \
     WINEPREFIX=/var/lib/tradejournal/wine-prefix/current
 
+# The upstream ubuntu:24.04 image ships a default uid/gid 1000 "ubuntu" account; removed
+# unconditionally in the RUN below (no-op if a future base image drops it) so "runtime" can
+# claim uid/gid 1000, which the rest of this stage and deploy/instance/compose.yaml assume.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -18,30 +21,37 @@ RUN apt-get update \
         gosu \
         jq \
         procps \
+        python3 \
         wine \
         wine64 \
         x11-utils \
         xvfb \
         zstd \
     && rm -rf /var/lib/apt/lists/* \
+    && (getent passwd ubuntu >/dev/null 2>&1 && userdel -r ubuntu 2>/dev/null || true) \
+    && (getent group ubuntu >/dev/null 2>&1 && groupdel ubuntu 2>/dev/null || true) \
     && groupadd --gid 1000 runtime \
     && useradd --uid 1000 --gid runtime --create-home --shell /usr/sbin/nologin runtime \
     && mkdir -p \
-        /app/bridge/windows \
+        /app/bridge/files \
         /opt/tradejournal/runtime \
         /opt/tradejournal/template \
         /var/lib/tradejournal/wine-prefix \
     && chown -R runtime:runtime /app /opt/tradejournal/runtime /home/runtime
 
+# Nessun package Python (pip) e' installato: bridge/files/file_bridge.py e' stdlib-only, letto
+# dal python3 di sistema. Nessun pacchetto MetaTrader5/Windows Python entra in questa immagine:
+# l'unico artefatto MT5 e' il terminale stesso, dentro il golden template esterno (vedi
+# scripts/create_mt5_runtime_template.sh), mai in questa immagine Docker.
 COPY bridge/common.py /app/bridge/common.py
-COPY bridge/windows/mt5_bridge.py /app/bridge/windows/mt5_bridge.py
+COPY bridge/files/file_bridge.py /app/bridge/files/file_bridge.py
 COPY deploy/instance/entrypoint-runtime.sh /opt/tradejournal/runtime/entrypoint-runtime.sh
 COPY deploy/instance/healthcheck-runtime.sh /opt/tradejournal/runtime/healthcheck-runtime.sh
 
 RUN chmod 0755 \
         /opt/tradejournal/runtime/entrypoint-runtime.sh \
         /opt/tradejournal/runtime/healthcheck-runtime.sh \
-    && chmod 0644 /app/bridge/common.py /app/bridge/windows/mt5_bridge.py
+    && chmod 0644 /app/bridge/common.py /app/bridge/files/file_bridge.py
 
 EXPOSE 8090
 
