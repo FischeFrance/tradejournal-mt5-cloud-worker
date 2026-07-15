@@ -1,0 +1,53 @@
+{
+  "$comment": "Fixture payloads validated against schema.json by contract tests in both tradejournal-drp and tradejournal-mt5-cloud-worker. No real secrets: all ids/tokens here are fabricated.",
+  "claimRequest": { "api_version": "1" },
+  "claimResponseJob_provision": {
+    "api_version": "1",
+    "job_id": "0f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c11",
+    "connection_id": "1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d",
+    "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a",
+    "lease_expires_at": "2026-07-15T12:01:00.000Z",
+    "job_type": "provision",
+    "attempt": 1,
+    "created_at": "2026-07-15T12:00:00.000Z",
+    "history_mode": "new_only",
+    "from_date": null,
+    "payload": {}
+  },
+  "claimResponseJob_historicalSync": {
+    "api_version": "1",
+    "job_id": "1f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c22",
+    "connection_id": "1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d",
+    "lease_id": "8d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6b",
+    "lease_expires_at": "2026-07-15T12:11:00.000Z",
+    "job_type": "historical_sync",
+    "attempt": 1,
+    "created_at": "2026-07-15T12:10:00.000Z",
+    "history_mode": "from_date",
+    "from_date": "2026-01-01T00:00:00.000Z",
+    "payload": {}
+  },
+  "claimResponseNoJob": null,
+  "heartbeatRequest": {
+    "api_version": "1",
+    "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a"
+  },
+  "heartbeatResponseOk": { "api_version": "1", "lease_valid": true },
+  "heartbeatResponseLeaseLost": { "api_version": "1", "lease_valid": false, "error_code": "lease_lost" },
+  "runningRequest": { "api_version": "1", "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a" },
+  "runningResponseOk": { "api_version": "1", "status": "running" },
+  "completeRequest": {
+    "api_version": "1",
+    "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a",
+    "result": { "imported_deals": 12, "live_sync_started": true }
+  },
+  "completeResponseOk": { "api_version": "1", "status": "complete" },
+  "failRequest": {
+    "api_version": "1",
+    "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a",
+    "error_code": "mt5_initialize_failed"
+  },
+  "failResponseOk": { "api_version": "1", "status": "failed" },
+  "transitionResponseLeaseLost": { "api_version": "1", "error_code": "lease_lost" },
+  "errorResponse_unauthorized": { "error_code": "unauthorized" }
+}

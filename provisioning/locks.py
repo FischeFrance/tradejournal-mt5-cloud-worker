@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +9,12 @@ from typing import Callable, Iterator
 
 from .naming import connection_slug
 from .validation import validate_uuid
+
+try:
+    import fcntl
+except ImportError:  # Native Windows compatibility for legacy test/provisioning reads.
+    fcntl = None
+    import msvcrt
 
 
 class LockUnavailableError(RuntimeError):
@@ -35,16 +40,34 @@ class _FileLockManager:
             flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags, 0o640)
         try:
-            os.fchmod(descriptor, 0o640)
-            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-            try:
-                fcntl.flock(descriptor, operation)
-            except BlockingIOError as exc:
-                raise LockUnavailableError(f"Lock gia' acquisito: {path.name}.") from exc
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o640)
+            if fcntl is not None:
+                operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(descriptor, operation)
+                except BlockingIOError as exc:
+                    raise LockUnavailableError(
+                        f"Lock gia' acquisito: {path.name}."
+                    ) from exc
+            else:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(descriptor, b"\0")
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                try:
+                    msvcrt.locking(descriptor, mode, 1)
+                except OSError as exc:
+                    raise LockUnavailableError(
+                        f"Lock gia' acquisito: {path.name}."
+                    ) from exc
             yield
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                else:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
             finally:
                 os.close(descriptor)
 

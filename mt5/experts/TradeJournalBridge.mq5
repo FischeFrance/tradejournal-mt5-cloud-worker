@@ -295,7 +295,8 @@ string BuildHeartbeatJson()
    string json = "{";
    json += "\"generated_at\":" + JsonString(Iso8601FromDatetime(TimeCurrent())) + ",";
    json += "\"sequence\":" + IntegerToString(g_event_seq) + ",";
-   json += "\"terminal_connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false");
+   json += "\"terminal_connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false") + ",";
+   json += "\"account_trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false");
    json += "}";
    return json;
   }
@@ -319,7 +320,8 @@ string BuildAccountJson()
    json += "\"balance\":" + JsonNumber(balance) + ",";
    json += "\"equity\":" + JsonNumber(equity) + ",";
    json += "\"currency\":" + JsonString(currency) + ",";
-   json += "\"leverage\":" + IntegerToString(leverage);
+   json += "\"leverage\":" + IntegerToString(leverage) + ",";
+   json += "\"trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false");
    json += "}";
    return json;
   }

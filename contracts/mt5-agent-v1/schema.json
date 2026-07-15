@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.internal/contracts/mt5-agent-v1/schema.json",
+  "title": "TradeJournal MT5 Agent Control Plane Contract V1",
+  "description": "Authoritative wire contract between the Windows Agent (tradejournal-mt5-cloud-worker) and the trading-agent Edge Function (tradejournal-drp). Generated from the actual implementation in supabase/functions/trading-agent/index.ts and supabase/migrations/20260715135432_mt5_agent_control_plane.sql -- this file must be kept in sync by hand in BOTH repositories (no package registry links them). Do not add fields here that the Edge Function does not actually implement.",
+  "$defs": {
+    "apiVersion": { "const": "1" },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "isoTimestamp": { "type": "string", "format": "date-time" },
+    "errorCode": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+    "jobType": { "enum": ["provision", "deprovision", "historical_sync"] },
+    "historyMode": { "enum": ["new_only", "from_date", "all_available"] },
+
+    "claimRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" }
+      }
+    },
+    "claimResponseJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version", "job_id", "connection_id", "lease_id", "lease_expires_at",
+        "job_type", "attempt", "created_at", "history_mode", "from_date", "payload"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "job_id": { "$ref": "#/$defs/uuid" },
+        "connection_id": { "$ref": "#/$defs/uuid" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "lease_expires_at": { "$ref": "#/$defs/isoTimestamp" },
+        "job_type": { "$ref": "#/$defs/jobType" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "created_at": { "$ref": "#/$defs/isoTimestamp" },
+        "history_mode": { "anyOf": [{ "$ref": "#/$defs/historyMode" }, { "type": "null" }] },
+        "from_date": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
+        "payload": { "type": "object" }
+      }
+    },
+    "claimResponseNoJob": { "const": null, "description": "HTTP 204 No Content body" },
+
+    "heartbeatRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "heartbeatResponseOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_valid"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_valid": { "const": true }
+      }
+    },
+    "heartbeatResponseLeaseLost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_valid", "error_code"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_valid": { "const": false },
+        "error_code": { "const": "lease_lost" }
+      }
+    },
+
+    "transitionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "error_code": { "anyOf": [{ "$ref": "#/$defs/errorCode" }, { "type": "null" }] },
+        "result": { "type": "object" }
+      }
+    },
+    "transitionResponseOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "status"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "status": { "enum": ["running", "complete", "failed"] }
+      }
+    },
+    "transitionResponseLeaseLost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "error_code"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "error_code": { "const": "lease_lost" }
+      }
+    },
+
+    "errorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error_code"],
+      "properties": {
+        "error_code": {
+          "enum": [
+            "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed",
+            "invalid_identifier", "lease_lost", "route_not_found", "invalid_error_code",
+            "method_not_allowed", "server_not_configured", "payload_too_large",
+            "rate_limited", "internal_error"
+          ]
+        }
+      }
+    }
+  }
+}

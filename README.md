@@ -1,5 +1,12 @@
 # tradejournal-mt5-cloud-worker
 
+> **Percorso operativo corrente (Windows):** per i nuovi test usare MetaTrader 5 nativo,
+> `requirements-windows.txt` e `windows_agent`. Il percorso Ubuntu/Docker/Wine/MQL5 descritto
+> più avanti è conservato integralmente come legacy e non è più il percorso raccomandato.
+> L'agente Windows espone soltanto letture, richiede una password investor DEMO e non contiene
+> primitive di trading. Vedere [docs/windows/installation.md](docs/windows/installation.md) e
+> [docs/windows/demo-poc-runbook.md](docs/windows/demo-poc-runbook.md).
+
 POC **isolato** per un Cloud Sync self-hosted di MetaTrader 5: un worker Python che rileva eventi
 di trading (apertura/modifica/chiusura posizioni, ordini pendenti) e li invia all'API di
 ingestion di TradeJournal. Il worker applicativo gira in Docker; con MT5 reale usa un bridge

@@ -20,12 +20,47 @@ from typing import Any, Dict, Optional
 # cambiamento reale di stato (es. un secondo modify SL con un valore diverso) produce un
 # fingerprint -- e quindi un event_id -- diverso.
 _FINGERPRINT_FIELDS = {
-    "trade_opened": ("symbol", "direction", "volume", "open_price", "stop_loss", "take_profit", "open_time"),
-    "trade_modified": ("stop_loss", "take_profit", "previous_stop_loss", "previous_take_profit"),
+    "trade_opened": (
+        "symbol",
+        "direction",
+        "volume",
+        "open_price",
+        "stop_loss",
+        "take_profit",
+        "open_time",
+    ),
+    "trade_modified": (
+        "stop_loss",
+        "take_profit",
+        "previous_stop_loss",
+        "previous_take_profit",
+    ),
     "trade_closed": ("close_price", "profit", "commission", "swap", "close_time"),
-    "pending_order_created": ("symbol", "direction", "volume", "price", "stop_loss", "take_profit"),
-    "pending_order_modified": ("price", "stop_loss", "take_profit", "previous_stop_loss", "previous_take_profit"),
+    "pending_order_created": (
+        "symbol",
+        "direction",
+        "volume",
+        "price",
+        "stop_loss",
+        "take_profit",
+    ),
+    "pending_order_modified": (
+        "price",
+        "stop_loss",
+        "take_profit",
+        "previous_stop_loss",
+        "previous_take_profit",
+    ),
     "pending_order_cancelled": ("symbol", "direction", "volume", "price"),
+    "trade_volume_changed": ("volume", "previous_volume", "partial_close"),
+    "deal_recorded": (
+        "position_ticket",
+        "close_price",
+        "profit",
+        "commission",
+        "swap",
+        "close_time",
+    ),
 }
 
 
@@ -40,7 +75,9 @@ def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     ticket = str(event.get("ticket", ""))
     fields = _FINGERPRINT_FIELDS.get(event_type, ())
     fingerprint_payload = {name: event.get(name) for name in fields}
-    fingerprint_json = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":"), default=str)
+    fingerprint_json = json.dumps(
+        fingerprint_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
     digest = hashlib.sha256(fingerprint_json.encode("utf-8")).hexdigest()[:16]
     account_part = account_number or "unknown"
     return f"mt5-{account_part}-{event_type}-{ticket}-{digest}"
