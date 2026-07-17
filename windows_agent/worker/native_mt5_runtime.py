@@ -247,7 +247,13 @@ class NativeMt5Runtime:
         investor_password: str,
         expert_binary: Path,
         symbol: str = "EURUSD",
-        timeout: float = 90.0,
+        # A real broker login cycles through several MetaQuotes community/discovery servers
+        # before it gets to actually dialing the named broker server -- observed via a live
+        # TCP capture on 2026-07-17 to still be making fresh connection attempts past the old
+        # 90s budget (brief ~7s connections to 194.164.179.x:443 at roughly 19:40:42 and
+        # 19:41:38, i.e. still active ~66s in, with silence in between). The credential-free
+        # start_no_login() path never needs this -- it never leaves the local machine.
+        timeout: float = 180.0,
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
