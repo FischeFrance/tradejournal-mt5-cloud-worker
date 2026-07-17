@@ -28,6 +28,10 @@ class TradeJournalAgentService(win32serviceutil.ServiceFramework):
 
     def SvcDoRun(self):
         servicemanager.LogInfoMsg("TradeJournal read-only agent started")
+        # Build-up includes loading DPAPI-protected credentials and the MT5 runtime.  Tell the
+        # Service Control Manager immediately that the process is alive so its fixed start
+        # timeout cannot kill an otherwise healthy agent during that work.
+        self.ReportServiceStatus(win32service.SERVICE_RUNNING)
         try:
             config = load_runtime_config()
             runner = build_runner(config)
