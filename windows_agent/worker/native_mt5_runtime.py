@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from ..provisioning.secret_store import WindowsSecretStore
+
+logger = logging.getLogger(__name__)
 
 
 class NativeMt5Error(RuntimeError):
@@ -41,6 +44,7 @@ class NativeMt5Runtime:
         self.state = self.root / "state"
         self._process: subprocess.Popen[bytes] | None = None
         self._interactive_task: str | None = None
+        self._last_symbol: str | None = None
 
     def install_expert(self, expert_binary: Path) -> Path:
         if not expert_binary.is_file() or expert_binary.suffix.casefold() != ".ex5":
@@ -119,6 +123,14 @@ class NativeMt5Runtime:
 
     @staticmethod
     def _startup_symbol(default: str) -> str:
+        # Incident (2026-07-17): an operator set this machine-wide to a broker-specific variant
+        # ("EURUSD.raw") while debugging a different connection. That symbol didn't exist in the
+        # terminal's Market Watch, so the [StartUp] chart never opened, the EA never attached, and
+        # EVERY provision -- including the credential-free no-login smoke test, on a terminal that
+        # never even logs into a broker -- failed with terminal_not_ready. There is no reliable way
+        # to validate a symbol before the terminal opens (that's the very step this unblocks), so
+        # if this override is ever set again, prefer a plain, unsuffixed major-pair name and prove
+        # it against `run-no-login-file-bridge-smoke.ps1` before touching any real connection.
         symbol = NativeMt5Runtime._setting("TRADEJOURNAL_MT5_STARTUP_SYMBOL") or default
         if not symbol or any(c in symbol for c in "\r\n"):
             raise NativeMt5Error("invalid_startup_symbol")
@@ -203,6 +215,14 @@ class NativeMt5Runtime:
             if bool(account.get("trade_allowed", True)):
                 raise NativeMt5Error("investor_readonly_not_verified")
             return NativeMt5Status(pid, account, heartbeat, self.files)
+        logger.error(
+            "native MT5 runtime: heartbeat.json never appeared within %.0fs "
+            "(connection_id=%s, symbol=%s) -- check whether that symbol exists in this "
+            "terminal's Market Watch (see TRADEJOURNAL_MT5_STARTUP_SYMBOL)",
+            timeout,
+            self.connection_id,
+            self._last_symbol,
+        )
         raise NativeMt5Error("terminal_not_ready")
 
     def _running_terminal_pids(self) -> list[int]:
@@ -232,6 +252,7 @@ class NativeMt5Runtime:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
         symbol = self._startup_symbol(symbol)
+        self._last_symbol = symbol
         self.install_expert(expert_binary)
         config = self._write_startup_config(login, server, investor_password, symbol)
         investor_password = ""
@@ -261,6 +282,7 @@ class NativeMt5Runtime:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
         symbol = self._startup_symbol(symbol)
+        self._last_symbol = symbol
         self.install_expert(expert_binary)
         config = self._write_startup_config(None, None, None, symbol)
         try:
