@@ -10,6 +10,21 @@ from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.worker.native_mt5_runtime import NativeMt5Error, NativeMt5Runtime
 
 
+@pytest.fixture(autouse=True)
+def _no_machine_overrides(monkeypatch):
+    # NativeMt5Runtime._setting() deliberately falls back to a machine-wide registry key (see its
+    # own docstring/usage), not just the process environment, so it stays visible to a real
+    # subprocess.Popen()-launched terminal on the same host. That means these tests are NOT
+    # hermetic against whatever an operator has set on the actual VPS: TRADEJOURNAL_MT5_
+    # INTERACTIVE_USER being set there (a legitimate real-flow requirement, see _start_process)
+    # silently swaps the code path under test from a plain subprocess.Popen() call to a schtasks/
+    # scheduled-task launch, which these tests never patch -- they fail with an unrelated
+    # "Mock object does not support the context manager protocol" instead of testing what they
+    # say they test. Force a clean, override-free environment so behavior here depends only on
+    # what each test explicitly sets up, never on the host machine's operational configuration.
+    monkeypatch.setattr(NativeMt5Runtime, "_setting", staticmethod(lambda name: ""))
+
+
 def _runtime(tmp_path: Path) -> NativeMt5Runtime:
     terminal = tmp_path / "terminal" / "terminal64.exe"
     terminal.parent.mkdir()

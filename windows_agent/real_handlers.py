@@ -33,7 +33,6 @@ from .security import canonical_uuid
 from .state_store import atomic_json, read_json
 from .worker.dedup import PersistentDedup
 from .worker.direct_mt5_adapter import (
-    DirectMt5Adapter,
     IdentityMismatch,
     Mt5Error,
     Mt5IpcError,

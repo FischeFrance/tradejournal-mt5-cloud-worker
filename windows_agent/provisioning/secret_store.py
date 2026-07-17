@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import tempfile
@@ -93,7 +93,7 @@ class WindowsSecretStore:
         try:
             sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
         finally:
-            token.Close()
+            token.Close()  # type: ignore[attr-defined]  # pywin32 stub types the handle as int; PyHANDLE has Close() at runtime
         descriptor = win32security.SECURITY_DESCRIPTOR()
         acl = win32security.ACL()
         acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, sid)

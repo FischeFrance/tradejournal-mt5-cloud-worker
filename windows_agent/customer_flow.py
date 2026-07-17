@@ -12,7 +12,7 @@ from .provisioning.process_manager import ProcessManager
 from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
 from .worker.dedup import PersistentDedup
-from .worker.direct_mt5_adapter import DirectMt5Adapter, IdentityMismatch, Mt5Error
+from .worker.direct_mt5_adapter import IdentityMismatch, Mt5Error
 from .worker.direct_mt5_adapter import Mt5IpcError, Mt5ProcessCrashed
 from .worker.history_sync import HistorySync
 from .worker.live_sync import LiveSync

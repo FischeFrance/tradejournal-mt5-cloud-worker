@@ -12,12 +12,11 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-import requests
 from market_data_source import (
     Mt5BridgeAuthError,
     Mt5BridgeError,
