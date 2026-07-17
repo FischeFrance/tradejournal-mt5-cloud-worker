@@ -7,8 +7,8 @@ import win32event
 import win32service
 import win32serviceutil
 
-from ..agent_daemon import build_runner, run_forever
-from ..runtime_config import load_runtime_config
+from windows_agent.agent_daemon import build_runner, run_forever
+from windows_agent.runtime_config import load_runtime_config
 
 
 class TradeJournalAgentService(win32serviceutil.ServiceFramework):
