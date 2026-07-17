@@ -86,8 +86,14 @@ class WindowsSecretStore:
         import win32con
         import win32security
 
-        user = win32api.GetUserNameEx(win32api.NameSamCompatible)
-        sid, _, _ = win32security.LookupAccountName(None, user)
+        # Services running as LocalSystem do not have a SAM-compatible user name that can be
+        # resolved with LookupAccountName.  The access token always contains the effective SID,
+        # so use it directly and keep the DPAPI blob readable only by the identity that wrote it.
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        finally:
+            token.Close()
         descriptor = win32security.SECURITY_DESCRIPTOR()
         acl = win32security.ACL()
         acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, sid)
