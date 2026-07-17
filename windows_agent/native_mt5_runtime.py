@@ -40,7 +40,6 @@ class NativeMt5Runtime:
         self.files = self.terminal_root / "MQL5" / "Files" / "TradeJournal"
         self.state = self.root / "state"
         self._process: subprocess.Popen[bytes] | None = None
-        self._interactive_task: str | None = None
 
     def install_expert(self, expert_binary: Path) -> Path:
         if not expert_binary.is_file() or expert_binary.suffix.casefold() != ".ex5":
@@ -72,21 +71,13 @@ class NativeMt5Runtime:
             raise NativeMt5Error("invalid_startup_value")
         path = self.state / "startup.ini"
         self.state.mkdir(parents=True, exist_ok=True)
-        # The portable terminal must retain its per-instance data directory while
-        # it bootstraps the StartUp EA.  With this launcher, KeepPrivate=1 accepts
-        # the login but prevents the EA's OnInit from running.  Credentials remain
-        # in the ACL-restricted config only for the short bootstrap window.
         common = "[Common]\nKeepPrivate=0\n"
         if login is not None and server and password:
             common += f"Login={login}\nServer={server}\nPassword={password}\n"
         content = (
             common + "\n"
-            "[Charts]\nProfileLast=Default\nPreloadCharts=1\n\n"
             "[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n"
-            "Account=0\nProfile=0\nChart=0\n\n"
-            # MetaTrader resolves StartUp.Expert from its own MQL5/Experts directory.
-            # Passing an absolute EX5 path leaves the chart open but does not reliably attach
-            # the EA in portable installations.
+            "Account=0\nProfile=0\n\n"
             "[StartUp]\nExpert=TradeJournal\\TradeJournalBridge\n"
             f"Symbol={symbol}\nPeriod=M1\n"
         )
@@ -102,59 +93,12 @@ class NativeMt5Runtime:
         return path
 
     @staticmethod
-    def _setting(name: str) -> str:
-        value = (os.environ.get(name) or "").strip()
-        if value:
-            return value
-        try:
-            import winreg
-
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-            ) as key:
-                return str(winreg.QueryValueEx(key, name)[0]).strip()
-        except (ImportError, OSError):
-            return ""
-
-    @staticmethod
-    def _startup_symbol(default: str) -> str:
-        symbol = NativeMt5Runtime._setting("TRADEJOURNAL_MT5_STARTUP_SYMBOL") or default
-        if not symbol or any(c in symbol for c in "\r\n"):
-            raise NativeMt5Error("invalid_startup_symbol")
-        return symbol
-
-    @staticmethod
     def _payload(record: dict[str, Any], name: str) -> dict[str, Any] | None:
         if record.get("schema_version") != 1 or not isinstance(record.get("payload"), dict):
             return None
         return record["payload"]
 
-    def _start_process(self, config: Path) -> subprocess.Popen[bytes] | None:
-        interactive_user = self._setting("TRADEJOURNAL_MT5_INTERACTIVE_USER")
-        if interactive_user:
-            if not interactive_user.replace("-", "").replace("_", "").replace(".", "").isalnum():
-                raise NativeMt5Error("invalid_interactive_user")
-            task = f"TradeJournalMT5-{self.connection_id}"
-            launcher = self.state / "launch-terminal.cmd"
-            launcher.write_text(
-                "@echo off\r\n"
-                f'start "" /b "{self.terminal}" /portable /config:"{config}"\r\n',
-                encoding="utf-8",
-            )
-            command = str(launcher)
-            create = [
-                "schtasks", "/Create", "/TN", task, "/SC", "ONCE", "/ST", "23:59",
-                "/RU", interactive_user, "/IT", "/RL", "HIGHEST", "/TR", command, "/F",
-            ]
-            completed = subprocess.run(create, capture_output=True, text=True, check=False)
-            if completed.returncode != 0:
-                raise NativeMt5Error("interactive_task_create_failed")
-            completed = subprocess.run(["schtasks", "/Run", "/TN", task], capture_output=True, text=True, check=False)
-            if completed.returncode != 0:
-                raise NativeMt5Error("interactive_task_run_failed")
-            self._interactive_task = task
-            return None
+    def _start_process(self, config: Path) -> subprocess.Popen[bytes]:
         self._process = subprocess.Popen(
             [str(self.terminal), "/portable", f"/config:{config}"],
             cwd=self.terminal_root,
@@ -167,20 +111,8 @@ class NativeMt5Runtime:
     ) -> NativeMt5Status:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            pid = 0
-            if self._process is not None:
-                pid = self._process.pid
-            elif self._interactive_task:
-                pids = self._running_terminal_pids()
-                pid = pids[0] if pids else 0
-            if self._process is not None and self._process.poll() is not None:
-                # MT5 may detach from the short-lived launcher process after reading /config.
-                # Accept only the exact executable inside this isolated instance, never an
-                # arbitrary terminal64.exe elsewhere on the host.
-                pids = self._running_terminal_pids()
-                if not pids:
-                    raise NativeMt5Error("mt5_process_crashed")
-                pid = pids[0]
+            if self._process is None or self._process.poll() is not None:
+                raise NativeMt5Error("mt5_process_crashed")
             account_raw = self._read_json(self.files / "account.json")
             heartbeat_raw = self._read_json(self.files / "heartbeat.json")
             account = self._payload(account_raw, "account") if account_raw else None
@@ -189,7 +121,7 @@ class NativeMt5Runtime:
                 time.sleep(1)
                 continue
             if login is None:
-                return NativeMt5Status(pid, account or {}, heartbeat, self.files)
+                return NativeMt5Status(self._process.pid, account or {}, heartbeat, self.files)
             if account is None:
                 time.sleep(1)
                 continue
@@ -202,22 +134,8 @@ class NativeMt5Runtime:
                 continue
             if bool(account.get("trade_allowed", True)):
                 raise NativeMt5Error("investor_readonly_not_verified")
-            return NativeMt5Status(pid, account, heartbeat, self.files)
+            return NativeMt5Status(self._process.pid, account, heartbeat, self.files)
         raise NativeMt5Error("terminal_not_ready")
-
-    def _running_terminal_pids(self) -> list[int]:
-        try:
-            import psutil
-        except ImportError:
-            return []
-        result = []
-        for process in psutil.process_iter(("pid", "exe")):
-            try:
-                if process.info["exe"] and Path(process.info["exe"]).resolve() == self.terminal.resolve():
-                    result.append(int(process.info["pid"]))
-            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
-                continue
-        return result
 
     def start(
         self,
@@ -231,7 +149,6 @@ class NativeMt5Runtime:
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
-        symbol = self._startup_symbol(symbol)
         self.install_expert(expert_binary)
         config = self._write_startup_config(login, server, investor_password, symbol)
         investor_password = ""
@@ -239,11 +156,6 @@ class NativeMt5Runtime:
         try:
             self._start_process(config)
             return self._wait_for_heartbeat(timeout, login, server)
-        except Exception:
-            # A failed bootstrap has no consumer yet, so its isolated terminal must not be
-            # retained. Successful starts deliberately remain alive for history/live sync.
-            self.stop()
-            raise
         finally:
             try:
                 config.unlink(missing_ok=True)
@@ -260,15 +172,11 @@ class NativeMt5Runtime:
         """Verify that a generic terminal loads the EA without credentials or MT5 login."""
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
-        symbol = self._startup_symbol(symbol)
         self.install_expert(expert_binary)
         config = self._write_startup_config(None, None, None, symbol)
         try:
             self._start_process(config)
             return self._wait_for_heartbeat(timeout)
-        except Exception:
-            self.stop()
-            raise
         finally:
             try:
                 config.unlink(missing_ok=True)
@@ -284,36 +192,13 @@ class NativeMt5Runtime:
         return value if isinstance(value, dict) else None
 
     def stop(self, timeout: float = 15.0) -> bool:
-        if self._interactive_task:
-            subprocess.run(["schtasks", "/End", "/TN", self._interactive_task], capture_output=True, check=False)
-            subprocess.run(["schtasks", "/Delete", "/TN", self._interactive_task, "/F"], capture_output=True, check=False)
-            self._interactive_task = None
-        try:
-            (self.state / "launch-terminal.cmd").unlink(missing_ok=True)
-        except OSError:
-            pass
         process = self._process
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(5)
-        pids = self._running_terminal_pids()
-        if not pids:
+        if process is None or process.poll() is not None:
             return True
+        process.terminate()
         try:
-            import psutil
-        except ImportError:
-            return False
-        try:
-            for pid in pids:
-                candidate = psutil.Process(pid)
-                candidate.terminate()
-            _, alive = psutil.wait_procs([psutil.Process(pid) for pid in pids], timeout=timeout)
-            for candidate in alive:
-                candidate.kill()
-            return not self._running_terminal_pids()
-        except (psutil.Error, OSError):
-            return False
+            process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(5)
+        return process.poll() is not None

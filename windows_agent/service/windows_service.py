@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import logging
+from pathlib import Path
 
 import servicemanager
 import win32event
@@ -9,6 +11,21 @@ import win32serviceutil
 
 from windows_agent.agent_daemon import build_runner, run_forever
 from windows_agent.runtime_config import load_runtime_config
+from windows_agent.security import RedactionFilter
+
+
+def _configure_logging() -> None:
+    """Persist service failures locally without allowing credentials into logs."""
+    root = logging.getLogger()
+    if any(getattr(handler, "_tradejournal_service", False) for handler in root.handlers):
+        return
+    Path(r"C:\TradeJournal\logs").mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(r"C:\TradeJournal\logs\agent-service.log", encoding="utf-8")
+    handler._tradejournal_service = True  # type: ignore[attr-defined]
+    handler.addFilter(RedactionFilter())
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
 
 
 class TradeJournalAgentService(win32serviceutil.ServiceFramework):
@@ -27,6 +44,7 @@ class TradeJournalAgentService(win32serviceutil.ServiceFramework):
         win32event.SetEvent(self.stop_event)
 
     def SvcDoRun(self):
+        _configure_logging()
         servicemanager.LogInfoMsg("TradeJournal read-only agent started")
         # Build-up includes loading DPAPI-protected credentials and the MT5 runtime.  Tell the
         # Service Control Manager immediately that the process is alive so its fixed start

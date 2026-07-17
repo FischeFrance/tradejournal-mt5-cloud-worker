@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.worker.native_mt5_runtime import NativeMt5Error, NativeMt5Runtime
 
 
@@ -16,16 +17,29 @@ def _runtime(tmp_path: Path) -> NativeMt5Runtime:
     return NativeMt5Runtime(tmp_path, "00000000-0000-4000-8000-000000000001")
 
 
+def _envelope(payload: dict[str, object]) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "generated_at": "2026-07-17T00:00:00Z",
+            "sequence": 1,
+            "account_identity": {"login": "42", "server": "Demo"},
+            "server_identity": "Demo",
+            "payload": payload,
+        }
+    )
+
+
 def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     runtime.files.mkdir(parents=True)
     (runtime.files / "account.json").write_text(
-        json.dumps({"login": "42", "server": "Demo", "trade_allowed": False})
+        _envelope({"login": "42", "server": "Demo", "trade_allowed": False})
     )
     (runtime.files / "heartbeat.json").write_text(
-        json.dumps({"terminal_connected": True})
+        _envelope({"terminal_connected": True})
     )
     process = Mock(pid=123)
     process.poll.return_value = None
@@ -50,6 +64,15 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert not config.exists()
 
 
+def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    runtime = _runtime(tmp_path)
+    config = runtime._write_startup_config(None, None, None, "EURUSD")
+    content = config.read_text(encoding="utf-8")
+    assert "Expert=TradeJournal\\TradeJournalBridge" in content
+    assert str(runtime.terminal_root) not in content
+
+
 @pytest.mark.parametrize(
     ("account", "code"),
     [
@@ -65,9 +88,9 @@ def test_identity_and_readonly_guards(
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     runtime.files.mkdir(parents=True)
-    (runtime.files / "account.json").write_text(json.dumps(account))
+    (runtime.files / "account.json").write_text(_envelope(account))
     (runtime.files / "heartbeat.json").write_text(
-        json.dumps({"terminal_connected": True})
+        _envelope({"terminal_connected": True})
     )
     process = Mock(pid=123)
     process.poll.return_value = None
@@ -110,4 +133,3 @@ def test_crashed_process_is_reported(tmp_path: Path) -> None:
                 investor_password="placeholder",
                 expert_binary=expert,
             )
-

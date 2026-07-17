@@ -1,5 +1,6 @@
 param([switch]$DisconnectAfterTest)
 $ErrorActionPreference='Stop'
+throw 'This legacy Python MetaTrader5 IPC flow is disabled. Use run-real-file-bridge-customer-flow.ps1.'
 $repo=Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $login=Read-Host 'MT5 DEMO login number'
 $server=Read-Host 'MT5 DEMO server'

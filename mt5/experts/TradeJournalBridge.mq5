@@ -5,14 +5,14 @@
 //|                                                                          |
 //| ==== PERCHE' QUESTO EA NON PUO' FARE TRADING (leggere prima) ==========  |
 //| Questo file non chiama MAI OrderSend, OrderSendAsync, OrderModify,       |
-//| OrderClose o CTrade::*, e non contiene alcun blocco #import di una DLL   |
+//| OrderClose, PositionOpen, PositionClose, PositionModify o CTrade::*,    |
+//| e non contiene alcun blocco #import di una DLL                           |
 //| esterna. L'unico scopo e' leggere lo stato gia' presente nel terminale   |
 //| (account, posizioni, ordini, storico) e scriverlo su file JSON dentro    |
-//| il sandbox MQL5/Files/TradeJournal, cosi' che un processo Linux esterno  |
-//| del tutto separato (bridge/files/file_bridge.py) possa esporlo in sola   |
-//| lettura al worker via HTTP. Il worker stesso non ha mai potuto inviare   |
-//| ordini (vedi worker/bridge_mt5_client.py): questo EA mantiene la stessa  |
-//| garanzia anche sul lato MT5. tests/test_mql5_ea_no_trading.py verifica   |
+//| il sandbox MQL5/Files/TradeJournal. Il Windows Agent locale legge solo   |
+//| questi file atomici: non usa il pacchetto Python MetaTrader5, IPC o una  |
+//| porta HTTP per ottenere i dati. Questo EA mantiene la garanzia di sola   |
+//| lettura anche sul lato MT5. tests/test_mql5_ea_no_trading.py verifica    |
 //| staticamente l'assenza di queste chiamate a ogni modifica del file.      |
 //| =========================================================================|
 //+------------------------------------------------------------------------+
@@ -22,28 +22,28 @@
 #property strict
 #property description "EA read-only: scrive account/posizioni/ordini/eventi/candele su file JSON. Nessuna funzione di trading."
 
-//--- Parametri configurabili (vedi anche startup.ini / deploy/instance/entrypoint-runtime.sh)
+//--- Parametri configurabili del bridge file Windows nativo.
 input int InpTimerSeconds     = 2;        // Intervallo OnTimer in secondi (heartbeat + snapshot)
 input int InpBackfillHours    = 168;      // Finestra di backfill storico al primo avvio (ore, 0 = disabilita)
-input int InpCandleBars       = 200;      // Barre storiche complete da pubblicare per timeframe in candles.json
-input int InpEventsMaxBytes   = 10000000; // Soglia di rotazione di events.jsonl (byte, 0 = mai ruotare)
+input int InpSnapshotHistoryHours = 87600; // Storico pubblicato nei file deals/history_orders (10 anni)
+input int InpCandleBars       = 200;      // Barre storiche complete da pubblicare per timeframe
 
 //--- Directory di output, relativa al sandbox MQL5/Files del terminale (portable mode).
 #define BASE_DIR "TradeJournal"
+#define FILE_BRIDGE_SCHEMA_VERSION 1
 
 //--- Stato di processo persistito su disco per sopravvivere a un riavvio di EA/terminale.
 long g_event_seq     = 0;
 bool g_backfill_done = false;
 
 //--- Identificativo della connessione (UUID non sensibile), letto una volta in OnInit da un file
-//--- scritto dall'entrypoint PRIMA di avviare il terminale (deploy/instance/entrypoint-runtime.sh):
-//--- l'EA non ha altro modo di conoscere il connection_id, perche' MQL5 non legge variabili
-//--- d'ambiente del processo Linux ospitante. Incluso in ogni event_id per garantire unicita'
+//--- scritto dal Windows Agent PRIMA di avviare il terminale: l'EA non ha altro modo di
+//--- conoscere il connection_id, perche' MQL5 non legge variabili d'ambiente del processo.
+//--- Incluso in ogni event_id per garantire unicita'
 //--- anche fra connessioni/account diversi con ticket numericamente coincidenti.
 string g_connection_id = "unknown-connection";
 
-//--- Le 6 timeframe pubblicate in candles.json: stesse sigle di bridge/common.py:TIMEFRAME_SECONDS
-//--- sul lato Python, cosi' il bridge Linux puo' servire POST /v1/candles senza reinterpretarle.
+//--- Le 6 timeframe pubblicate in file separati candles/<symbol>-<timeframe>.json.
 string           TIMEFRAME_NAMES[6]  = {"M1", "M5", "M15", "H1", "H4", "D1"};
 ENUM_TIMEFRAMES  TIMEFRAME_VALUES[6] = {PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4, PERIOD_D1};
 
@@ -88,6 +88,23 @@ string JsonNumber(const double value)
    return DoubleToString(value, 5);
   }
 
+// Ogni file del protocollo nativo usa la stessa envelope. Login/server sono identita' di
+// attribuzione, non credenziali; password e token non sono mai letti ne' serializzati dall'EA.
+string BuildEnvelope(const string payload, const long sequence)
+  {
+   string login = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   string json = "{";
+   json += "\"schema_version\":" + IntegerToString(FILE_BRIDGE_SCHEMA_VERSION) + ",";
+   json += "\"generated_at\":" + JsonString(Iso8601FromDatetime(TimeGMT())) + ",";
+   json += "\"sequence\":" + IntegerToString(sequence) + ",";
+   json += "\"account_identity\":{\"login\":" + JsonString(login) + ",\"server\":" + JsonString(server) + "},";
+   json += "\"server_identity\":" + JsonString(server) + ",";
+   json += "\"payload\":" + payload;
+   json += "}";
+   return json;
+  }
+
 // datetime MQL5 e' gia' un timestamp Unix (secondi UTC dal 1970-01-01), esattamente come i
 // campi letti da worker/mt5_client.py e dal vecchio bridge/windows/mt5_bridge.py: nessuna
 // conversione di fuso orario e' necessaria, solo la formattazione ISO8601 con suffisso Z.
@@ -101,14 +118,11 @@ string Iso8601FromDatetime(const datetime value)
 
 string EntryToString(const long entry_raw)
   {
-   switch(entry_raw)
-     {
-      case DEAL_ENTRY_IN:     return "IN";
-      case DEAL_ENTRY_OUT:    return "OUT";
-      case DEAL_ENTRY_INOUT:  return "INOUT";
-      case DEAL_ENTRY_OUT_BY: return "OUT_BY";
-      default:                return "UNKNOWN";
-     }
+   if(entry_raw == (long)DEAL_ENTRY_IN)    return "IN";
+   if(entry_raw == (long)DEAL_ENTRY_OUT)   return "OUT";
+   if(entry_raw == (long)DEAL_ENTRY_INOUT) return "INOUT";
+   if(entry_raw == (long)DEAL_ENTRY_OUT_BY)return "OUT_BY";
+   return "UNKNOWN";
   }
 
 string DirectionFromType(const long mt5_type)
@@ -174,54 +188,13 @@ bool WriteJsonAtomic(const string relative_name, const string json_text)
    return true;
   }
 
-//--- Rotazione dimensionale di events.jsonl: oltre InpEventsMaxBytes, il file corrente viene
-//--- rinominato in events.jsonl.1 (sovrascrivendo un'eventuale rotazione precedente: una sola
-//--- generazione storica e' conservata) e la prossima AppendEventLine ne ricrea uno vuoto. Il
-//--- bridge Linux riconosce la rotazione dal cambio di identita' (device+inode) del file
-//--- "events.jsonl" e, se events.jsonl.1 e' esattamente il file che stava leggendo, ne consuma
-//--- la coda rimasta prima di passare al nuovo file (vedi
-//--- bridge/files/file_bridge.py:_EventsCursor, e docs/provisioning.md per il limite noto:
-//--- una sola rotazione "non lette" fra due letture del bridge e' garantita senza perdita).
-void RotateEventsLogIfNeeded()
+// Ogni evento e' un file indipendente in events/. A differenza di un log append-only puo'
+// essere pubblicato con lo stesso rename atomico degli snapshot: il lettore non osserva mai una
+// riga parziale e il nome basato sulla sequenza resta stabile dopo il riavvio grazie a cursor.json.
+bool WriteEventAtomic(const string payload)
   {
-   if(InpEventsMaxBytes <= 0)
-      return;
-   string path = BASE_DIR + "\\events.jsonl";
-   if(!FileIsExist(path))
-      return;
-   int handle = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ, 0, CP_UTF8);
-   if(handle == INVALID_HANDLE)
-      return;
-   ulong size = (ulong)FileSize(handle);
-   FileClose(handle);
-   if(size < (ulong)InpEventsMaxBytes)
-      return;
-
-   string rotated_path = BASE_DIR + "\\events.jsonl.1";
-   if(!FileMove(path, 0, rotated_path, FILE_REWRITE))
-      Print("TradeJournalBridge: rotazione di events.jsonl fallita, errore=", GetLastError());
-  }
-
-//--- events.jsonl e' l'unico file append-only: FileOpen con FILE_READ|FILE_WRITE non tronca il
-//--- file esistente (a differenza del solo FILE_WRITE), FileSeek all'inizio della scrittura
-//--- posiziona sempre alla fine. FileFlush dopo ogni riga garantisce che il bridge Linux, che
-//--- legge in modo incrementale, non veda mai una riga a meta' oltre il confine dell'ultimo
-//--- carattere di newline scritto.
-bool AppendEventLine(const string json_line)
-  {
-   RotateEventsLogIfNeeded();
-   string path = BASE_DIR + "\\events.jsonl";
-   int handle = FileOpen(path, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ, 0, CP_UTF8);
-   if(handle == INVALID_HANDLE)
-     {
-      Print("TradeJournalBridge: impossibile aprire events.jsonl errore=", GetLastError());
-      return false;
-     }
-   FileSeek(handle, 0, SEEK_END);
-   FileWriteString(handle, json_line + "\n");
-   FileFlush(handle);
-   FileClose(handle);
-   return true;
+   string relative_name = "events\\event-" + IntegerToString(g_event_seq) + ".json";
+   return WriteJsonAtomic(relative_name, BuildEnvelope(payload, g_event_seq));
   }
 
 //+------------------------------------------------------------------------+
@@ -397,51 +370,105 @@ string BuildOrdersJson()
    return json;
   }
 
-string BuildCandlesJson()
+// Snapshot storico separato dagli ordini attivi: HistorySync lo usa per importare anche ordini
+// chiusi senza confondere lo stato live letto da LiveSync.
+string BuildHistoryOrdersJson()
+  {
+   datetime to_time = TimeCurrent();
+   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
+   string json = "[";
+   bool first = true;
+   if(!HistorySelect(from_time, to_time))
+      return json + "]";
+   int total = HistoryOrdersTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryOrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!first)
+         json += ",";
+      first = false;
+      json += "{";
+      json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
+      json += "\"symbol\":" + JsonString(HistoryOrderGetString(ticket, ORDER_SYMBOL)) + ",";
+      json += "\"volume_current\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_VOLUME_CURRENT)) + ",";
+      json += "\"type\":" + IntegerToString(HistoryOrderGetInteger(ticket, ORDER_TYPE)) + ",";
+      json += "\"price_open\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_PRICE_OPEN)) + ",";
+      json += "\"sl\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_SL)) + ",";
+      json += "\"tp\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_TP)) + ",";
+      json += "\"time\":" + JsonString(Iso8601FromDatetime((datetime)HistoryOrderGetInteger(ticket, ORDER_TIME_DONE)));
+      json += "}";
+     }
+   return json + "]";
+  }
+
+string BuildDealsJson()
+  {
+   datetime to_time = TimeCurrent();
+   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
+   string json = "[";
+   bool first = true;
+   if(!HistorySelect(from_time, to_time))
+      return json + "]";
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!first)
+         json += ",";
+      first = false;
+      json += "{";
+      json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
+      json += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
+      json += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
+      json += "\"volume\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_VOLUME)) + ",";
+      json += "\"price\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PRICE)) + ",";
+      json += "\"profit\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PROFIT)) + ",";
+      json += "\"commission\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_COMMISSION)) + ",";
+      json += "\"swap\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_SWAP)) + ",";
+      json += "\"time\":" + JsonString(Iso8601FromDatetime((datetime)HistoryDealGetInteger(ticket, DEAL_TIME)));
+      json += "}";
+     }
+   return json + "]";
+  }
+
+string BuildCandlesJson(const int timeframe_index)
   {
    string symbol = _Symbol; // simbolo del grafico su cui e' agganciato l'EA (Symbol= in startup.ini)
-   string json = "{" + JsonString(symbol) + ":{";
    datetime now = TimeCurrent();
-
-   for(int t = 0; t < 6; t++)
+   MqlRates rates[];
+   int copied = CopyRates(symbol, TIMEFRAME_VALUES[timeframe_index], 0, InpCandleBars + 1, rates);
+   int period_seconds = PeriodSeconds(TIMEFRAME_VALUES[timeframe_index]);
+   string json = "[";
+   bool first = true;
+   for(int i = 0; i < copied; i++)
      {
-      MqlRates rates[];
-      int copied = CopyRates(symbol, TIMEFRAME_VALUES[t], 0, InpCandleBars + 1, rates);
-      int period_seconds = PeriodSeconds(TIMEFRAME_VALUES[t]);
-
-      json += JsonString(TIMEFRAME_NAMES[t]) + ":[";
-      bool first = true;
-      for(int i = 0; i < copied; i++)
-        {
-         if(rates[i].time + period_seconds > now)
-            continue; // candela ancora in formazione: mai pubblicata (stessa regola del vecchio bridge)
-         if(!first)
-            json += ",";
-         first = false;
-         json += "{";
-         json += "\"open_time\":" + JsonString(Iso8601FromDatetime(rates[i].time)) + ",";
-         // Prezzi come stringa decimale, non come numero JSON: stesso formato del vecchio
-         // bridge/windows/mt5_bridge.py (str(Decimal(...))), per compatibilita' col client.
-         json += "\"open\":" + JsonString(DoubleToString(rates[i].open, 5)) + ",";
-         json += "\"high\":" + JsonString(DoubleToString(rates[i].high, 5)) + ",";
-         json += "\"low\":" + JsonString(DoubleToString(rates[i].low, 5)) + ",";
-         json += "\"close\":" + JsonString(DoubleToString(rates[i].close, 5)) + ",";
-         json += "\"tick_volume\":" + IntegerToString((long)rates[i].tick_volume) + ",";
-         json += "\"spread\":" + IntegerToString(rates[i].spread) + ",";
-         json += "\"source\":\"mt5\"";
-         json += "}";
-        }
-      json += "]";
-      if(t < 5)
+      if(rates[i].time + period_seconds > now)
+         continue; // candela ancora in formazione: mai pubblicata
+      if(!first)
          json += ",";
+      first = false;
+      json += "{";
+      json += "\"open_time\":" + JsonString(Iso8601FromDatetime(rates[i].time)) + ",";
+      json += "\"open\":" + JsonString(DoubleToString(rates[i].open, 5)) + ",";
+      json += "\"high\":" + JsonString(DoubleToString(rates[i].high, 5)) + ",";
+      json += "\"low\":" + JsonString(DoubleToString(rates[i].low, 5)) + ",";
+      json += "\"close\":" + JsonString(DoubleToString(rates[i].close, 5)) + ",";
+      json += "\"tick_volume\":" + IntegerToString((long)rates[i].tick_volume) + ",";
+      json += "\"spread\":" + IntegerToString(rates[i].spread) + ",";
+      json += "\"source\":\"mt5\"";
+      json += "}";
      }
-   json += "}}";
+   json += "]";
    return json;
   }
 
 //+------------------------------------------------------------------------+
-//| Un unico record evento per events.jsonl. Campi non applicabili al tipo |
-//| di evento restano null, mai omessi (schema stabile riga per riga).     |
+//| Un unico payload evento. Campi non applicabili al tipo restano null,   |
+//| mai omessi (schema stabile); WriteEventAtomic aggiunge l'envelope.     |
 //+------------------------------------------------------------------------+
 string BuildEventJson(const string event_type, const long ticket, const long position_id,
                        const long order_id, const long deal_id, const string symbol,
@@ -534,7 +561,7 @@ void EmitDealAddEvent(const ulong deal_ticket)
                                  symbol, direction, volume, price, 0.0, 0.0,
                                  profit, commission, swap, magic, comment, entry, event_time,
                                  timestamp_msc);
-   AppendEventLine(line);
+   WriteEventAtomic(line);
   }
 
 void EmitOrderEvent(const string event_type, const ulong order_ticket)
@@ -581,7 +608,7 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
    string line = BuildEventJson(event_type, (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
-   AppendEventLine(line);
+   WriteEventAtomic(line);
   }
 
 void EmitPositionEvent(const ulong position_ticket)
@@ -603,7 +630,7 @@ void EmitPositionEvent(const ulong position_ticket)
    string line = BuildEventJson("POSITION", (long)position_ticket, (long)position_ticket, 0, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
-   AppendEventLine(line);
+   WriteEventAtomic(line);
   }
 
 void EmitHistoryOrderEvent(const ulong order_ticket)
@@ -625,7 +652,7 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
    string line = BuildEventJson("HISTORY_ADD", (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
-   AppendEventLine(line);
+   WriteEventAtomic(line);
   }
 
 //+------------------------------------------------------------------------+
@@ -676,19 +703,23 @@ void RunBackfill()
   }
 
 //+------------------------------------------------------------------------+
-//| Scrittura di tutti gli snapshot per un ciclo OnTimer. L'heartbeat e'   |
-//| scritto per ULTIMO: il bridge Linux considera "freschi" i dati solo se |
-//| heartbeat.json e' recente, quindi una heartbeat fresca implica che     |
-//| account/positions/orders/candles di questo stesso giro sono gia' stati |
-//| scritti.                                                                |
+//| Scrittura di tutti gli snapshot per un ciclo OnTimer. Tutti usano la    |
+//| stessa envelope versionata; l'heartbeat e' scritto per ULTIMO, quindi   |
+//| un heartbeat fresco implica che i dati dello stesso ciclo esistono gia'.|
 //+------------------------------------------------------------------------+
 void WriteAllSnapshots()
   {
-   WriteJsonAtomic("account.json", BuildAccountJson());
-   WriteJsonAtomic("positions.json", BuildPositionsJson());
-   WriteJsonAtomic("orders.json", BuildOrdersJson());
-   WriteJsonAtomic("candles.json", BuildCandlesJson());
-   WriteJsonAtomic("heartbeat.json", BuildHeartbeatJson());
+   g_event_seq++;
+   long sequence = g_event_seq;
+   WriteJsonAtomic("account.json", BuildEnvelope(BuildAccountJson(), sequence));
+   WriteJsonAtomic("positions.json", BuildEnvelope(BuildPositionsJson(), sequence));
+   WriteJsonAtomic("orders.json", BuildEnvelope(BuildOrdersJson(), sequence));
+   WriteJsonAtomic("history_orders.json", BuildEnvelope(BuildHistoryOrdersJson(), sequence));
+   WriteJsonAtomic("deals.json", BuildEnvelope(BuildDealsJson(), sequence));
+   for(int t = 0; t < 6; t++)
+      WriteJsonAtomic("candles\\" + _Symbol + "-" + TIMEFRAME_NAMES[t] + ".json",
+                      BuildEnvelope(BuildCandlesJson(t), sequence));
+   WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(), sequence));
   }
 
 //+------------------------------------------------------------------------+
@@ -703,8 +734,10 @@ int OnInit()
       // FolderCreate restituisce true anche se la cartella esiste gia': un false qui indica un
       // problema piu' serio (sandbox non scrivibile), che verra' comunque rilevato dai
       // successivi WriteJsonAtomic falliti e riportato in heartbeat/log.
-      Print("TradeJournalBridge: FolderCreate(", BASE_DIR, ") ha restituito false, errore=", GetLastError());
+     Print("TradeJournalBridge: FolderCreate(", BASE_DIR, ") ha restituito false, errore=", GetLastError());
      }
+   FolderCreate(BASE_DIR + "\\candles");
+   FolderCreate(BASE_DIR + "\\events");
 
    g_connection_id = ReadConnectionId();
    LoadCursorState();
@@ -741,7 +774,7 @@ void OnTimer()
   }
 
 // SICUREZZA: questo e' l'unico punto in cui l'EA reagisce a transazioni. Legge soltanto lo
-// stato del ticket coinvolto (funzioni Get*/History*Get*) e appende una riga a events.jsonl.
+// stato del ticket coinvolto (funzioni Get*/History*Get*) e pubblica un file evento atomico.
 // Nessun ramo chiama funzioni di trading. Ogni chiamata e' O(1) rispetto al volume di
 // account/posizioni/ordini (nessuna scansione completa), per non bloccare a lungo il thread
 // dei trade transaction del terminale.

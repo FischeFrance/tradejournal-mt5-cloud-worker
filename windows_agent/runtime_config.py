@@ -10,7 +10,8 @@ from .provisioning.secret_store import WindowsSecretStore
 
 DEFAULT_SECRETS_ROOT = Path(r"C:\TradeJournal\secrets")
 DEFAULT_INSTANCES_ROOT = Path(r"C:\TradeJournal\instances")
-DEFAULT_SOURCE_TERMINAL = Path(r"C:\Program Files\MetaTrader 5\terminal64.exe")
+DEFAULT_SOURCE_TERMINAL = Path(r"C:\TradeJournal\mt5-template\terminal64.exe")
+DEFAULT_EXPERT_BINARY = Path(r"C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5")
 DEFAULT_POLL_SECONDS = 5.0
 
 
@@ -21,6 +22,7 @@ class AgentRuntimeConfig:
     secrets_root: Path
     instances_root: Path = DEFAULT_INSTANCES_ROOT
     source_terminal: Path = DEFAULT_SOURCE_TERMINAL
+    expert_binary: Path = DEFAULT_EXPERT_BINARY
 
 
 def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig:
@@ -37,12 +39,14 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
     secrets_root = Path(source.get("TRADEJOURNAL_SECRETS_ROOT", "").strip() or DEFAULT_SECRETS_ROOT)
     instances_root = Path(source.get("TRADEJOURNAL_INSTANCES_ROOT", "").strip() or DEFAULT_INSTANCES_ROOT)
     source_terminal = Path(source.get("TRADEJOURNAL_SOURCE_TERMINAL", "").strip() or DEFAULT_SOURCE_TERMINAL)
+    expert_binary = Path(source.get("TRADEJOURNAL_EXPERT_BINARY", "").strip() or DEFAULT_EXPERT_BINARY)
     return AgentRuntimeConfig(
         base_url=base_url,
         poll_seconds=poll_seconds,
         secrets_root=secrets_root,
         instances_root=instances_root,
         source_terminal=source_terminal,
+        expert_binary=expert_binary,
     )
 
 

@@ -28,13 +28,11 @@ def _not_implemented(job_type: str) -> JobHandler:
 
 
 def default_handlers() -> dict[str, JobHandler]:
-    """Placeholder handlers: claim/lease/heartbeat/transition against the real control plane
-    already work end to end (see runtime_config.py, job_runner.py, credential_envelope.py), but
-    driving an actual MT5 instance from a claimed job is not yet wired -- see
-    CONTROL-PLANE-NEXT-STEPS.txt. Raising NotImplementedError here is deliberate and safe: it
-    fails the job cleanly (JobRunner already turns any handler exception into a sanitized
-    `fail` transition with `error_code=notimplementederror`), so a real claimed job never hangs
-    or crashes the daemon -- it just visibly fails until the real handler is implemented."""
+    """Explicit no-op handlers for isolated unit tests only.
+
+    ``build_runner()`` never calls this helper: its normal path wires the real native MQL5 file
+    bridge handlers. Keeping this function avoids accidentally using a production API in a test.
+    """
     return {
         "provision": _not_implemented("provision"),
         "deprovision": _not_implemented("deprovision"),
@@ -58,6 +56,7 @@ def build_runner(
         instances_root=config.instances_root,
         secrets_root=config.secrets_root,
         source_terminal=config.source_terminal,
+        expert_binary=config.expert_binary,
     )
     return JobRunner(state_path, api, real_handlers)
 

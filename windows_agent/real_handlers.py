@@ -42,19 +42,19 @@ from .worker.direct_mt5_adapter import (
 from .worker.history_sync import HistoryMode, HistorySync
 from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
+from .worker.mql5_file_adapter import Mql5FileMt5Adapter
+from .worker.native_mt5_runtime import NativeMt5Error, NativeMt5Runtime
 
 logger = logging.getLogger(__name__)
 
 SERVER_PATTERN = re.compile(r"[A-Za-z0-9._ -]{1,128}")
+DEFAULT_EXPERT_BINARY = Path(r"C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5")
 
 JobHandler = Callable[[dict], dict]
 
 
 class PersistentSnapshot:
-    """Disk-backed replacement for customer_flow.py's in-memory MemorySnapshot. A real handler
-    only runs one poll_once() per job (see module docstring below), so this is mostly a
-    convenience, but persisting it means a future resumed live-sync check starts from the last
-    known state instead of an empty one."""
+    """Disk-backed snapshot for resumed live-sync checks."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -67,10 +67,7 @@ class PersistentSnapshot:
 
 
 def _progress(root: Path, **fields: Any) -> None:
-    """Local-only progress tracking for operator visibility and Fase 5 recovery. The contract's
-    job status enum (pending/claimed/running/complete/failed/cancelled, see
-    contracts/mt5-agent-v1/schema.json) has no "authenticating"/"importing_history"/"connected"
-    states -- those are internal granularity, never sent to the control plane."""
+    """Local-only progress tracking; these states are never sent to the control plane."""
     path = root / "state" / "job_progress.json"
     current = read_json(path)
     current.update(fields)
@@ -150,11 +147,7 @@ def _map_mt5_error(exc: Mt5Error) -> AgentError:
 def _ensure_no_stale_process(
     terminal: Path, state_path: Path, process_factory: Callable[[Path], Any]
 ) -> None:
-    """Recovery safeguard (Fase 5): by this architecture's design nothing keeps MT5 running
-    between jobs (see _run_live_sync_once's docstring), so a terminal64.exe already running at
-    this instance's path can only be an orphan from a crashed previous attempt, never a
-    legitimate concurrent session. Terminating it first prevents a second terminal64.exe fighting
-    the same portable data directory."""
+    """Remove only an orphan using this isolated terminal path before a new job."""
     if terminal.is_file() and ProcessManager.find(terminal):
         process_factory(state_path).cleanup_path(terminal)
 
@@ -201,14 +194,16 @@ def build_real_handlers(
     instances_root: Path,
     secrets_root: Path,
     source_terminal: Path,
-    adapter_factory: Callable[..., Any] = DirectMt5Adapter,
+    adapter_factory: Callable[..., Any] | None = None,
     process_factory: Callable[[Path], Any] = ProcessManager,
+    expert_binary: Path = DEFAULT_EXPERT_BINARY,
+    runtime_factory: Callable[[Path, str], NativeMt5Runtime] = NativeMt5Runtime,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers, reusing exactly the same building
-    blocks as customer_flow.py (InstanceProvisioner, WindowsSecretStore, DirectMt5Adapter,
-    HistorySync, LiveSync) but driven by a job already claimed by the real JobRunner/control
-    plane, instead of customer_flow.py's own CLI-oriented LocalControlPlane. See
-    CONTROL-PLANE-NEXT-STEPS.txt for why the two could not simply be wired together as-is."""
+    blocks as customer_flow.py (InstanceProvisioner, WindowsSecretStore, HistorySync, LiveSync)
+    but driven by a job already claimed by the real JobRunner/control plane. With no explicit
+    ``adapter_factory`` the Windows-native MQL5 file path is used; DirectMt5Adapter is retained
+    only for explicitly injected legacy/testing fallback calls and is never the default."""
 
     store = WindowsSecretStore(secrets_root)
 
@@ -246,9 +241,15 @@ def build_real_handlers(
             raise InstanceProvisionFailed("instance provisioning failed") from exc
         _progress(root, status="provisioned", connection_id=cid)
 
-        result = _authenticate_and_sync(
-            job, api, root, cid, login, server, mode, from_date, store, adapter_factory, process_factory
-        )
+        if adapter_factory is None:
+            result = _start_file_bridge_and_sync(
+                job, api, root, cid, login, server, mode, from_date, store,
+                process_factory, expert_binary, runtime_factory,
+            )
+        else:
+            result = _authenticate_and_sync(
+                job, api, root, cid, login, server, mode, from_date, store, adapter_factory, process_factory
+            )
         _progress(root, status="connected")
         return result
 
@@ -265,32 +266,40 @@ def build_real_handlers(
         except Exception as exc:
             raise SecretStoreFailed("stored identity unavailable") from exc
 
-        _require_lease(api, job)
-        _progress(root, status="authenticating")
-        try:
-            investor_password = store.read(cid, "mt5_investor_password")
-        except Exception as exc:
-            raise SecretStoreFailed("stored credential unavailable") from exc
-
         terminal = root / "terminal" / "terminal64.exe"
         state_path = root / "state" / "terminal-process.json"
-        _ensure_no_stale_process(terminal, state_path, process_factory)
-        process = process_factory(state_path)
-        adapter = adapter_factory(terminal, login, server)
-        try:
-            with adapter.session(investor_password):
-                investor_password = ""
-                gc.collect()
-                try:
-                    process.adopt(terminal)
-                except (AttributeError, RuntimeError):
-                    pass
-                _verify_investor_access(adapter)
-                _progress(root, status="importing_history")
-                _require_lease(api, job)
-                counts = _run_history_sync(adapter, root, mode, from_date)
-        except Mt5Error as exc:
-            raise _map_mt5_error(exc) from exc
+        if adapter_factory is None:
+            # The default adapter consumes only the EA's files.  A later history job must
+            # therefore not read, decrypt or retain the investor password at all.
+            _require_lease(api, job)
+            _progress(root, status="importing_history")
+            adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
+            _verify_investor_access(adapter)
+            counts = _run_history_sync(adapter, root, mode, from_date)
+        else:
+            _require_lease(api, job)
+            _progress(root, status="authenticating")
+            try:
+                investor_password = store.read(cid, "mt5_investor_password")
+            except Exception as exc:
+                raise SecretStoreFailed("stored credential unavailable") from exc
+            _ensure_no_stale_process(terminal, state_path, process_factory)
+            process = process_factory(state_path)
+            adapter = adapter_factory(terminal, login, server)
+            try:
+                with adapter.session(investor_password):
+                    investor_password = ""
+                    gc.collect()
+                    try:
+                        process.adopt(terminal)
+                    except (AttributeError, RuntimeError):
+                        pass
+                    _verify_investor_access(adapter)
+                    _progress(root, status="importing_history")
+                    _require_lease(api, job)
+                    counts = _run_history_sync(adapter, root, mode, from_date)
+            except Mt5Error as exc:
+                raise _map_mt5_error(exc) from exc
         _progress(root, status="connected")
         return {"imported_deals": counts["deals"], "imported_orders": counts["orders"]}
 
@@ -341,6 +350,85 @@ def _run_history_sync(adapter: Any, root: Path, mode: HistoryMode, from_date: "d
         return HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
     except Exception as exc:
         raise HistorySyncFailed("history import failed") from exc
+
+
+def _start_file_bridge_and_sync(
+    job: dict,
+    api: Any,
+    root: Path,
+    cid: str,
+    login: int,
+    server: str,
+    mode: HistoryMode,
+    from_date: "datetime | None",
+    store: WindowsSecretStore,
+    process_factory: Callable[[Path], Any],
+    expert_binary: Path,
+    runtime_factory: Callable[[Path, str], NativeMt5Runtime],
+) -> dict:
+    """Launch MT5 once, then consume only EA-produced local files.
+
+    No Python MT5 IPC session is created here. The password is only supplied to the protected
+    startup config inside ``NativeMt5Runtime`` and is cleared before file parsing/history sync.
+    """
+    terminal = root / "terminal" / "terminal64.exe"
+    state_path = root / "state" / "terminal-process.json"
+    _ensure_no_stale_process(terminal, state_path, process_factory)
+    _require_lease(api, job)
+    _progress(root, status="starting_native_file_bridge")
+    try:
+        investor_password = store.read(cid, "mt5_investor_password")
+    except Exception as exc:
+        raise SecretStoreFailed("stored credential unavailable") from exc
+    try:
+        runtime = runtime_factory(root, cid)
+        status = runtime.start(
+            login=login,
+            server=server,
+            investor_password=investor_password,
+            expert_binary=expert_binary,
+        )
+    except NativeMt5Error as exc:
+        code = str(exc)
+        if code == "investor_readonly_not_verified":
+            raise InvestorAccessNotVerified(code) from exc
+        if code in ("identity_mismatch", "server_identity_mismatch"):
+            raise AccountIdentityMismatch(code) from exc
+        if code == "terminal_start_failed":
+            raise TerminalStartFailed(code) from exc
+        raise Mt5InitializeFailed(code) from exc
+    finally:
+        investor_password = ""
+        gc.collect()
+
+    try:
+        process_factory(state_path).adopt(terminal)
+    except (AttributeError, RuntimeError):
+        # The runtime owns an already-started, exact terminal path. Adoption is persistence for
+        # deprovision/recovery; a test double may intentionally omit real OS process discovery.
+        pass
+    adapter = Mql5FileMt5Adapter(status.files_path, cid, login, server, root / "state")
+    try:
+        _verify_investor_access(adapter)
+        _progress(root, status="importing_history")
+        _require_lease(api, job)
+        counts = _run_history_sync(adapter, root, mode, from_date)
+        _progress(root, status="starting_live_sync")
+        _require_lease(api, job)
+        delivered = _run_live_sync_once(adapter, root)
+    except AgentError:
+        raise
+    except Mt5Error as exc:
+        raise _map_mt5_error(exc) from exc
+    except Exception as exc:
+        raise LiveSyncFailed("file bridge sync failed") from exc
+    return {
+        "imported_deals": counts["deals"],
+        "imported_orders": counts["orders"],
+        "live_sync_started": True,
+        "live_sync_events_delivered": delivered,
+        "file_bridge": "mql5-local-json",
+    }
 
 
 def _authenticate_and_sync(

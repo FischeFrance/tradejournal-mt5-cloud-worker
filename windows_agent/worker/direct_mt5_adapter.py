@@ -28,7 +28,12 @@ class Mt5VersionMismatch(Mt5IpcError):
 
 
 class DirectMt5Adapter:
-    """A deliberately narrow facade exposing read operations only."""
+    """Legacy read-only fallback, deliberately not selected by the Windows daemon.
+
+    The operational path is ``Mql5FileMt5Adapter`` fed by the native EA. Keep this class for
+    explicit compatibility experiments only; do not use it as a default factory because it
+    depends on the Python MetaTrader5 IPC package.
+    """
 
     def __init__(
         self,
