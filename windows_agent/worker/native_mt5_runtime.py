@@ -247,15 +247,18 @@ class NativeMt5Runtime:
         investor_password: str,
         expert_binary: Path,
         symbol: str = "EURUSD",
-        # TEMPORARY DIAGNOSTIC VALUE (2026-07-17), not a considered default: after an
-        # auto-update to build 6032, every fresh instance logs "Compiler full recompilation
-        # has been started" (453 MQL5 files) and then goes completely silent in its own
-        # journal for the rest of the run -- no login attempt, no chart, nothing -- through
-        # both a 90s and a 180s budget. Bumped to 600s purely to find out whether that
-        # recompilation (or whatever follows it) ever actually finishes on this VPS, or
-        # hangs indefinitely. Revert to a sane bounded value once that's known -- do not
-        # ship 600s as the real timeout.
-        timeout: float = 600.0,
+        # A diagnostic 600s run on 2026-07-17 showed the post-build-6032 full MQL5
+        # recompilation (453 files touched, 131 actually compiled) finishing at ~144s --
+        # real, but not the whole story: after it finished, the terminal's own journal
+        # logged absolutely nothing else (no chart, no EA attach, no login attempt) for
+        # the remaining ~7.5 minutes until the 600s deadline. So this is a genuine hang
+        # past the compile step, not just "needs more time" -- raising this further would
+        # only mask that hang behind an even longer wait. Left at 240s (compile budget +
+        # a working margin) rather than reverting to 180s, since the compile step alone
+        # can legitimately eat more than that; still expected to fail here until the
+        # actual post-compile hang is diagnosed (needs visual/RDP observation of a live
+        # attempt -- the journal produces zero signal during that window).
+        timeout: float = 240.0,
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
