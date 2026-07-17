@@ -247,13 +247,15 @@ class NativeMt5Runtime:
         investor_password: str,
         expert_binary: Path,
         symbol: str = "EURUSD",
-        # A real broker login cycles through several MetaQuotes community/discovery servers
-        # before it gets to actually dialing the named broker server -- observed via a live
-        # TCP capture on 2026-07-17 to still be making fresh connection attempts past the old
-        # 90s budget (brief ~7s connections to 194.164.179.x:443 at roughly 19:40:42 and
-        # 19:41:38, i.e. still active ~66s in, with silence in between). The credential-free
-        # start_no_login() path never needs this -- it never leaves the local machine.
-        timeout: float = 180.0,
+        # TEMPORARY DIAGNOSTIC VALUE (2026-07-17), not a considered default: after an
+        # auto-update to build 6032, every fresh instance logs "Compiler full recompilation
+        # has been started" (453 MQL5 files) and then goes completely silent in its own
+        # journal for the rest of the run -- no login attempt, no chart, nothing -- through
+        # both a 90s and a 180s budget. Bumped to 600s purely to find out whether that
+        # recompilation (or whatever follows it) ever actually finishes on this VPS, or
+        # hangs indefinitely. Revert to a sane bounded value once that's known -- do not
+        # ship 600s as the real timeout.
+        timeout: float = 600.0,
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
