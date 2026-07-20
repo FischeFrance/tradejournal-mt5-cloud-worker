@@ -448,73 +448,30 @@ class NativeMt5Runtime:
             except OSError:
                 pass
 
-    def _probe_broker_symbol(self, preferred: str, timeout: float = 20.0) -> str:
-        output = self.state / "symbol-probe.json"
-        preference = self.state / "symbol-preference.txt"
-        launcher = self.state / "probe-symbol.cmd"
-        script = Path(__file__).with_name("mt5_symbol_probe.py")
-        if not script.is_file():
-            raise NativeMt5Error("broker_symbol_probe_missing")
-        output.unlink(missing_ok=True)
-        preference.write_text(preferred, encoding="utf-8")
-        arguments = [
-            sys.executable,
-            str(script),
-            "--terminal",
-            str(self.terminal),
-            "--output",
-            str(output),
-            "--preference",
-            str(preference),
-        ]
-        probe_task: str | None = None
-        try:
-            interactive_user = self._interactive_user()
-            if interactive_user:
-                launcher.write_text(
-                    "@echo off\r\n" + " ".join(f'"{value}"' for value in arguments) + "\r\n",
-                    encoding="utf-8",
-                )
-                probe_task = f"TradeJournalProbe-{self.connection_id}"
-                create = [
-                    "schtasks", "/Create", "/TN", probe_task, "/SC", "ONCE", "/ST", "23:59",
-                    "/RU", interactive_user, "/IT", "/RL", "HIGHEST", "/TR", str(launcher), "/F",
-                ]
-                completed = subprocess.run(create, capture_output=True, text=True, check=False)
-                if completed.returncode != 0:
-                    raise NativeMt5Error("broker_symbol_probe_task_failed")
-                completed = subprocess.run(
-                    ["schtasks", "/Run", "/TN", probe_task],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if completed.returncode != 0:
-                    raise NativeMt5Error("broker_symbol_probe_task_failed")
-            else:
-                subprocess.Popen(arguments, cwd=script.parent, close_fds=True)
+    def _write_symbol_preference(self, preferred: str) -> None:
+        # Published into the terminal's MQL5\Files sandbox BEFORE the discovery script starts, so
+        # TradeJournalDiscovery can resolve the real broker symbol (e.g. EURUSD.raw) in-terminal.
+        self.files.mkdir(parents=True, exist_ok=True)
+        (self.files / "discovered-symbol.json").unlink(missing_ok=True)
+        tmp = self.files / "symbol-preference.tmp"
+        tmp.write_text(preferred, encoding="ascii")
+        tmp.replace(self.files / "symbol-preference.txt")
 
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline and not output.is_file():
-                time.sleep(0.25)
-            record = self._read_json(output) if output.is_file() else None
-            symbol = str(record.get("symbol", "")) if record else ""
-            if not symbol or len(symbol) > 64 or any(c in symbol for c in "\r\n"):
-                raise NativeMt5Error("broker_symbol_probe_failed")
-            return symbol
-        finally:
-            if probe_task:
-                subprocess.run(
-                    ["schtasks", "/End", "/TN", probe_task], capture_output=True, check=False
-                )
-                subprocess.run(
-                    ["schtasks", "/Delete", "/TN", probe_task, "/F"],
-                    capture_output=True,
-                    check=False,
-                )
-            output.unlink(missing_ok=True)
-            preference.unlink(missing_ok=True)
-            launcher.unlink(missing_ok=True)
+    def _probe_broker_symbol(self, preferred: str, timeout: float = 30.0) -> str:
+        # Read the symbol resolved IN-TERMINAL by TradeJournalDiscovery (MQL5), published to the
+        # sandbox as discovered-symbol.json. This deliberately does NOT use the MetaTrader5 Python
+        # IPC (mt5.initialize): that path is intermittent (-10005 "IPC timeout") and is not designed
+        # for multiple terminals on one host -- both fatal for a multi-instance provisioner.
+        output = self.files / "discovered-symbol.json"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not output.is_file():
+            time.sleep(0.25)
+        record = self._read_json(output) if output.is_file() else None
+        symbol = str(record.get("symbol", "")) if record else ""
+        output.unlink(missing_ok=True)
+        if not symbol or len(symbol) > 64 or any(c in symbol for c in "\r\n"):
+            raise NativeMt5Error("broker_symbol_probe_failed")
+        return symbol
 
     def _start_process(
         self,
@@ -680,9 +637,10 @@ class NativeMt5Runtime:
                 raise NativeMt5Error("terminal_stop_failed")
 
             # Phase 2: open a credential-free discovery chart so MT5 hydrates the broker symbol
-            # catalogue. Once investor synchronization is proven, a local read-only Python IPC
-            # probe selects the real broker symbol (for example EURUSD.raw instead of the generic
-            # EURUSD placeholder). No account password is passed to this probe.
+            # catalogue. Once investor synchronization is proven, the in-terminal MQL5 script
+            # TradeJournalDiscovery selects the real broker symbol (for example EURUSD.raw instead
+            # of the generic EURUSD placeholder) and publishes it to the sandbox as
+            # discovered-symbol.json. No account password and no Python IPC are used here.
             discovery = self._write_startup_config(
                 None,
                 None,
@@ -693,6 +651,7 @@ class NativeMt5Runtime:
                 script_name="TradeJournal\\TradeJournalDiscovery",
                 filename="symbol-discovery.ini",
             )
+            self._write_symbol_preference(symbol)
             checkpoint = self._journal_checkpoint()
             self._start_process(discovery, login)
             self._wait_for_authorization(checkpoint, login, server, min(timeout, 120.0))
