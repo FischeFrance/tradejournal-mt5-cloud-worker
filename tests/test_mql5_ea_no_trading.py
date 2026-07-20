@@ -97,3 +97,27 @@ def test_expert_declares_versioned_file_bridge_contract():
         "events\\\\",
     ):
         assert required in text, f"contratto file bridge mancante: {required}"
+
+
+def test_new_only_defers_account_reads_until_after_on_init():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    assert "if(!g_new_only)\n      WriteAllSnapshots();" in text
+    assert (
+        "GetTickCount64() - g_new_only_started_ms < NEW_ONLY_STARTUP_GRACE_MS" in text
+    )
+
+
+def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
+    text = (MT5_EXPERTS_DIR / "TradeJournalLoader.mq5").read_text(encoding="utf-8")
+    assert "void OnStart()" in text
+    assert "HistorySelect" not in text
+    assert "TerminalInfoInteger(TERMINAL_CONNECTED)" in text
+    assert "now_ms - connected_since_ms >= connection_grace_ms" in text
+    assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text
+
+
+def test_discovery_script_only_waits_for_account_connection():
+    text = (MT5_EXPERTS_DIR / "TradeJournalDiscovery.mq5").read_text(encoding="utf-8")
+    assert "void OnStart()" in text
+    assert "TerminalInfoInteger(TERMINAL_CONNECTED)" in text
+    assert "ChartApplyTemplate" not in text

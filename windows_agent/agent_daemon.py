@@ -37,6 +37,7 @@ def default_handlers() -> dict[str, JobHandler]:
         "provision": _not_implemented("provision"),
         "deprovision": _not_implemented("deprovision"),
         "historical_sync": _not_implemented("historical_sync"),
+        "live_sync": _not_implemented("live_sync"),
     }
 
 
@@ -57,6 +58,7 @@ def build_runner(
         secrets_root=config.secrets_root,
         source_terminal=config.source_terminal,
         expert_binary=config.expert_binary,
+        trading_ingestion_url=config.trading_ingestion_url,
     )
     return JobRunner(state_path, api, real_handlers)
 

@@ -43,6 +43,7 @@ from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
 from .worker.mql5_file_adapter import Mql5FileMt5Adapter
 from .worker.native_mt5_runtime import NativeMt5Error, NativeMt5Runtime
+from .worker.trading_ingestion_sink import TradingIngestionSink
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ def build_real_handlers(
     process_factory: Callable[[Path], Any] = ProcessManager,
     expert_binary: Path = DEFAULT_EXPERT_BINARY,
     runtime_factory: Callable[[Path, str], NativeMt5Runtime] = NativeMt5Runtime,
+    trading_ingestion_url: str = "",
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers, reusing exactly the same building
     blocks as customer_flow.py (InstanceProvisioner, WindowsSecretStore, HistorySync, LiveSync)
@@ -214,14 +216,24 @@ def build_real_handlers(
         login, server = _expected_identity(payload)
         mode, from_date = _history_window(job)
 
+        bridge_token = payload.get("bridge_token")
         try:
             store.write(cid, "mt5_login", str(login))
             store.write(cid, "mt5_server", server)
             store.write(cid, "mt5_investor_password", password)
+            # Issued fresh per provision run by request_mt5_provisioning_job (mt5_managed only) --
+            # the live_sync job reads this back to authenticate its HTTP delivery to
+            # trading-mt5-events, exactly like the manual EA/self-hosted worker connectors already
+            # do with their own customer-generated bridge tokens. Older re-provision runs may omit
+            # it (server-side rollout not yet applied); live_sync raises a clear config error in
+            # that case rather than silently never delivering anything.
+            if isinstance(bridge_token, str) and bridge_token:
+                store.write(cid, "bridge_token", bridge_token)
         except Exception as exc:
             raise SecretStoreFailed("failed to persist credentials to DPAPI") from exc
         finally:
             del password
+            bridge_token = None
             gc.collect()
 
         layout = InstanceLayout(instances_root, cid)
@@ -321,10 +333,75 @@ def build_real_handlers(
         _progress_if_exists(root, status="disconnected")
         return {"deprovisioned": True}
 
+    def live_sync(job: dict) -> dict:
+        """Recurring job (self-chained server-side, see transition_mt5_provisioning_job in
+        20260720080000_mt5_managed_live_sync.sql): reuses the terminal already left running by
+        provision() -- no re-launch, no re-login, just cheap local file reads -- unless the
+        process has actually died (crash/host reboot), in which case it self-heals by relaunching
+        once before giving up. Every cycle also sends a liveness heartbeat regardless of whether
+        any new trade was detected, so trading_connections.last_seen_at/status stay fresh in real
+        time even on a perfectly quiet account."""
+        cid = canonical_uuid(str(job["connection_id"]))
+        layout = InstanceLayout(instances_root, cid)
+        root = layout.path
+        if not root.exists():
+            raise InstanceProvisionFailed("no provisioned instance for connection")
+        try:
+            login = int(store.read(cid, "mt5_login"))
+            server = store.read(cid, "mt5_server")
+            bridge_token = store.read(cid, "bridge_token")
+        except Exception as exc:
+            raise SecretStoreFailed("stored identity/bridge token unavailable") from exc
+        if not trading_ingestion_url:
+            raise SecretStoreFailed("trading_ingestion_url not configured on this agent")
+        _require_lease(api, job)
+
+        terminal = root / "terminal" / "terminal64.exe"
+        state_path = root / "state" / "terminal-process.json"
+        if not (terminal.is_file() and ProcessManager.find(terminal)):
+            try:
+                investor_password = store.read(cid, "mt5_investor_password")
+            except Exception as exc:
+                raise SecretStoreFailed("stored credential unavailable") from exc
+            try:
+                runtime = runtime_factory(root, cid)
+                runtime.start(
+                    login=login, server=server, investor_password=investor_password, expert_binary=expert_binary,
+                )
+            except NativeMt5Error as exc:
+                code = str(exc)
+                if code in ("identity_mismatch", "server_identity_mismatch"):
+                    raise AccountIdentityMismatch(code) from exc
+                if code == "terminal_start_failed":
+                    raise TerminalStartFailed(code) from exc
+                raise Mt5InitializeFailed(code) from exc
+            finally:
+                investor_password = ""
+                gc.collect()
+            try:
+                process_factory(state_path).adopt(terminal)
+            except (AttributeError, RuntimeError):
+                pass
+
+        adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
+        try:
+            _verify_investor_access(adapter)
+            sink = TradingIngestionSink(root, trading_ingestion_url, bridge_token)
+            sink.send_heartbeat()
+            delivered = _run_live_sync_once(adapter, root, sink)
+        except AgentError:
+            raise
+        except Mt5Error as exc:
+            raise _map_mt5_error(exc) from exc
+        except Exception as exc:
+            raise LiveSyncFailed("live sync check failed") from exc
+        return {"live_sync_events_delivered": delivered}
+
     return {
         "provision": provision,
         "historical_sync": historical_sync,
         "deprovision": deprovision,
+        "live_sync": live_sync,
     }
 
 
@@ -386,6 +463,7 @@ def _start_file_bridge_and_sync(
             server=server,
             investor_password=investor_password,
             expert_binary=expert_binary,
+            history_mode=mode,
         )
     except NativeMt5Error as exc:
         code = str(exc)
@@ -484,16 +562,16 @@ def _authenticate_and_sync(
     }
 
 
-def _run_live_sync_once(adapter: Any, root: Path) -> int:
-    """A single poll_once(), exactly like customer_flow.py's own live-sync proof step -- this
-    architecture runs one job at a time (docs/windows/architecture.md) and the MetaTrader5 Python
-    package holds a single global IPC connection per process, so there is no continuous
-    background live-sync thread here; ongoing monitoring needs a periodic job/scheduler this
-    contract does not define yet (see CONTROL-PLANE-NEXT-STEPS.txt)."""
+def _run_live_sync_once(adapter: Any, root: Path, sink: Callable[[dict], None] | None = None) -> int:
+    """A single poll_once(). Historically this ran exactly once per connection, glued to the tail
+    of provision()/historical_sync() (this architecture runs one job at a time, see
+    docs/windows/architecture.md) -- ongoing monitoring is now driven by the recurring live_sync
+    job (see build_real_handlers.live_sync), which passes its own HTTP-forwarding sink instead of
+    the local-only default used here for the one-shot provisioning-time check."""
     live = LiveSync(
         adapter,
         PersistentSnapshot(root / "state" / "live_snapshot.json"),
         PersistentDedup(root / "state" / "live-dedup.sqlite"),
-        LocalEventSink(root / "data" / "live.jsonl"),
+        sink or LocalEventSink(root / "data" / "live.jsonl"),
     )
     return live.poll_once()

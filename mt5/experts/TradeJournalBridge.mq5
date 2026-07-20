@@ -42,10 +42,33 @@ bool g_backfill_done = false;
 //--- Incluso in ogni event_id per garantire unicita'
 //--- anche fra connessioni/account diversi con ticket numericamente coincidenti.
 string g_connection_id = "unknown-connection";
+bool   g_new_only      = false;
+ulong  g_new_only_started_ms = 0;
+const ulong NEW_ONLY_STARTUP_GRACE_MS = 5000;
 
 //--- Le 6 timeframe pubblicate in file separati candles/<symbol>-<timeframe>.json.
 string           TIMEFRAME_NAMES[6]  = {"M1", "M5", "M15", "H1", "H4", "D1"};
 ENUM_TIMEFRAMES  TIMEFRAME_VALUES[6] = {PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4, PERIOD_D1};
+
+void WriteInitMarker(const string state)
+  {
+   int handle = FileOpen(BASE_DIR + "\\init-state.tmp",
+                         FILE_WRITE | FILE_TXT | FILE_ANSI, 0, CP_UTF8);
+   if(handle == INVALID_HANDLE)
+     {
+      Print("TradeJournalBridge: init marker non scrivibile, stato=", state,
+            ", errore=", GetLastError());
+      return;
+     }
+   FileWriteString(handle, state);
+   FileFlush(handle);
+   FileClose(handle);
+   FileDelete(BASE_DIR + "\\init-state.txt");
+   if(!FileMove(BASE_DIR + "\\init-state.tmp", 0,
+                BASE_DIR + "\\init-state.txt", FILE_REWRITE))
+      Print("TradeJournalBridge: init marker non pubblicato, stato=", state,
+            ", errore=", GetLastError());
+  }
 
 //+------------------------------------------------------------------------+
 //| Utility JSON minime (scopo specifico, non un parser/serializzatore     |
@@ -158,6 +181,26 @@ string ReadConnectionId()
    StringTrimLeft(content);
    StringTrimRight(content);
    return (content == "") ? "unknown-connection" : content;
+  }
+
+// La modalita' new_only deve diventare pronta senza scaricare storico. Il Windows Agent scrive
+// questo flag non sensibile prima dell'avvio; le altre modalita' mantengono il comportamento
+// storico completo e verranno ottimizzate separatamente.
+bool ReadNewOnlyMode()
+  {
+   string path = BASE_DIR + "\\history_mode";
+   if(!FileIsExist(path))
+      return false;
+   int handle = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ, 0, CP_UTF8);
+   if(handle == INVALID_HANDLE)
+      return false;
+   string content = "";
+   while(!FileIsEnding(handle))
+      content += FileReadString(handle);
+   FileClose(handle);
+   StringTrimLeft(content);
+   StringTrimRight(content);
+   return content == "new_only";
   }
 
 //+------------------------------------------------------------------------+
@@ -714,6 +757,15 @@ void WriteAllSnapshots()
    WriteJsonAtomic("account.json", BuildEnvelope(BuildAccountJson(), sequence));
    WriteJsonAtomic("positions.json", BuildEnvelope(BuildPositionsJson(), sequence));
    WriteJsonAtomic("orders.json", BuildEnvelope(BuildOrdersJson(), sequence));
+   if(g_new_only)
+     {
+      // new_only parte da "adesso": nessun HistorySelect e nessun download candele deve
+      // ritardare account/heartbeat o il primo snapshot live.
+      WriteJsonAtomic("history_orders.json", BuildEnvelope("[]", sequence));
+      WriteJsonAtomic("deals.json", BuildEnvelope("[]", sequence));
+      WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(), sequence));
+      return;
+     }
    WriteJsonAtomic("history_orders.json", BuildEnvelope(BuildHistoryOrdersJson(), sequence));
    WriteJsonAtomic("deals.json", BuildEnvelope(BuildDealsJson(), sequence));
    for(int t = 0; t < 6; t++)
@@ -729,6 +781,7 @@ void WriteAllSnapshots()
 //+------------------------------------------------------------------------+
 int OnInit()
   {
+   WriteInitMarker("entered");
    if(!FolderCreate(BASE_DIR))
      {
       // FolderCreate restituisce true anche se la cartella esiste gia': un false qui indica un
@@ -738,25 +791,38 @@ int OnInit()
      }
    FolderCreate(BASE_DIR + "\\candles");
    FolderCreate(BASE_DIR + "\\events");
+   WriteInitMarker("folders-ready");
 
    g_connection_id = ReadConnectionId();
+   WriteInitMarker("connection-id-ready");
+   g_new_only = ReadNewOnlyMode();
+   WriteInitMarker(g_new_only ? "mode-new-only" : "mode-history");
+   g_new_only_started_ms = GetTickCount64();
    LoadCursorState();
-   if(!g_backfill_done)
+   WriteInitMarker("cursor-ready");
+   if(!g_new_only && !g_backfill_done)
      {
       RunBackfill();
       g_backfill_done = true;
-      SaveCursorState();
+     SaveCursorState();
      }
 
-   WriteAllSnapshots(); // primo snapshot immediato, senza attendere il primo tick del timer
+   // Su un'istanza live appena creata, le AccountInfo*/PositionsTotal/OrdersTotal invocate
+   // durante OnInit possono attendere la cache account e impedire allo stesso terminale di
+   // completare la sincronizzazione. new_only non ha backfill da anticipare: registra subito il
+   // timer e lascia una breve finestra priva di letture account. Il primo snapshot arriva al
+   // primo timer successivo alla finestra, senza dipendere da tick di mercato.
+   if(!g_new_only)
+      WriteAllSnapshots();
 
    if(InpTimerSeconds <= 0 || !EventSetTimer(InpTimerSeconds))
      {
       Print("TradeJournalBridge: EventSetTimer fallito (InpTimerSeconds=", InpTimerSeconds,
             "), errore=", GetLastError());
-      return(INIT_FAILED);
+     return(INIT_FAILED);
      }
 
+   WriteInitMarker("timer-ready");
    Print("TradeJournalBridge: EA di sola lettura avviato, timer=", InpTimerSeconds, "s.");
    return(INIT_SUCCEEDED);
   }
@@ -769,6 +835,8 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
+   if(g_new_only && GetTickCount64() - g_new_only_started_ms < NEW_ONLY_STARTUP_GRACE_MS)
+      return;
    WriteAllSnapshots();
    SaveCursorState();
   }

@@ -23,6 +23,7 @@ class AgentRuntimeConfig:
     instances_root: Path = DEFAULT_INSTANCES_ROOT
     source_terminal: Path = DEFAULT_SOURCE_TERMINAL
     expert_binary: Path = DEFAULT_EXPERT_BINARY
+    trading_ingestion_url: str = ""
 
 
 def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig:
@@ -40,6 +41,13 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
     instances_root = Path(source.get("TRADEJOURNAL_INSTANCES_ROOT", "").strip() or DEFAULT_INSTANCES_ROOT)
     source_terminal = Path(source.get("TRADEJOURNAL_SOURCE_TERMINAL", "").strip() or DEFAULT_SOURCE_TERMINAL)
     expert_binary = Path(source.get("TRADEJOURNAL_EXPERT_BINARY", "").strip() or DEFAULT_EXPERT_BINARY)
+    # Distinct from base_url (the trading-agent job control-plane): this is the trading-mt5-events
+    # ingestion endpoint the live_sync job posts detected trades/heartbeats to, bridge-token
+    # authenticated, exactly like the manual EA/self-hosted worker connectors already do. Left
+    # optional here (not raised at startup like base_url) so provision/deprovision/historical_sync
+    # keep working unattended even before an operator sets this; live_sync itself raises a clear
+    # config error if it's missing when actually needed.
+    trading_ingestion_url = source.get("TRADEJOURNAL_TRADING_INGESTION_URL", "").strip()
     return AgentRuntimeConfig(
         base_url=base_url,
         poll_seconds=poll_seconds,
@@ -47,6 +55,7 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         instances_root=instances_root,
         source_terminal=source_terminal,
         expert_binary=expert_binary,
+        trading_ingestion_url=trading_ingestion_url,
     )
 
 

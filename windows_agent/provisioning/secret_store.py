@@ -15,6 +15,7 @@ ALLOWED = frozenset(
         "agent_token",
         "worker_token",
         "mt5_provisioning_key",
+        "bridge_token",
     )
 )
 
