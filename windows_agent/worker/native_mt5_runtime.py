@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -245,6 +246,28 @@ class NativeMt5Runtime:
         return path
 
     def _interactive_user(self) -> str:
+        # A single Windows interactive session cannot host two MT5 terminals at once (confirmed
+        # live: the second instance hangs mid-init -- ~20 threads, ~570 handles, no window ever
+        # created -- until the 120s auth watchdog kills it, reproduced 3/3 times, unrelated to the
+        # separate MCP-port bind collision fixed earlier). TRADEJOURNAL_MT5_INTERACTIVE_USERS (new,
+        # plural) is an optional comma-separated pool of Windows accounts, each expected to already
+        # have its own persistent interactive/disconnected logon session on this host (created once,
+        # out-of-band -- Task Scheduler's /IT launch mode requires the target user to already be
+        # logged on, it does not log them on itself). Every job for a given connection_id always
+        # hashes to the same pool member, so a connection's provision/historical_sync/live_sync/
+        # deprovision jobs stay on the same session for its whole lifecycle. Falls back to the
+        # original singular TRADEJOURNAL_MT5_INTERACTIVE_USER when the pool isn't configured, so a
+        # single-slot deployment is completely unaffected.
+        pool_setting = self._setting("TRADEJOURNAL_MT5_INTERACTIVE_USERS")
+        pool = [u.strip() for u in pool_setting.split(",") if u.strip()] if pool_setting else []
+        if pool:
+            for candidate in pool:
+                if not candidate.replace("-", "").replace("_", "").replace(".", "").isalnum():
+                    raise NativeMt5Error("invalid_interactive_user")
+            digest = hashlib.sha256(self.connection_id.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:8], "big") % len(pool)
+            return pool[index]
+
         interactive_user = self._setting("TRADEJOURNAL_MT5_INTERACTIVE_USER")
         if (
             interactive_user
@@ -501,6 +524,7 @@ class NativeMt5Runtime:
             if completed.returncode != 0:
                 raise NativeMt5Error("interactive_task_run_failed")
             self._interactive_task = task
+            self._boost_priority()
             return None
         arguments = [str(self.terminal), "/portable"]
         if login_hint is not None:
@@ -512,6 +536,35 @@ class NativeMt5Runtime:
             close_fds=True,
         )
         return self._process
+
+    def _boost_priority(self, timeout: float = 10.0) -> None:
+        # Task Scheduler assigns /IT-launched processes a below-normal priority class that
+        # `start /normal` inside the launched .cmd cannot override (the ceiling is enforced by
+        # the task's own job object, not inherited from the launcher); this raises it from here,
+        # which runs outside that job object and is not subject to the same ceiling. Investigated
+        # (2026-07-21) as a candidate fix for the same-session two-terminal stall documented above:
+        # confirmed via live testing that the priority class does change (verified AboveNormal on
+        # the affected process) but the second terminal still hangs identically (~20 threads, ~570
+        # handles, no window, authorization_timeout), so CPU scheduling is NOT the cause of that
+        # stall -- ruled out, alongside a SharedSection desktop-heap/GDIProcessHandleQuota increase
+        # tested the same night (also no effect). Kept anyway because raising a background-launched
+        # terminal to at least normal-or-above priority is a reasonable improvement on its own with
+        # no observed downside; it just doesn't solve the concurrency problem above.
+        try:
+            import psutil
+        except ImportError:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pids = self._running_terminal_pids()
+            if pids:
+                for pid in pids:
+                    try:
+                        psutil.Process(pid).nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        pass
+                return
+            time.sleep(0.2)
 
     def _wait_for_heartbeat(
         self, timeout: float, login: int | None = None, server: str | None = None
