@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.etl
+*.evtx
+*.pml
+*.wfw
+*.ex5
+raw/
+private/
+sanitized/

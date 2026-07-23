@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.local/schemas/mt5-direct-endpoint/direct-campaign-manifest-v2.json",
+  "title": "MT5 direct-endpoint direct-control campaign manifest v2",
+  "$comment": "This immutable artifact commits the C3/C4/C5 control descriptors without run IDs or control-plan digests, avoiding a digest cycle with the candidate handoff. The direct_campaign_manifest_sha256 is a domain-separated digest over the canonical body with that self field omitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "policy_version",
+    "experiment_id",
+    "experiment_manifest_sha256",
+    "c2_run_id",
+    "c2_control_plan_sha256",
+    "c2_evidence_sha256",
+    "candidate_endpoint",
+    "canonical_identity",
+    "terminal",
+    "produced_at_unix_ms",
+    "canonical_order",
+    "temporal_policy",
+    "controls",
+    "direct_campaign_manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2
+    },
+    "artifact_type": {
+      "const": "DIRECT_CAMPAIGN_MANIFEST"
+    },
+    "policy_version": {
+      "const": "mt5-direct-endpoint-policy-v2"
+    },
+    "experiment_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "experiment_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "c2_run_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "c2_control_plan_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "c2_evidence_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "candidate_endpoint": {
+      "$ref": "#/$defs/candidate"
+    },
+    "canonical_identity": {
+      "$ref": "#/$defs/demo_identity"
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "build"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "build": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "produced_at_unix_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "canonical_order": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "C3"
+        },
+        {
+          "const": "C4"
+        },
+        {
+          "const": "C5"
+        }
+      ],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "temporal_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "ordering_policy",
+        "c5_separation_anchor",
+        "c5_separation_minimum_seconds"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "ordering_policy": {
+          "const": "STRICT_NON_OVERLAPPING"
+        },
+        "c5_separation_anchor": {
+          "const": "C3_COMPLETED_AT_UNIX"
+        },
+        "c5_separation_minimum_seconds": {
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 3600
+        }
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "C3",
+        "C4",
+        "C5"
+      ],
+      "properties": {
+        "C3": {
+          "$ref": "#/$defs/c3_descriptor"
+        },
+        "C4": {
+          "$ref": "#/$defs/c4_descriptor"
+        },
+        "C5": {
+          "$ref": "#/$defs/c5_descriptor"
+        }
+      }
+    },
+    "direct_campaign_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ip",
+        "port",
+        "source_control",
+        "observed_phase",
+        "process_scoped"
+      ],
+      "properties": {
+        "ip": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "ipv4"
+            },
+            {
+              "type": "string",
+              "format": "ipv6"
+            }
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "source_control": {
+          "const": "C2"
+        },
+        "observed_phase": {
+          "const": "LOGIN"
+        },
+        "process_scoped": {
+          "const": true
+        }
+      }
+    },
+    "human_text_128": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "allOf": [
+        {
+          "pattern": "^(?:\\S(?:.*\\S)?)$"
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z])\\d(?:[\\s_:\\(\\)•+.,'\\u2013\\u2014\\u2019-]?\\d){5,}(?:$|[^0-9A-Za-z])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z_])(?:[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn])(?:$|[^0-9A-Za-z_])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F\\u00AD\\u034F\\u061C\\u115F-\\u1160\\u17B4-\\u17B5\\u180B-\\u180F\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\u3164\\uFE00-\\uFE0F\\uFEFF\\uFFA0]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u00B2\\u00B3\\u00B9\\u2070\\u2074-\\u2079\\u2080-\\u2089\\uFF00-\\uFFEF]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[/\\\\]"
+          }
+        }
+      ]
+    },
+    "demo_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "server",
+        "company",
+        "trade_mode"
+      ],
+      "properties": {
+        "server": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "company": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "trade_mode": {
+          "const": "DEMO"
+        }
+      }
+    },
+    "durations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline",
+        "negative_discovery",
+        "exact_discovery",
+        "login_timeout",
+        "connected_steady",
+        "network_interruption",
+        "reconnect_observation",
+        "blocked_timeout",
+        "c4_elapsed_tolerance",
+        "c5_separation_minimum",
+        "probe_timestamp_tolerance_seconds"
+      ],
+      "properties": {
+        "baseline": {
+          "type": "integer",
+          "minimum": 600,
+          "maximum": 3600
+        },
+        "negative_discovery": {
+          "type": "integer",
+          "minimum": 120,
+          "maximum": 3600
+        },
+        "exact_discovery": {
+          "type": "integer",
+          "minimum": 180,
+          "maximum": 3600
+        },
+        "login_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "connected_steady": {
+          "type": "integer",
+          "minimum": 600,
+          "maximum": 3600
+        },
+        "network_interruption": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600
+        },
+        "reconnect_observation": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 3600
+        },
+        "blocked_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 180
+        },
+        "c4_elapsed_tolerance": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "c5_separation_minimum": {
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 3600
+        },
+        "probe_timestamp_tolerance_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        }
+      }
+    },
+    "descriptor_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control",
+        "required_phase_codes",
+        "duration_contract",
+        "network_contract"
+      ],
+      "properties": {
+        "control": {
+          "enum": [
+            "C3",
+            "C4",
+            "C5"
+          ]
+        },
+        "required_phase_codes": {
+          "type": "array"
+        },
+        "duration_contract": {
+          "$ref": "#/$defs/durations"
+        },
+        "network_contract": {
+          "$ref": "#/$defs/network_contract"
+        }
+      }
+    },
+    "network_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_only",
+        "dns_events_max",
+        "other_tcp_flows_max",
+        "non_tcp_network_events_max",
+        "candidate_disposition"
+      ],
+      "properties": {
+        "candidate_only": {
+          "const": true
+        },
+        "dns_events_max": {
+          "const": 0
+        },
+        "other_tcp_flows_max": {
+          "const": 0
+        },
+        "non_tcp_network_events_max": {
+          "const": 0
+        },
+        "candidate_disposition": {
+          "enum": [
+            "CONNECTED",
+            "BLOCKED"
+          ]
+        }
+      }
+    },
+    "c3_descriptor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/descriptor_base"
+        },
+        {
+          "properties": {
+            "control": {
+              "const": "C3"
+            },
+            "required_phase_codes": {
+              "$ref": "#/$defs/c3_phase_codes"
+            },
+            "network_contract": {
+              "properties": {
+                "candidate_disposition": {
+                  "const": "CONNECTED"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "c4_descriptor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/descriptor_base"
+        },
+        {
+          "properties": {
+            "control": {
+              "const": "C4"
+            },
+            "required_phase_codes": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "C4_ENDPOINT_BLOCKED_START"
+                },
+                {
+                  "const": "C4_ENDPOINT_BLOCKED_END"
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "network_contract": {
+              "properties": {
+                "candidate_disposition": {
+                  "const": "BLOCKED"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "c5_descriptor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/descriptor_base"
+        },
+        {
+          "properties": {
+            "control": {
+              "const": "C5"
+            },
+            "required_phase_codes": {
+              "$ref": "#/$defs/c5_phase_codes"
+            },
+            "network_contract": {
+              "properties": {
+                "candidate_disposition": {
+                  "const": "CONNECTED"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "c3_phase_codes": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "C3_DIRECT_LOGIN_START"
+        },
+        {
+          "const": "C3_DIRECT_LOGIN_END"
+        },
+        {
+          "const": "C3_CONNECTED_STEADY_START"
+        },
+        {
+          "const": "C3_CONNECTED_STEADY_END"
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "c5_phase_codes": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "C5_DIRECT_LOGIN_START"
+        },
+        {
+          "const": "C5_DIRECT_LOGIN_END"
+        },
+        {
+          "const": "C5_CONNECTED_STEADY_START"
+        },
+        {
+          "const": "C5_CONNECTED_STEADY_END"
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    }
+  }
+}

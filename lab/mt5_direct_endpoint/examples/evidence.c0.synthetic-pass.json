@@ -1,0 +1,193 @@
+{
+  "capture_integrity": {
+    "buffers_lost": 0,
+    "etw_started": true,
+    "etw_stopped": true,
+    "events_lost": 0,
+    "required_markers_present": true
+  },
+  "control": "C0",
+  "credential_bundle_investor_confirmed": false,
+  "discovery": {
+    "cache_influence_excluded": false,
+    "credentials_supplied": false,
+    "endpoint_delta_acquired": false,
+    "endpoint_delta_source": "NONE",
+    "endpoint_delta_source_sha256": null,
+    "endpoint_delta_source_verified": false,
+    "exact_label_match_verified": false,
+    "exact_selection_completed": false,
+    "expected_exact_result_count": 0,
+    "helper_secret_accessed": false,
+    "negative_exact_query_completed": false,
+    "negative_query_label_sha256": null,
+    "negative_query_result_count": null,
+    "negative_query_ui_binding_verified": false,
+    "selected_server_label_sha256": null,
+    "unsafe_endpoint_promoted": false
+  },
+  "environment_health": {
+    "account_available": false,
+    "baseline_stable": true,
+    "build_unchanged": true,
+    "clock_synchronized": true,
+    "external_outage_excluded": false,
+    "firewall_policy_verified": false,
+    "ui_compatible": false
+  },
+  "identity": null,
+  "initial_pre_state_binding": {
+    "initial_c012_pre_state_sha256": "ebce1c63181d172e099d533936c59a323bf190df109d712ce54322a91058cd56",
+    "portable_root_path_sha256": "4000b6f65e0258fd1e056870c63291d12b692704d68e4dde24411d96a6fde309",
+    "schema_version": 1,
+    "scope": "C012_INITIAL"
+  },
+  "lifecycle_binding": {
+    "bootstrap_submitted_to_existing_session": false,
+    "c012_session_id": "33333333-3333-4333-8333-333333333333",
+    "job_id": "44444444-4444-4444-8444-444444444444",
+    "job_identity_sha256": "62ee83f9dc228d6bd34437c8d6ce9fcf9c1d2fa0018c2f410f5e85d87a97bd08",
+    "job_manifest_sha256": "5920564dda8f9e4b4142eb6927ea255a5cc41234590f0dcbc96dbbf0d12ca645",
+    "lifecycle_mode": "C012_SINGLE_PROCESS_SESSION",
+    "root_process_generation_sha256": "5d804bcd6b7bc0838d40dc8f7a76a920c7cb25b2b0c40fc2f04ec2cef51390dd",
+    "schema_version": 1,
+    "session_retained": true,
+    "session_role": "LAUNCH_RETAIN",
+    "teardown_completed": false,
+    "terminal_alive_at_end": true,
+    "terminal_alive_at_start": false,
+    "transient_process_same_job_verified": false,
+    "transient_process_set_sha256": null
+  },
+  "network": {
+    "attribution_unambiguous": false,
+    "candidate_attempt_observed": false,
+    "candidate_block_observed": false,
+    "candidate_connected": false,
+    "candidate_endpoint_safe": false,
+    "candidate_observed_phase": "NONE",
+    "candidate_tcp_flows": 0,
+    "candidate_tuple_match": false,
+    "dns_events": 0,
+    "flow_record_set_sha256": "7fe1d7938e64837014786cdc14108b5af01c8fc762511baf5fc010744687a9a3",
+    "flow_record_set_verified": true,
+    "non_tcp_network_events": 0,
+    "other_tcp_flows": 0,
+    "process_scoped_tcp_flows": 0
+  },
+  "phase_markers": [
+    "C0_BASELINE_START",
+    "C0_BASELINE_END"
+  ],
+  "pre_state": {
+    "accounts_dat_absent": true,
+    "appdata_absent": true,
+    "bases_absent": true,
+    "community_identity_absent": true,
+    "credential_manager_empty": true,
+    "disposable_clone_new": true,
+    "no_shared_storage": true,
+    "portable_root_new": true,
+    "prior_processes_absent": true,
+    "registry_clean": true,
+    "sensitive_bootstrap_absent": true,
+    "servers_dat_absent": true,
+    "terminal_data_path_matches": true,
+    "windows_user_new": true
+  },
+  "proof_binding": {
+    "candidate_endpoint_sha256": null,
+    "candidate_handoff_manifest_sha256": null,
+    "candidate_tuple_bound": false,
+    "control_plan_sha256": "8a3d6ed4bea735da3e5f80556fc952b48264f943b2296b5a7dea5364a4845273",
+    "credential_set_binding_sha256": null,
+    "credential_set_binding_verified": false,
+    "etw_evidence_sha256": "e52eb1b72f465a1183c55e3943c2591bc41f0c2658cd1420f923edbd005cadae",
+    "etw_proof_capable": true,
+    "experiment_manifest_sha256": "d43e3af562badd13f7ff0e297b83c24253aed8c166ea955753404e4594a26246",
+    "firewall_plan_bound": false,
+    "firewall_plan_sha256": null,
+    "firewall_portable_root_binding_sha256": null,
+    "job_identity_sha256": "62ee83f9dc228d6bd34437c8d6ce9fcf9c1d2fa0018c2f410f5e85d87a97bd08",
+    "job_manifest_sha256": "5920564dda8f9e4b4142eb6927ea255a5cc41234590f0dcbc96dbbf0d12ca645",
+    "job_portable_root_binding_sha256": "0b02d7c5f3ceb246c5b1ecbc952a98c251943efb0d4f85c448f4d75076db28d2",
+    "job_process_binding_verified": true,
+    "lifecycle_binding_sha256": "ea48a3eb5027b52acdbf3cf17204ca3568da5eebc433433c7d078da3a1b95c64",
+    "negative_query_binding_sha256": null,
+    "phase_binding_verified": true,
+    "phase_timeline_sha256": "c222f5d60c5797e77181b83a96e2e082a533288e6ae6ddb811890fe40cf444d9",
+    "pre_state_binding_sha256": "fb280873d20d8a487ddabf7b2f7e1f6b71b9caffa8825b041bb1430df57f0a6b",
+    "probe_path_binding_sha256": null,
+    "provenance": {
+      "artifact_set_id": "10000000-0000-4000-8000-000000000001",
+      "origin": "SYNTHETIC_FIXTURE",
+      "producer": "OFFLINE_TEST_FIXTURE",
+      "synthetic_fixture": true
+    },
+    "requested_label_binding_sha256": "0e7d250c791c49bfdfa3b187d04cdfb8e1b70f1d13ae1202af4d903e729632a0",
+    "requested_label_binding_verified": true,
+    "root_process_generation_sha256": "5d804bcd6b7bc0838d40dc8f7a76a920c7cb25b2b0c40fc2f04ec2cef51390dd",
+    "run_id": "00000000-0000-4000-8000-000000000001",
+    "schema_version": 5,
+    "state_transition_sha256": "a5b6d7e1f2c1b174455a9e102c7442d36fd9b5be3f01d7d8ac325fd6ae08b28b",
+    "wfp_evidence_sha256": null,
+    "wfp_proof_capable": false
+  },
+  "run_context": {
+    "candidate_endpoint": null,
+    "clone_id_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "cohort": "C012",
+    "completed_at_unix": 1600,
+    "credential_set_id": null,
+    "expected_company": null,
+    "expected_server": null,
+    "expected_trade_mode": null,
+    "experiment_id": "11111111-1111-4111-8111-111111111111",
+    "portable_root_path_sha256": "4000b6f65e0258fd1e056870c63291d12b692704d68e4dde24411d96a6fde309",
+    "requested_server_label_sha256": "ccbc53972cbe30548fb4bc611cce706e16061a3619b5d7eb16a622c227067954",
+    "started_at_unix": 1000,
+    "terminal_build": 5000,
+    "terminal_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "windows_user_sid_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "run_id": "00000000-0000-4000-8000-000000000001",
+  "schema_version": 6,
+  "state_transition": {
+    "account_cache_state": "ABSENT",
+    "broker_cache_state": "ABSENT",
+    "schema_version": 1,
+    "sensitive_material_exported": false,
+    "stage": "C0_INITIAL",
+    "transition_evidence_sha256": null,
+    "transition_verified": true
+  },
+  "timeline": {
+    "events": [
+      {
+        "code": "C0_BASELINE_START",
+        "qpc": 1000000,
+        "sequence": 1,
+        "timestamp_unix_ms": 1000000
+      },
+      {
+        "code": "C0_BASELINE_END",
+        "qpc": 1600000,
+        "sequence": 2,
+        "timestamp_unix_ms": 1600000
+      }
+    ],
+    "qpc_frequency_hz": 1000,
+    "schema_version": 1
+  },
+  "timing": {
+    "baseline_seconds": 600,
+    "blocked_observation_seconds": 0,
+    "connected_steady_seconds": 0,
+    "exact_discovery_seconds": 0,
+    "login_observation_seconds": 0,
+    "negative_discovery_seconds": 0,
+    "network_interruption_seconds": 0,
+    "reconnect_observation_seconds": 0,
+    "separation_from_c3_seconds": 0
+  }
+}

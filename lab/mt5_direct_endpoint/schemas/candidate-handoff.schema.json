@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.local/schemas/mt5-direct-endpoint/candidate-handoff-v2.json",
+  "title": "MT5 direct-endpoint verified C2 candidate handoff v2",
+  "$comment": "The handoff is the sole authoritative candidate source for C3/C4/C5. candidate_handoff_manifest_sha256 is a domain-separated SHA-256 over the canonical body with that self field omitted. No account number or credential is permitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "policy_version",
+    "experiment_id",
+    "experiment_manifest_sha256",
+    "c2_run_id",
+    "c2_control_plan_sha256",
+    "c2_evidence_sha256",
+    "lifecycle_mode",
+    "c012_session_id",
+    "initial_c012_pre_state_sha256",
+    "c2_lifecycle_binding_sha256",
+    "candidate_endpoint",
+    "canonical_identity",
+    "terminal_sha256",
+    "terminal_build",
+    "produced_at_unix_ms",
+    "direct_campaign_manifest_sha256",
+    "candidate_handoff_manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2
+    },
+    "artifact_type": {
+      "const": "CANDIDATE_HANDOFF"
+    },
+    "policy_version": {
+      "const": "mt5-direct-endpoint-policy-v2"
+    },
+    "experiment_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "experiment_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "c2_run_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "c2_control_plan_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "c2_evidence_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "lifecycle_mode": {
+      "const": "C012_SINGLE_PROCESS_SESSION"
+    },
+    "c012_session_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "initial_c012_pre_state_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "c2_lifecycle_binding_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "candidate_endpoint": {
+      "$ref": "#/$defs/candidate"
+    },
+    "canonical_identity": {
+      "$ref": "#/$defs/demo_identity"
+    },
+    "terminal_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "terminal_build": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "produced_at_unix_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "direct_campaign_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "candidate_handoff_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ip",
+        "port",
+        "source_control",
+        "observed_phase",
+        "process_scoped"
+      ],
+      "properties": {
+        "ip": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "ipv4"
+            },
+            {
+              "type": "string",
+              "format": "ipv6"
+            }
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "source_control": {
+          "const": "C2"
+        },
+        "observed_phase": {
+          "const": "LOGIN"
+        },
+        "process_scoped": {
+          "const": true
+        }
+      }
+    },
+    "human_text_128": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "allOf": [
+        {
+          "pattern": "^(?:\\S(?:.*\\S)?)$"
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z])\\d(?:[\\s_:\\(\\)•+.,'\\u2013\\u2014\\u2019-]?\\d){5,}(?:$|[^0-9A-Za-z])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z_])(?:[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn])(?:$|[^0-9A-Za-z_])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F\\u00AD\\u034F\\u061C\\u115F-\\u1160\\u17B4-\\u17B5\\u180B-\\u180F\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\u3164\\uFE00-\\uFE0F\\uFEFF\\uFFA0]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u00B2\\u00B3\\u00B9\\u2070\\u2074-\\u2079\\u2080-\\u2089\\uFF00-\\uFFEF]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[/\\\\]"
+          }
+        }
+      ]
+    },
+    "demo_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "server",
+        "company",
+        "trade_mode"
+      ],
+      "properties": {
+        "server": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "company": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "trade_mode": {
+          "const": "DEMO"
+        }
+      }
+    }
+  }
+}

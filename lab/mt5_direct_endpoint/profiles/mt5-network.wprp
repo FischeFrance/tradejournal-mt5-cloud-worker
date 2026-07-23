@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<WindowsPerformanceRecorder Version="1.0" Author="TradeJournal MT5 direct-endpoint lab">
+  <Profiles>
+    <!-- Collectors must precede providers. The circular cap prevents an accidental
+         unbounded trace from filling the disposable VM disk. Hitting the cap makes
+         the experiment inconclusive because the oldest evidence may be overwritten. -->
+    <SystemCollector Id="MT5LabSystemCollector" Name="NT Kernel Logger">
+      <BufferSize Value="1024" />
+      <Buffers Value="128" />
+      <MaximumFileSize Value="2048" FileMode="Circular" />
+      <FlushTimer Value="1" />
+    </SystemCollector>
+
+    <EventCollector Id="MT5LabEventCollector" Name="MT5 Lab Event Collector">
+      <BufferSize Value="256" />
+      <Buffers Value="128" />
+      <MaximumFileSize Value="512" FileMode="Circular" />
+      <FlushTimer Value="1" />
+    </EventCollector>
+
+    <SystemProvider Id="MT5LabSystemProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread" />
+        <Keyword Value="Loader" />
+        <Keyword Value="NetworkTrace" />
+      </Keywords>
+    </SystemProvider>
+
+    <!-- DNS is corroborating evidence. Process attribution for TCP/IP comes from
+         the kernel NetworkTrace events, not from DNS alone. -->
+    <EventProvider
+      Id="MT5LabDnsClientProvider"
+      Name="Microsoft-Windows-DNS-Client"
+      Level="5"
+      Stack="false"
+      SID="false"
+      TSID="true" />
+
+    <Profile
+      Id="MT5DirectEndpoint.Verbose.File"
+      Name="MT5DirectEndpoint"
+      Description="Process, image, TCP/IP and DNS evidence for the MT5 direct-endpoint lab"
+      DetailLevel="Verbose"
+      LoggingMode="File"
+      Strict="true">
+      <ProblemCategories>
+        <ProblemCategory Value="First Level Triage" />
+      </ProblemCategories>
+      <Collectors>
+        <SystemCollectorId Value="MT5LabSystemCollector">
+          <SystemProviderId Value="MT5LabSystemProvider" />
+        </SystemCollectorId>
+        <EventCollectorId Value="MT5LabEventCollector">
+          <EventProviders>
+            <EventProviderId Value="MT5LabDnsClientProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+
+    <Profile
+      Id="MT5DirectEndpoint.Verbose.Memory"
+      Name="MT5DirectEndpoint"
+      Description="Process, image, TCP/IP and DNS evidence for the MT5 direct-endpoint lab"
+      DetailLevel="Verbose"
+      LoggingMode="Memory"
+      Strict="true">
+      <ProblemCategories>
+        <ProblemCategory Value="First Level Triage" />
+      </ProblemCategories>
+      <Collectors>
+        <SystemCollectorId Value="MT5LabSystemCollector">
+          <SystemProviderId Value="MT5LabSystemProvider" />
+        </SystemCollectorId>
+        <EventCollectorId Value="MT5LabEventCollector">
+          <EventProviders>
+            <EventProviderId Value="MT5LabDnsClientProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

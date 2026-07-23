@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.local/schemas/mt5-direct-endpoint/pre-state-report-v1.json",
+  "title": "MT5 direct-endpoint sanitized pre-state report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "generated_at_utc",
+    "overall_status",
+    "check_count",
+    "pass_count",
+    "fail_count",
+    "unknown_count",
+    "checks",
+    "evidence_projection",
+    "operator_attestation_fields",
+    "privacy",
+    "network_operations_performed",
+    "system_mutations_performed",
+    "output_requested",
+    "output_written",
+    "report_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "mode": { "enum": ["PLANONLY", "READONLYCHECKS"] },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "overall_status": { "$ref": "#/$defs/status" },
+    "check_count": { "type": "integer", "minimum": 1 },
+    "pass_count": { "type": "integer", "minimum": 0 },
+    "fail_count": { "type": "integer", "minimum": 0 },
+    "unknown_count": { "type": "integer", "minimum": 0 },
+    "checks": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "evidence_projection": { "$ref": "#/$defs/evidenceProjection" },
+    "operator_attestation_fields": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "portable_root_new",
+          "disposable_clone_new",
+          "windows_user_new",
+          "credential_manager_empty",
+          "community_identity_absent",
+          "no_shared_storage",
+          "terminal_data_path_matches"
+        ]
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_paths_exported",
+        "registry_names_exported",
+        "credential_names_exported",
+        "proxy_values_exported",
+        "sensitive_file_contents_read",
+        "command_lines_exported"
+      ],
+      "properties": {
+        "raw_paths_exported": { "const": false },
+        "registry_names_exported": { "const": false },
+        "credential_names_exported": { "const": false },
+        "proxy_values_exported": { "const": false },
+        "sensitive_file_contents_read": { "const": false },
+        "command_lines_exported": { "const": false }
+      }
+    },
+    "network_operations_performed": { "const": false },
+    "system_mutations_performed": { "const": false },
+    "output_requested": { "type": "boolean" },
+    "output_written": { "type": "boolean" },
+    "report_digest": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "status": { "enum": ["PASS", "FAIL", "UNKNOWN"] },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "nullableBoolean": { "type": ["boolean", "null"] },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "clean", "count", "digest", "path_hash", "reason_code"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{1,80}$" },
+        "status": { "$ref": "#/$defs/status" },
+        "clean": { "$ref": "#/$defs/nullableBoolean" },
+        "count": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "digest": { "$ref": "#/$defs/nullableSha256" },
+        "path_hash": { "$ref": "#/$defs/nullableSha256" },
+        "reason_code": { "type": "string", "pattern": "^[A-Z0-9_]{1,80}$" }
+      }
+    },
+    "evidenceProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "portable_root_new",
+        "disposable_clone_new",
+        "windows_user_new",
+        "accounts_dat_absent",
+        "servers_dat_absent",
+        "bases_absent",
+        "appdata_absent",
+        "registry_clean",
+        "credential_manager_empty",
+        "community_identity_absent",
+        "no_shared_storage",
+        "sensitive_bootstrap_absent",
+        "prior_processes_absent",
+        "terminal_data_path_matches"
+      ],
+      "properties": {
+        "portable_root_new": { "$ref": "#/$defs/nullableBoolean" },
+        "disposable_clone_new": { "$ref": "#/$defs/nullableBoolean" },
+        "windows_user_new": { "$ref": "#/$defs/nullableBoolean" },
+        "accounts_dat_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "servers_dat_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "bases_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "appdata_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "registry_clean": { "$ref": "#/$defs/nullableBoolean" },
+        "credential_manager_empty": { "$ref": "#/$defs/nullableBoolean" },
+        "community_identity_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "no_shared_storage": { "$ref": "#/$defs/nullableBoolean" },
+        "sensitive_bootstrap_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "prior_processes_absent": { "$ref": "#/$defs/nullableBoolean" },
+        "terminal_data_path_matches": { "$ref": "#/$defs/nullableBoolean" }
+      }
+    }
+  }
+}
+

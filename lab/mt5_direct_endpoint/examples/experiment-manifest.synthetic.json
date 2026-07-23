@@ -1,0 +1,70 @@
+{
+  "artifact_type": "EXPERIMENT_MANIFEST",
+  "durations_seconds": {
+    "baseline": 600,
+    "blocked_timeout": 180,
+    "c4_elapsed_tolerance": 30,
+    "c5_separation_minimum": 1800,
+    "connected_steady": 600,
+    "exact_discovery": 180,
+    "login_timeout": 120,
+    "negative_discovery": 120,
+    "network_interruption": 30,
+    "probe_timestamp_tolerance_seconds": 2,
+    "reconnect_observation": 300
+  },
+  "expected_identity": {
+    "company": "Example Broker Ltd",
+    "server": "Broker-Demo",
+    "trade_mode": "DEMO"
+  },
+  "experiment_id": "11111111-1111-4111-8111-111111111111",
+  "experiment_manifest_sha256": "d43e3af562badd13f7ff0e297b83c24253aed8c166ea955753404e4594a26246",
+  "lab_root": "C:\\TJLab",
+  "lifecycle": {
+    "allowed_transient_process_policy": "C2_CONFIG_SUBMITTER_SAME_JOB_ONLY",
+    "c012_session_id": "33333333-3333-4333-8333-333333333333",
+    "launch_control": "C0",
+    "lifecycle_mode": "C012_SINGLE_PROCESS_SESSION",
+    "root_process_generation_policy": "SINGLE_SHARED_C0_C1_C2",
+    "schema_version": 1,
+    "teardown_control": "C2"
+  },
+  "negative_query": {
+    "expected_result_count": 0,
+    "label": "TJ-NO-SUCH-11111111-1111-4111-8111-111111111111",
+    "label_sha256": "656e40edffa1ba92262994e86b053410f6b3c761418d1de3115020f084363302",
+    "schema_version": 1
+  },
+  "network_policy": {
+    "allowed_remote_ports": [
+      443
+    ],
+    "candidate_address_policy": "GLOBAL_LITERAL_ONLY",
+    "candidate_source_policy": "C2_LOGIN_PROCESS_SCOPED",
+    "direct_dns_events_max": 0,
+    "direct_egress_policy": "CANDIDATE_ONLY",
+    "direct_other_tcp_flows_max": 0,
+    "external_deny_role": "DEFENSE_IN_DEPTH_NON_PROBATORY",
+    "transport": "TCP"
+  },
+  "policy_version": "mt5-direct-endpoint-policy-v2",
+  "probe": {
+    "policy": "DEMO_INVESTOR_READ_ONLY_V1",
+    "probe_version": "3.0.0",
+    "schema_version": 3,
+    "source_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "symbol": "EURUSD"
+  },
+  "region": "offline-test",
+  "requested_server_label": "Synthetic Broker Demo",
+  "schema_version": 2,
+  "terminal": {
+    "publisher": "Verified Test Publisher",
+    "publisher_policy": "EXACT_PUBLISHER_AND_SIGNER_POLICY",
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "signer_policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_canonical_path": "C:\\TJLabSource\\terminal64.exe",
+    "source_path_sha256": "9b6a8d83b4a1fbe4ba41d459ff48349deb345ac950da839dc790020c55fb4867"
+  }
+}

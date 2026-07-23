@@ -1,0 +1,43 @@
+﻿{
+  "schema_version": 1,
+  "document_type": "windows_firewall_wfp_plan",
+  "generated_at_utc": "2026-01-01T00:00:00Z",
+  "run_id": "dryrun001",
+  "control": "C3",
+  "apply_capability_in_script": false,
+  "current_host_forbidden": true,
+  "disposable_vm_only": true,
+  "endpoint": {
+    "SchemaVersion": 1,
+    "InputEndpoint": "8.8.8.8:443",
+    "NormalizedEndpoint": "8.8.8.8:443",
+    "HostKind": "IPv4",
+    "NormalizedHost": "8.8.8.8",
+    "Port": 443,
+    "SyntaxValid": true,
+    "PortApproved": true,
+    "SafetyStatus": "SAFE",
+    "ServingEligible": true,
+    "AddressEvidence": [],
+    "Reasons": []
+  },
+  "terminal": {
+    "path": "C:\\TJLab\\dryrun001\\terminal\\terminal64.exe",
+    "sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "artifacts": {
+    "firewall_backup": "C:\\TJLab\\evidence\\dryrun001.firewall-policy.wfw",
+    "audit_backup": "C:\\TJLab\\evidence\\dryrun001.audit-policy.csv",
+    "firewall_log": "C:\\TJLab\\evidence\\dryrun001.pfirewall.log",
+    "policy_inventory": "C:\\TJLab\\evidence\\dryrun001.firewall-policy-before.json",
+    "isolation_intent": "C:\\TJLab\\evidence\\dryrun001.network-isolation-intent.json",
+    "isolation_applied": "C:\\TJLab\\evidence\\dryrun001.network-isolation-applied.json",
+    "isolation_failed": "C:\\TJLab\\evidence\\dryrun001.network-isolation-failed.json",
+    "isolation_rollback": "C:\\TJLab\\evidence\\dryrun001.network-isolation-rollback.json"
+  },
+  "required_security_events": [5156],
+  "corroborating_events": [],
+  "hard_preconditions": ["fixture dry-run only"],
+  "steps": [],
+  "rollback": []
+}

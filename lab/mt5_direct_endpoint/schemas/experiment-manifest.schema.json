@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.local/schemas/mt5-direct-endpoint/experiment-manifest-v2.json",
+  "title": "MT5 direct-endpoint authoritative experiment manifest v2",
+  "$comment": "The experiment_manifest_sha256 value is a domain-separated SHA-256 over the canonical JSON body with that self-digest field omitted. The runtime validator is authoritative for canonical Windows paths, globally safe policy values, Unicode sanitization, and digest recomputation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_type",
+    "policy_version",
+    "experiment_id",
+    "lifecycle",
+    "region",
+    "lab_root",
+    "terminal",
+    "requested_server_label",
+    "expected_identity",
+    "durations_seconds",
+    "probe",
+    "network_policy",
+    "negative_query",
+    "experiment_manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2
+    },
+    "artifact_type": {
+      "const": "EXPERIMENT_MANIFEST"
+    },
+    "policy_version": {
+      "const": "mt5-direct-endpoint-policy-v2"
+    },
+    "experiment_id": {
+      "$ref": "#/$defs/uuid4"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/lifecycle"
+    },
+    "region": {
+      "$ref": "#/$defs/human_text_64"
+    },
+    "lab_root": {
+      "$ref": "#/$defs/windows_absolute_path"
+    },
+    "terminal": {
+      "$ref": "#/$defs/manifest_terminal"
+    },
+    "requested_server_label": {
+      "$ref": "#/$defs/human_text_128"
+    },
+    "expected_identity": {
+      "$ref": "#/$defs/demo_identity"
+    },
+    "durations_seconds": {
+      "$ref": "#/$defs/durations"
+    },
+    "probe": {
+      "$ref": "#/$defs/probe_policy"
+    },
+    "network_policy": {
+      "$ref": "#/$defs/network_policy"
+    },
+    "negative_query": {
+      "$ref": "#/$defs/negative_query"
+    },
+    "experiment_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "windows_absolute_path": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z]:\\\\[^\\r\\n\\u0000]*$"
+    },
+    "human_text_base": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?:\\S(?:.*\\S)?)$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z])\\d(?:[\\s_:\\(\\)•+.,'\\u2013\\u2014\\u2019-]?\\d){5,}(?:$|[^0-9A-Za-z])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[^0-9A-Za-z_])(?:[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn])(?:$|[^0-9A-Za-z_])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u0000-\\u001F\\u007F-\\u009F\\u00AD\\u034F\\u061C\\u115F-\\u1160\\u17B4-\\u17B5\\u180B-\\u180F\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u206F\\u3164\\uFE00-\\uFE0F\\uFEFF\\uFFA0]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[\\u00B2\\u00B3\\u00B9\\u2070\\u2074-\\u2079\\u2080-\\u2089\\uFF00-\\uFFEF]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "[/\\\\]"
+          }
+        }
+      ]
+    },
+    "human_text_64": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/human_text_base"
+        },
+        {
+          "maxLength": 64
+        }
+      ]
+    },
+    "human_text_128": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/human_text_base"
+        },
+        {
+          "maxLength": 128
+        }
+      ]
+    },
+    "manifest_terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_canonical_path",
+        "source_path_sha256",
+        "sha256",
+        "publisher",
+        "publisher_policy",
+        "signer_policy_sha256"
+      ],
+      "properties": {
+        "source_canonical_path": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/windows_absolute_path"
+            },
+            {
+              "pattern": "\\\\[Tt][Ee][Rr][Mm][Ii][Nn][Aa][Ll]64\\.[Ee][Xx][Ee]$"
+            }
+          ]
+        },
+        "source_path_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "publisher": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "publisher_policy": {
+          "const": "EXACT_PUBLISHER_AND_SIGNER_POLICY"
+        },
+        "signer_policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "demo_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "server",
+        "company",
+        "trade_mode"
+      ],
+      "properties": {
+        "server": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "company": {
+          "$ref": "#/$defs/human_text_128"
+        },
+        "trade_mode": {
+          "const": "DEMO"
+        }
+      }
+    },
+    "probe_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "probe_version",
+        "source_sha256",
+        "policy",
+        "symbol"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 3
+        },
+        "probe_version": {
+          "const": "3.0.0"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "policy": {
+          "const": "DEMO_INVESTOR_READ_ONLY_V1"
+        },
+        "symbol": {
+          "$ref": "#/$defs/human_text_64"
+        }
+      }
+    },
+    "network_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "allowed_remote_ports",
+        "candidate_address_policy",
+        "candidate_source_policy",
+        "direct_egress_policy",
+        "direct_dns_events_max",
+        "direct_other_tcp_flows_max",
+        "external_deny_role"
+      ],
+      "properties": {
+        "transport": {
+          "const": "TCP"
+        },
+        "allowed_remote_ports": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "candidate_address_policy": {
+          "const": "GLOBAL_LITERAL_ONLY"
+        },
+        "candidate_source_policy": {
+          "const": "C2_LOGIN_PROCESS_SCOPED"
+        },
+        "direct_egress_policy": {
+          "const": "CANDIDATE_ONLY"
+        },
+        "direct_dns_events_max": {
+          "const": 0
+        },
+        "direct_other_tcp_flows_max": {
+          "const": 0
+        },
+        "external_deny_role": {
+          "const": "DEFENSE_IN_DEPTH_NON_PROBATORY"
+        }
+      }
+    },
+    "durations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline",
+        "negative_discovery",
+        "exact_discovery",
+        "login_timeout",
+        "connected_steady",
+        "network_interruption",
+        "reconnect_observation",
+        "blocked_timeout",
+        "c4_elapsed_tolerance",
+        "c5_separation_minimum",
+        "probe_timestamp_tolerance_seconds"
+      ],
+      "properties": {
+        "baseline": {
+          "type": "integer",
+          "minimum": 600,
+          "maximum": 3600
+        },
+        "negative_discovery": {
+          "type": "integer",
+          "minimum": 120,
+          "maximum": 3600
+        },
+        "exact_discovery": {
+          "type": "integer",
+          "minimum": 180,
+          "maximum": 3600
+        },
+        "login_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "connected_steady": {
+          "type": "integer",
+          "minimum": 600,
+          "maximum": 3600
+        },
+        "network_interruption": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600
+        },
+        "reconnect_observation": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 3600
+        },
+        "blocked_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 180
+        },
+        "c4_elapsed_tolerance": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "c5_separation_minimum": {
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 3600
+        },
+        "probe_timestamp_tolerance_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "lifecycle_mode",
+        "c012_session_id",
+        "launch_control",
+        "teardown_control",
+        "root_process_generation_policy",
+        "allowed_transient_process_policy"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "lifecycle_mode": {
+          "const": "C012_SINGLE_PROCESS_SESSION"
+        },
+        "c012_session_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "launch_control": {
+          "const": "C0"
+        },
+        "teardown_control": {
+          "const": "C2"
+        },
+        "root_process_generation_policy": {
+          "const": "SINGLE_SHARED_C0_C1_C2"
+        },
+        "allowed_transient_process_policy": {
+          "const": "C2_CONFIG_SUBMITTER_SAME_JOB_ONLY"
+        }
+      }
+    },
+    "negative_query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "label",
+        "label_sha256",
+        "expected_result_count"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "label": {
+          "type": "string",
+          "pattern": "^TJ-NO-SUCH-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "label_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "expected_result_count": {
+          "type": "integer",
+          "const": 0
+        }
+      }
+    }
+  }
+}
