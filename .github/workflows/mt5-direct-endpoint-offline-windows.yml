@@ -1,3 +1,4 @@
+# Trigger offline Windows validation
 name: MT5 Direct Endpoint — Offline Windows Validation
 
 on:
