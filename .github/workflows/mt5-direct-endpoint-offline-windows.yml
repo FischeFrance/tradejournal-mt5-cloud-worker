@@ -1,0 +1,84 @@
+name: MT5 Direct Endpoint — Offline Windows Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/broker-resolver-poc
+    paths:
+      - lab/mt5_direct_endpoint/**
+      - .github/workflows/mt5-direct-endpoint-offline-windows.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mt5-direct-endpoint-offline-windows
+  cancel-in-progress: true
+
+jobs:
+  offline-validation:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Verify no blocked terminal/metaeditor processes are running
+        run: |
+          $forbiddenProcesses = @('terminal', 'terminal64', 'metaeditor', 'metaeditor64')
+          $found = @()
+          foreach ($name in $forbiddenProcesses) {
+            $found += Get-Process -Name $name -ErrorAction SilentlyContinue
+          }
+          if ($found.Count -gt 0) {
+            $list = $found | Sort-Object Id | ForEach-Object { "${($_.ProcessName)}($($_.Id))" } | Sort-Object -Unique
+            throw "Forbidden process(es) already running before test: $($list -join ', ')"
+          }
+
+      - name: Run offline Python test suite
+        run: |
+          python -m unittest discover -s lab/mt5_direct_endpoint/tests -q
+          python -m unittest discover -s lab/mt5_direct_endpoint/mql5/tests -q
+          python -m unittest discover -s lab/mt5_direct_endpoint/windows/tests -p "test_*.py" -q
+          python -m compileall -q lab/mt5_direct_endpoint
+
+      - name: Build JobHarness in offline mode
+        run: dotnet build lab/mt5_direct_endpoint/src/JobHarness/JobHarness.csproj --configuration Release --nologo
+
+      - name: Run JobHarness smoke tests (offline harness)
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/src/JobHarness/scripts/Test-JobHarness.ps1
+
+      - name: Run JobHarness hard-disabled gate smoke
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/src/JobHarness/scripts/Test-JobHarness.ps1 -RunWindowsProcessSmoke
+
+      - name: Run PowerShell dry-run self test
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/windows/tests/Invoke-DryRunSelfTest.ps1
+
+      - name: Run PowerShell pre-state dry-run scanner test
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/windows/tests/Invoke-PreStateScannerDryRunTest.ps1
+
+      - name: Verify no blocked terminal/metaeditor processes remain
+        run: |
+          $forbiddenProcesses = @('terminal', 'terminal64', 'metaeditor', 'metaeditor64')
+          $found = @()
+          foreach ($name in $forbiddenProcesses) {
+            $found += Get-Process -Name $name -ErrorAction SilentlyContinue
+          }
+          if ($found.Count -gt 0) {
+            $list = $found | Sort-Object Id | ForEach-Object { "${($_.ProcessName)}($($_.Id))" } | Sort-Object -Unique
+            throw "Forbidden process(es) running after validation: $($list -join ', ')"
+          }
