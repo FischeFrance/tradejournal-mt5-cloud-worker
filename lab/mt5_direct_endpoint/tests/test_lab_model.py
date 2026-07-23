@@ -1694,6 +1694,200 @@ class Patch7ContractTests(unittest.TestCase):
         self.assertEqual(result.outcome, "INCONCLUSIVE")
         self.assertIn("c012_timeline_qpc_order_invalid", result.reasons)
 
+    def test_c012_timeline_one_ms_overlap_c1_c2_is_rejected(self) -> None:
+        artifacts = self.fresh()
+        c1 = artifacts.evidence["C1"]
+        c1_events = c1["timeline"]["events"]
+        c2_events = artifacts.evidence["C2"]["timeline"]["events"]
+        shift_ms = (
+            int(c2_events[0]["timestamp_unix_ms"])
+            - int(c1_events[-1]["timestamp_unix_ms"])
+            + 1
+        )
+        for event in c1_events:
+            event["timestamp_unix_ms"] += shift_ms
+        c1["run_context"]["started_at_unix"] = (
+            int(c1_events[0]["timestamp_unix_ms"]) // 1000
+        )
+        c1["run_context"]["completed_at_unix"] = (
+            int(c1_events[-1]["timestamp_unix_ms"]) // 1000
+        )
+        c1["proof_binding"]["phase_timeline_sha256"] = contract_digest(
+            "PHASE_TIMELINE",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "timeline": c1["timeline"],
+            },
+        )
+        c1["proof_binding"]["requested_label_binding_sha256"] = evidence_digest(
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "experiment_id": EXPERIMENT_ID,
+                "requested_label_manifest_sha256": requested_label_manifest_digest(
+                    artifacts.manifest
+                ),
+                "job_identity_sha256": c1["proof_binding"][
+                    "job_identity_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "requested_server_label_sha256": REQUESTED_SERVER_LABEL_SHA256,
+                "selected_server_label_sha256": c1["discovery"][
+                    "selected_server_label_sha256"
+                ],
+            }
+        )
+        c1["proof_binding"]["negative_query_binding_sha256"] = contract_digest(
+            "NEGATIVE_QUERY_BINDING",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "control_plan_sha256": artifacts.plans["C1"][
+                    "control_plan_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "negative_query_label_sha256": c1["discovery"][
+                    "negative_query_label_sha256"
+                ],
+                "negative_query_result_count": c1["discovery"][
+                    "negative_query_result_count"
+                ],
+                "negative_query_ui_binding_verified": True,
+            },
+        )
+        result = evaluate_artifacts(artifacts)
+        self.assertEqual(result.outcome, "INCONCLUSIVE")
+        self.assertIn("c012_timeline_timestamp_order_invalid", result.reasons)
+
+    def test_c012_timeline_qpc_at_or_below_c1_is_rejected_for_c2(self) -> None:
+        artifacts = self.fresh()
+        c1 = artifacts.evidence["C1"]
+        c1_events = c1["timeline"]["events"]
+        c2_events = artifacts.evidence["C2"]["timeline"]["events"]
+        qpc_shift = int(c2_events[0]["qpc"]) - int(c1_events[-1]["qpc"])
+        for event in c1_events:
+            event["qpc"] += qpc_shift
+        c1["proof_binding"]["phase_timeline_sha256"] = contract_digest(
+            "PHASE_TIMELINE",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "timeline": c1["timeline"],
+            },
+        )
+        c1["proof_binding"]["requested_label_binding_sha256"] = evidence_digest(
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "experiment_id": EXPERIMENT_ID,
+                "requested_label_manifest_sha256": requested_label_manifest_digest(
+                    artifacts.manifest
+                ),
+                "job_identity_sha256": c1["proof_binding"][
+                    "job_identity_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "requested_server_label_sha256": REQUESTED_SERVER_LABEL_SHA256,
+                "selected_server_label_sha256": c1["discovery"][
+                    "selected_server_label_sha256"
+                ],
+            }
+        )
+        c1["proof_binding"]["negative_query_binding_sha256"] = contract_digest(
+            "NEGATIVE_QUERY_BINDING",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "control_plan_sha256": artifacts.plans["C1"][
+                    "control_plan_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "negative_query_label_sha256": c1["discovery"][
+                    "negative_query_label_sha256"
+                ],
+                "negative_query_result_count": c1["discovery"][
+                    "negative_query_result_count"
+                ],
+                "negative_query_ui_binding_verified": True,
+            },
+        )
+        result = evaluate_artifacts(artifacts)
+        self.assertEqual(result.outcome, "INCONCLUSIVE")
+        self.assertIn("c012_timeline_qpc_order_invalid", result.reasons)
+
+    def test_c012_timeline_frequency_mismatch_is_rejected(self) -> None:
+        artifacts = self.fresh()
+        c1 = artifacts.evidence["C1"]
+        c1["timeline"]["qpc_frequency_hz"] = 2000
+        for event in c1["timeline"]["events"]:
+            event["qpc"] *= 2
+        c1["proof_binding"]["phase_timeline_sha256"] = contract_digest(
+            "PHASE_TIMELINE",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "timeline": c1["timeline"],
+            },
+        )
+        c1["proof_binding"]["requested_label_binding_sha256"] = evidence_digest(
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "experiment_id": EXPERIMENT_ID,
+                "requested_label_manifest_sha256": requested_label_manifest_digest(
+                    artifacts.manifest
+                ),
+                "job_identity_sha256": c1["proof_binding"][
+                    "job_identity_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "requested_server_label_sha256": REQUESTED_SERVER_LABEL_SHA256,
+                "selected_server_label_sha256": c1["discovery"][
+                    "selected_server_label_sha256"
+                ],
+            }
+        )
+        c1["proof_binding"]["negative_query_binding_sha256"] = contract_digest(
+            "NEGATIVE_QUERY_BINDING",
+            1,
+            {
+                "run_id": c1["run_id"],
+                "control": "C1",
+                "control_plan_sha256": artifacts.plans["C1"][
+                    "control_plan_sha256"
+                ],
+                "phase_timeline_sha256": c1["proof_binding"][
+                    "phase_timeline_sha256"
+                ],
+                "negative_query_label_sha256": c1["discovery"][
+                    "negative_query_label_sha256"
+                ],
+                "negative_query_result_count": c1["discovery"][
+                    "negative_query_result_count"
+                ],
+                "negative_query_ui_binding_verified": True,
+            },
+        )
+        result = evaluate_artifacts(artifacts)
+        self.assertEqual(result.outcome, "INCONCLUSIVE")
+        self.assertIn("c012_timeline_frequency_mismatch", result.reasons)
+
     def test_timeline_event_must_be_inside_run_interval(self) -> None:
         evidence = copy.deepcopy(self.base.evidence["C0"])
         evidence["timeline"]["events"][0]["timestamp_unix_ms"] -= 1
