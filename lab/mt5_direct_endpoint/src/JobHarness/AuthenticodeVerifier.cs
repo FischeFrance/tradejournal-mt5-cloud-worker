@@ -194,7 +194,7 @@ internal static class AuthenticodeVerifier
             };
 
             fileInfoPointer = Marshal.AllocHGlobal(Marshal.SizeOf<WinTrustFileInfo>());
-            Marshal.StructureToPtr(fileInfo, fileInfoPointer, deleteOld: false);
+            Marshal.StructureToPtr(fileInfo, fileInfoPointer, false);
 
             var trustData = new WinTrustData
             {

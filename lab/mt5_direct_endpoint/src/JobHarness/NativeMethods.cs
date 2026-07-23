@@ -110,7 +110,7 @@ internal struct ProcessInformation
 
 internal sealed class SafeJobHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
-    private SafeJobHandle()
+    public SafeJobHandle()
         : base(ownsHandle: true)
     {
     }
@@ -169,6 +169,9 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool AssignProcessToJobObject(SafeJobHandle job, SafeKernelObjectHandle process);
 
+#pragma warning disable CA1838
+    // CreateProcessW may mutate the command-line buffer (LPWSTR in/out); StringBuilder
+    // preserves the required mutable semantics for this native signature.
     [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool CreateProcess(
@@ -182,6 +185,7 @@ internal static class NativeMethods
         string currentDirectory,
         ref StartupInfo startupInfo,
         out ProcessInformation processInformation);
+#pragma warning restore CA1838
 
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern uint ResumeThread(SafeKernelObjectHandle thread);

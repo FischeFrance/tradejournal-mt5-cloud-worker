@@ -33,6 +33,7 @@ internal static class JobObjectRunner
         ConfigureAndVerifyJob(job, metadata.JobPolicy);
 
         ProcessInformation nativeProcess = default;
+        TimeSpan? watchdogTimeout = options.Timeout;
         SafeKernelObjectHandle? process = null;
         SafeKernelObjectHandle? thread = null;
         bool assigned = false;
@@ -43,7 +44,7 @@ internal static class JobObjectRunner
         var lifecycleGate = new object();
         Timer? timeoutWatchdog = null;
 
-        if (options.Timeout is not null)
+        if (watchdogTimeout is not null)
         {
             timeoutWatchdog = new Timer(
                 _ =>
@@ -204,7 +205,22 @@ internal static class JobObjectRunner
                 // The primary thread has never run. Explicitly terminate the unassigned,
                 // suspended process because KILL_ON_JOB_CLOSE cannot cover it.
                 NativeMethods.TerminateProcess(process, FailureExitCode);
-                NativeMethods.WaitForSingleObject(process, 5000);
+                uint assignCleanupWait = NativeMethods.WaitForSingleObject(process, 5000);
+                if (assignCleanupWait == NativeMethods.WaitTimeout)
+                {
+                    throw new InvalidOperationException("AssignProcessToJobObject cleanup wait timed out.");
+                }
+
+                if (assignCleanupWait == NativeMethods.WaitFailed)
+                {
+                    throw LastWin32("WaitForSingleObject");
+                }
+
+                if (assignCleanupWait != NativeMethods.WaitObject0)
+                {
+                    throw new InvalidOperationException(
+                        $"Unexpected AssignProcessToJobObject cleanup wait result: {assignCleanupWait}.");
+                }
                 throw new Win32Exception(assignError, "AssignProcessToJobObject failed.");
             }
 
@@ -241,7 +257,10 @@ internal static class JobObjectRunner
                 else
                 {
                     if (timeoutWatchdog is not null
-                        && !timeoutWatchdog.Change(options.Timeout.Value, Timeout.InfiniteTimeSpan))
+                        && !timeoutWatchdog.Change(
+                            watchdogTimeout ?? throw new InvalidOperationException(
+                                "Watchdog was initialized without a timeout."),
+                            Timeout.InfiniteTimeSpan))
                     {
                         throw new InvalidOperationException("The timeout watchdog could not be armed.");
                     }
