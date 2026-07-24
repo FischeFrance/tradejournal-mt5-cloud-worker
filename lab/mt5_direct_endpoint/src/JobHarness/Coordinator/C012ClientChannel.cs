@@ -5,21 +5,27 @@ namespace TradeJournal.Lab.JobHarness.Coordinator;
 // Client side of one IPC connection. Tracks its own next sequence number locally, only
 // advancing it once the server confirms acceptance -- a rejected request leaves the same
 // slot open for a corrected retry, matching C012RequestSequencer's own accept-only
-// advancement rule so client and server expectations never diverge.
+// advancement rule so client and server expectations never diverge. The starting sequence
+// number is always supplied by the caller (never hardcoded to 1): a fresh instance is
+// constructed for every separate c012-client process, so only an externally persisted
+// cursor (C012SessionSequenceCursor) lets the caller know the session's real, current
+// sequence number.
 public sealed class C012ClientChannel
 {
     private readonly Stream _stream;
     private readonly C012SessionSecret _secret;
     private readonly Guid _sessionId;
-    private long _nextSequence = 1;
+    private long _nextSequence;
 
-    public C012ClientChannel(Stream stream, C012SessionSecret secret, Guid sessionId)
+    public C012ClientChannel(Stream stream, C012SessionSecret secret, Guid sessionId, long initialSequence)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(secret);
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialSequence, 1);
         _stream = stream;
         _secret = secret;
         _sessionId = sessionId;
+        _nextSequence = initialSequence;
     }
 
     public async Task<C012TransitionResult> SendAsync(

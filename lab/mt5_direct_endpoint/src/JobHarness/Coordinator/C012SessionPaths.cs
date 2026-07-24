@@ -1,6 +1,6 @@
 namespace TradeJournal.Lab.JobHarness.Coordinator;
 
-// Purely local, file-based facts about a --session-dir: does it exist, are the two session
+// Purely local, file-based facts about a --session-dir: does it exist, are the four session
 // files present, and (if session.id parses) what session id it names. Never says anything
 // about whether a host process is actually alive or listening -- that is not observable
 // from the filesystem alone, and c012-client status must not claim it is.
@@ -8,16 +8,24 @@ public sealed record C012SessionDirStatus(
     bool DirectoryExists,
     bool SessionIdFilePresent,
     bool SessionSecretFilePresent,
+    bool SessionSequenceFilePresent,
+    bool SessionSequenceLockFilePresent,
     Guid? SessionId);
 
 public static class C012SessionPaths
 {
     public const string SessionIdFileName = "session.id";
     public const string SessionSecretFileName = "session.secret";
+    public const string SessionSequenceFileName = "session.sequence";
+    public const string SessionSequenceLockFileName = "session.sequence.lock";
 
     public static string SessionIdPath(string sessionDir) => Path.Combine(sessionDir, SessionIdFileName);
 
     public static string SessionSecretPath(string sessionDir) => Path.Combine(sessionDir, SessionSecretFileName);
+
+    public static string SessionSequencePath(string sessionDir) => Path.Combine(sessionDir, SessionSequenceFileName);
+
+    public static string SessionSequenceLockPath(string sessionDir) => Path.Combine(sessionDir, SessionSequenceLockFileName);
 
     // Deterministic and derived only: both host and client compute the same pipe name from
     // the same session id independently, so no separate pipe-name file is ever written.
@@ -76,11 +84,13 @@ public static class C012SessionPaths
 
         if (!Directory.Exists(sessionDir))
         {
-            return new C012SessionDirStatus(false, false, false, null);
+            return new C012SessionDirStatus(false, false, false, false, false, null);
         }
 
         bool idPresent = File.Exists(SessionIdPath(sessionDir));
         bool secretPresent = File.Exists(SessionSecretPath(sessionDir));
+        bool sequencePresent = File.Exists(SessionSequencePath(sessionDir));
+        bool sequenceLockPresent = File.Exists(SessionSequenceLockPath(sessionDir));
 
         Guid? sessionId = null;
         if (idPresent)
@@ -95,7 +105,7 @@ public static class C012SessionPaths
             }
         }
 
-        return new C012SessionDirStatus(true, idPresent, secretPresent, sessionId);
+        return new C012SessionDirStatus(true, idPresent, secretPresent, sequencePresent, sequenceLockPresent, sessionId);
     }
 
     // Best-effort deletion used only for startup rollback and end-of-session cleanup; never

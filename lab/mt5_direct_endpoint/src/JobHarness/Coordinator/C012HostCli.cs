@@ -55,7 +55,8 @@ public static class C012HostCli
             return ExitStartupFailure;
         }
 
-        if (status.SessionIdFilePresent || status.SessionSecretFilePresent)
+        if (status.SessionIdFilePresent || status.SessionSecretFilePresent
+            || status.SessionSequenceFilePresent || status.SessionSequenceLockFilePresent)
         {
             error.WriteLine("--session-dir already contains a session; refusing to reuse or overwrite it.");
             return ExitStartupFailure;
@@ -84,6 +85,7 @@ public static class C012HostCli
         NamedPipeServerStream? pipe = null;
         try
         {
+            C012SessionSequenceCursor.InitializeAtSessionStart(sessionDir);
             secret = C012SessionSecret.Generate();
             secret.Save(C012SessionPaths.SessionSecretPath(sessionDir));
             string pipeName = C012SessionPaths.DerivePipeName(sessionId);
@@ -94,12 +96,14 @@ public static class C012HostCli
             // Rollback: any failure between "session.id written" and "listening" must leave
             // the session directory exactly as empty as it started, so a retry of
             // c012-host start on the same directory is a genuine fresh start, not a partial
-            // reuse.
+            // reuse. All four session files are created and rolled back together.
             C012SessionPaths.TryDelete(C012SessionPaths.SessionIdPath(sessionDir));
             C012SessionPaths.TryDelete(C012SessionPaths.SessionSecretPath(sessionDir));
+            C012SessionPaths.TryDelete(C012SessionPaths.SessionSequencePath(sessionDir));
+            C012SessionPaths.TryDelete(C012SessionPaths.SessionSequenceLockPath(sessionDir));
             secret?.Dispose();
             pipe?.Dispose();
-            error.WriteLine("Unable to initialize the session (secret, ACL, or pipe creation failed); rolled back.");
+            error.WriteLine("Unable to initialize the session (secret, ACL, sequence cursor, or pipe creation failed); rolled back.");
             return ExitStartupFailure;
         }
 
@@ -114,7 +118,7 @@ public static class C012HostCli
             return ExitStartupFailure;
         }
 
-        // From here on, initialization is complete and both files are the confirmed,
+        // From here on, initialization is complete and all four files are the confirmed,
         // durable session -- session.id is never rolled back again after this point.
         var sequencer = new C012RequestSequencer(sessionId);
         var processor = new C012OrchestratingProcessor(sequencer, launcher);

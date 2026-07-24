@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -136,6 +137,19 @@ var tests = new (string Name, Action Body)[]
     ("innocuous_launcher_end_to_end_over_real_named_pipe_reaches_terminated", InnocuousLauncherEndToEndOverRealNamedPipeReachesTerminated),
     ("innocuous_launcher_closing_last_job_handle_kills_root_via_kill_on_job_close", InnocuousLauncherClosingLastJobHandleKillsRootViaKillOnJobClose),
     ("innocuous_launcher_constructor_refuses_metatrader_like_executable_name", InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName),
+
+    // B4.2 fix: session sequence cursor continuity across separate c012-client processes
+    // (Windows-only)
+    ("session_sequence_cursor_advances_one_two_three_on_accepted_responses", SessionSequenceCursorAdvancesOneTwoThreeOnAcceptedResponses),
+    ("session_sequence_cursor_concurrent_acquire_is_rejected_as_busy", SessionSequenceCursorConcurrentAcquireIsRejectedAsBusy),
+    ("session_sequence_cursor_write_ahead_pending_survives_reacquire", SessionSequenceCursorWriteAheadPendingSurvivesReacquire),
+    ("session_sequence_cursor_clean_rejection_leaves_same_sequence_reusable", SessionSequenceCursorCleanRejectionLeavesSameSequenceReusable),
+    ("client_cli_refuses_when_sequence_cursor_is_ambiguous_without_touching_the_pipe", ClientCliRefusesWhenSequenceCursorIsAmbiguousWithoutTouchingThePipe),
+    ("client_cli_refuses_when_sequence_cursor_does_not_match_verb_without_touching_the_pipe", ClientCliRefusesWhenSequenceCursorDoesNotMatchVerbWithoutTouchingThePipe),
+    ("client_cli_fails_cleanly_when_sequence_cursor_content_is_corrupt", ClientCliFailsCleanlyWhenSequenceCursorContentIsCorrupt),
+    ("client_cli_leaves_sequence_cursor_pending_when_response_is_lost", ClientCliLeavesSequenceCursorPendingWhenResponseIsLost),
+    ("host_cli_startup_rolls_back_all_four_session_files_when_secret_save_fails", HostCliStartupRollsBackAllFourSessionFilesWhenSecretSaveFails),
+    ("host_and_client_real_named_pipe_accepts_full_c0_through_c2_with_fake_launcher_and_sequence_cursor", HostAndClientRealNamedPipeAcceptsFullC0ThroughC2WithFakeLauncherAndSequenceCursor),
 };
 
 int failures = 0;
@@ -952,7 +966,7 @@ static void ClientServerRoundTripHappyPathOverDuplexStreams()
 
     using DuplexPair pair = DuplexPair.Create();
     var server = new C012ServerChannel(pair.ServerStream, secret, sequencer);
-    var client = new C012ClientChannel(pair.ClientStream, secret, sessionId);
+    var client = new C012ClientChannel(pair.ClientStream, secret, sessionId, 1);
 
     CancellationToken timeout = ShortTestTimeout();
     Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, timeout);
@@ -980,7 +994,7 @@ static void ClientRejectsResponseWithWrongHmac()
     Guid sessionId = Guid.NewGuid();
 
     using DuplexPair pair = DuplexPair.Create();
-    var client = new C012ClientChannel(pair.ClientStream, clientSecret, sessionId);
+    var client = new C012ClientChannel(pair.ClientStream, clientSecret, sessionId, 1);
 
     Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, ShortTestTimeout());
 
@@ -1015,7 +1029,7 @@ static void ClientKeepsSameSequenceSlotAfterServerRejection()
 
     using DuplexPair firstPair = DuplexPair.Create();
     var serverForFirst = new C012ServerChannel(firstPair.ServerStream, secret, sequencer);
-    var client = new C012ClientChannel(firstPair.ClientStream, secret, sessionId);
+    var client = new C012ClientChannel(firstPair.ClientStream, secret, sessionId, 1);
 
     Task<C012TransitionResult> firstClientTask =
         client.SendAsync(C012Control.C2, C012RequestType.SubmitConfig, ShortTestTimeout());
@@ -1025,8 +1039,8 @@ static void ClientKeepsSameSequenceSlotAfterServerRejection()
 
     using DuplexPair secondPair = DuplexPair.Create();
     var serverForSecond = new C012ServerChannel(secondPair.ServerStream, secret, sequencer);
-    var clientOnSecondPipe = new C012ClientChannel(secondPair.ClientStream, secret, sessionId);
-    // A fresh C012ClientChannel starts at sequence 1 again; since the first (rejected) call
+    var clientOnSecondPipe = new C012ClientChannel(secondPair.ClientStream, secret, sessionId, 1);
+    // A fresh C012ClientChannel is given sequence 1 again; since the first (rejected) call
     // never advanced the shared sequencer's counter either, sequence 1 is still legal here.
     Task<C012TransitionResult> secondClientTask =
         clientOnSecondPipe.SendAsync(C012Control.C0, C012RequestType.Start, ShortTestTimeout());
@@ -1537,6 +1551,8 @@ static void ClientCliStatusReportsFullSessionWithoutClaimingLiveness()
             secret.Save(C012SessionPaths.SessionSecretPath(directory));
         }
 
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+
         using var stdout = new StringWriter();
         using var stderr = new StringWriter();
         int exitCode = C012ClientCli.Run("status", ["--session-dir", directory], stdout, stderr);
@@ -1545,6 +1561,9 @@ static void ClientCliStatusReportsFullSessionWithoutClaimingLiveness()
         Assert(report.Contains($"session_id={sessionId:D}", StringComparison.Ordinal), "must report the actual session id");
         Assert(report.Contains("session_id_file_present=True", StringComparison.Ordinal), "must report session.id presence");
         Assert(report.Contains("session_secret_file_present=True", StringComparison.Ordinal), "must report session.secret presence");
+        Assert(report.Contains("session_sequence_file_present=True", StringComparison.Ordinal), "must report session.sequence presence");
+        Assert(report.Contains("session_sequence_lock_file_present=True", StringComparison.Ordinal), "must report session.sequence.lock presence");
+        Assert(report.Contains("session_sequence_next=1 session_sequence_pending=False", StringComparison.Ordinal), "must report the fresh cursor state");
         Assert(!report.Contains("alive", StringComparison.OrdinalIgnoreCase), "status must never claim liveness");
         Assert(!report.Contains("listening", StringComparison.OrdinalIgnoreCase), "status must never claim the host is listening");
         Assert(exitCode == C012ClientCli.ExitAccepted, "a fully-present session reports exit code 0 from status");
@@ -1680,11 +1699,15 @@ static void ClientCliFailsCleanlyWhenNoPipeIsListening()
             secret.Save(C012SessionPaths.SessionSecretPath(directory));
         }
 
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+
         using var stdout = new StringWriter();
         using var stderr = new StringWriter();
         int exitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], stdout, stderr);
 
         Assert(exitCode == C012ClientCli.ExitTransportFailure, "connecting when no pipe is listening must be a transport failure");
+        C012SessionSequenceState? state = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(state is { Pending: false, SequenceNumber: 1 }, "a connect-time failure must never touch the sequence cursor");
     }
     finally
     {
@@ -1854,6 +1877,360 @@ static void InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName()
         }
 
         Assert(refused, "the constructor must refuse an executable named terminal64.exe regardless of its actual contents/hash");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ---- B4.2 fix: session sequence cursor continuity (Windows-only; each test returns
+// immediately elsewhere) ----
+
+static void SessionSequenceCursorAdvancesOneTwoThreeOnAcceptedResponses()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+
+        foreach (long expected in new long[] { 1, 2, 3 })
+        {
+            using C012SessionSequenceCursor cursor = C012SessionSequenceCursor.AcquireExclusive(directory);
+            C012SessionSequenceState state = cursor.Read();
+            Assert(!state.Pending, $"cursor must be clean before sequence {expected}");
+            Assert(state.SequenceNumber == expected, $"cursor must show {expected} before that step");
+            cursor.WritePending(state.SequenceNumber);
+            cursor.WriteClean(state.SequenceNumber + 1);
+        }
+
+        C012SessionSequenceState? finalState = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(finalState is { Pending: false, SequenceNumber: 4 }, "after three accepted steps the cursor must show 4");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionSequenceCursorConcurrentAcquireIsRejectedAsBusy()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+        using C012SessionSequenceCursor first = C012SessionSequenceCursor.AcquireExclusive(directory);
+
+        bool threw = false;
+        try
+        {
+            using C012SessionSequenceCursor second = C012SessionSequenceCursor.AcquireExclusive(directory);
+        }
+        catch (C012SessionCursorBusyException)
+        {
+            threw = true;
+        }
+
+        Assert(threw, "a second concurrent acquire must be rejected while the first is still held");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionSequenceCursorWriteAheadPendingSurvivesReacquire()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+        using (C012SessionSequenceCursor cursor = C012SessionSequenceCursor.AcquireExclusive(directory))
+        {
+            cursor.WritePending(1);
+        }
+
+        // Simulates a crash right after the write-ahead marker was durably written: the lock
+        // is released (as the OS would release it on process exit) but the marker remains.
+        using (C012SessionSequenceCursor reacquired = C012SessionSequenceCursor.AcquireExclusive(directory))
+        {
+            C012SessionSequenceState state = reacquired.Read();
+            Assert(state is { Pending: true, SequenceNumber: 1 }, "the pending marker must survive across a lock release");
+        }
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionSequenceCursorCleanRejectionLeavesSameSequenceReusable()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+        using (C012SessionSequenceCursor cursor = C012SessionSequenceCursor.AcquireExclusive(directory))
+        {
+            cursor.WritePending(1);
+            // Simulates a definite, unambiguous Rejected response: the same sequence number
+            // remains legal to retry, unlike the ambiguous case above.
+            cursor.WriteClean(1);
+        }
+
+        C012SessionSequenceState? state = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(state is { Pending: false, SequenceNumber: 1 }, "a clean rejection must leave the same sequence number reusable");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliRefusesWhenSequenceCursorIsAmbiguousWithoutTouchingThePipe()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+        using (C012SessionSequenceCursor cursor = C012SessionSequenceCursor.AcquireExclusive(directory))
+        {
+            cursor.WritePending(1);
+        }
+
+        // No pipe is ever created for this session: if the client tried to connect, it would
+        // hang until ConnectTimeoutSeconds and report a timeout, not an "ambiguous" message.
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "an ambiguous cursor must be a transport-level failure");
+        Assert(stderr.ToString().Contains("ambiguous", StringComparison.OrdinalIgnoreCase), "the refusal must clearly say the cursor is ambiguous");
+        Assert(!stderr.ToString().Contains("Timed out", StringComparison.Ordinal), "the refusal must happen before any connection attempt");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliRefusesWhenSequenceCursorDoesNotMatchVerbWithoutTouchingThePipe()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+
+        // The cursor is clean at sequence 1 (c0-start), but c1-query expects 2: no pipe is
+        // ever created for this session, so a connection attempt would hang until timeout.
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("c1-query", ["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "a sequence mismatch must be a transport-level failure");
+        Assert(stderr.ToString().Contains("expects sequence 2", StringComparison.Ordinal), "the refusal must explain the mismatch");
+        Assert(!stderr.ToString().Contains("Timed out", StringComparison.Ordinal), "the refusal must happen before any connection attempt");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliFailsCleanlyWhenSequenceCursorContentIsCorrupt()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+        File.WriteAllText(C012SessionPaths.SessionSequencePath(directory), "not-a-number", System.Text.Encoding.UTF8);
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "a corrupt sequence cursor must fail closed, not crash or guess");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliLeavesSequenceCursorPendingWhenResponseIsLost()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        C012SessionSequenceCursor.InitializeAtSessionStart(directory);
+
+        string pipeName = C012SessionPaths.DerivePipeName(sessionId);
+        using var serverPipe = new NamedPipeServerStream(
+            pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        Task serverTask = Task.Run(async () =>
+        {
+            await serverPipe.WaitForConnectionAsync().ConfigureAwait(false);
+            // Reads exactly one request frame -- so the request genuinely arrived -- then
+            // disconnects without ever writing a response.
+            _ = await C012FrameCodec.ReadFrameAsync(serverPipe, CancellationToken.None).ConfigureAwait(false);
+            serverPipe.Disconnect();
+        });
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], stdout, stderr);
+        serverTask.GetAwaiter().GetResult();
+
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "a lost response must be a transport-level failure");
+
+        C012SessionSequenceState? state = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(state is { Pending: true, SequenceNumber: 1 }, "the cursor must be left pending at sequence 1 after a lost response");
+
+        // A second attempt must refuse locally, without ever touching the pipe again (there
+        // is no listener left for it to reach).
+        using var secondStdout = new StringWriter();
+        using var secondStderr = new StringWriter();
+        int secondExitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], secondStdout, secondStderr);
+        Assert(secondExitCode == C012ClientCli.ExitTransportFailure, "a subsequent attempt on an ambiguous cursor must also fail");
+        Assert(secondStderr.ToString().Contains("ambiguous", StringComparison.OrdinalIgnoreCase), "the second refusal must also cite ambiguity");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void HostCliStartupRollsBackAllFourSessionFilesWhenSecretSaveFails()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        // Occupies session.secret's path with a directory: File.Exists (used by the
+        // pre-flight "already contains a session" check) reports false for a directory, so
+        // the atomic startup block is entered -- but File.Move inside C012SessionSecret.Save
+        // still fails deterministically once it tries to move a file onto that path.
+        Directory.CreateDirectory(C012SessionPaths.SessionSecretPath(directory));
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012HostCli.Run(["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012HostCli.ExitStartupFailure, "a failed atomic startup must be a startup failure");
+        Assert(!File.Exists(C012SessionPaths.SessionIdPath(directory)), "session.id must be rolled back");
+        Assert(!File.Exists(C012SessionPaths.SessionSequencePath(directory)), "session.sequence must be rolled back");
+        Assert(!File.Exists(C012SessionPaths.SessionSequenceLockPath(directory)), "session.sequence.lock must be rolled back");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void HostAndClientRealNamedPipeAcceptsFullC0ThroughC2WithFakeLauncherAndSequenceCursor()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        var launcher = new FakeRootProcessLauncher();
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(["--session-dir", directory], hostOut, hostErr, launcher));
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start must be accepted");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int c1ExitCode, string c1Report) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query must be accepted");
+        Assert(c1Report.Contains("resulting_state=C1Retained", StringComparison.Ordinal), "c1-query must reach C1Retained");
+
+        (int c2ExitCode, string c2Report) = RunClientWithRetries("c2-submit", directory);
+        Assert(c2ExitCode == C012ClientCli.ExitAccepted, "c2-submit must be accepted");
+        Assert(c2Report.Contains("resulting_state=Terminated", StringComparison.Ordinal), "c2-submit must reach Terminated");
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitTerminated, "the host must exit with the Terminated code");
+
+        C012SessionSequenceState? finalState = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(finalState is { Pending: false, SequenceNumber: 4 }, "after three accepted steps the cursor must show 4");
     }
     finally
     {
