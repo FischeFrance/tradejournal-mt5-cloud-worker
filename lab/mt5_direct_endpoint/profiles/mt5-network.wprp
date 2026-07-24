@@ -41,8 +41,7 @@
       Name="MT5DirectEndpoint"
       Description="Process, image, TCP/IP and DNS evidence for the MT5 direct-endpoint lab"
       DetailLevel="Verbose"
-      LoggingMode="File"
-      Strict="true">
+      LoggingMode="File">
       <ProblemCategories>
         <ProblemCategory Value="First Level Triage" />
       </ProblemCategories>
@@ -63,8 +62,7 @@
       Name="MT5DirectEndpoint"
       Description="Process, image, TCP/IP and DNS evidence for the MT5 direct-endpoint lab"
       DetailLevel="Verbose"
-      LoggingMode="Memory"
-      Strict="true">
+      LoggingMode="Memory">
       <ProblemCategories>
         <ProblemCategory Value="First Level Triage" />
       </ProblemCategories>
