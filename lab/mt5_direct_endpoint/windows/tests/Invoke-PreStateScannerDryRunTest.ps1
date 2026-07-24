@@ -12,25 +12,27 @@ function Assert-True {
 }
 
 $scanner = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Get-LabPreState.ps1'))
-$scannerArguments = @(
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-File', $scanner,
-    '-Mode', 'PlanOnly',
-    '-PortableRoot', 'C:\TJLab\DRYRUN_ONLY\terminal'
-)
 
-# Get-LabPreState writes its CLI JSON directly to Console.Out. Execute it as a
-# child Windows PowerShell process so stdout can be captured exactly as an
-# external caller would observe it, without changing the scanner's output
-# contract or mixing PowerShell success-stream objects into the JSON.
-$rawLines = & powershell.exe @scannerArguments
-$scannerExitCode = $LASTEXITCODE
-if ($scannerExitCode -ne 0) {
-    throw ('SCANNER_PROCESS_FAILED_' + $scannerExitCode)
+# Get-LabPreState writes its CLI JSON directly to Console.Out instead of the
+# PowerShell success stream. Redirect Console.Out in-process so the test can
+# capture exactly that JSON without spawning powershell.exe, which is
+# intentionally forbidden by the lab's AST safety self-test.
+$originalConsoleOut = [Console]::Out
+$capturedConsoleOut = New-Object IO.StringWriter
+try {
+    [Console]::SetOut($capturedConsoleOut)
+    try {
+        & $scanner -Mode PlanOnly -PortableRoot 'C:\TJLab\DRYRUN_ONLY\terminal'
+    }
+    finally {
+        [Console]::SetOut($originalConsoleOut)
+    }
+    $raw = $capturedConsoleOut.ToString()
+}
+finally {
+    $capturedConsoleOut.Dispose()
 }
 
-$raw = [string]::Join([Environment]::NewLine, [string[]]@($rawLines))
 if ([string]::IsNullOrWhiteSpace($raw)) {
     throw 'SCANNER_STDOUT_EMPTY'
 }
