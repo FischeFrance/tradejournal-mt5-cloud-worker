@@ -794,7 +794,8 @@ function Get-LabPlanOnlyChecks {
         $pathHash = if ($id -in @('portable_storage_local_fixed', 'portable_root_exists', 'portable_inventory_complete', 'reparse_points_absent')) { $rootHash } else { $null }
         $checks.Add((New-LabPreStateCheck -Id $id -Status UNKNOWN -PathHash $pathHash -ReasonCode 'NOT_EXECUTED_PLAN_ONLY'))
     }
-    return @($checks)
+    [object[]]$checksArray = $checks.ToArray()
+    return $checksArray
 }
 
 function Get-LabReadOnlyChecks {
@@ -1005,11 +1006,12 @@ function Get-LabReadOnlyChecks {
         $checks.Add((New-LabPreStateCheck -Id 'sensitive_bootstrap_absent' -Status PASS -Clean $true -Count 0 -Digest $sensitiveDigest -PathHash $private.PathHash -ReasonCode 'SENSITIVE_BOOTSTRAP_ABSENT'))
     }
 
-    if ($checks.Count -ne $script:CheckIds.Count) { throw 'INTERNAL_CHECK_COUNT_MISMATCH' }
+    [object[]]$checksArray = $checks.ToArray()
+    if ($checksArray.Count -ne $script:CheckIds.Count) { throw 'INTERNAL_CHECK_COUNT_MISMATCH' }
     foreach ($id in $script:CheckIds) {
-        [void](Get-LabCheckById -Checks @($checks) -Id $id)
+        [void](Get-LabCheckById -Checks $checksArray -Id $id)
     }
-    return @($checks)
+    return $checksArray
 }
 
 $selectedChecks = if ($Mode -ceq 'PlanOnly') {
