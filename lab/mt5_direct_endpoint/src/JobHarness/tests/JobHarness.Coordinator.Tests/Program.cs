@@ -1338,6 +1338,64 @@ static void DriveC1ToRetained(C012OrchestratingProcessor processor, Guid session
     Assert(result.Accepted && result.ResultingState == C012State.C1Retained, "setup: C1 must reach C1Retained");
 }
 
+// ---- shared helpers ----
+
+// Builds a fresh C012ServerChannel bound to a single MemoryStream pre-loaded with one
+// crafted, signed request, invokes it, then (for a processed request) seeks back to right
+// after the request bytes to read and parse whatever response the server wrote there. One
+// MemoryStream is enough because the server only ever reads then writes sequentially -- no
+// real duplex concurrency is needed to exercise C012ServerChannel in isolation.
+static void ExchangeSingleRequest(
+    C012SessionSecret serverSecret, C012RequestSequencer sequencer, C012SessionSecret signingSecret,
+    Guid sessionId, long sequenceNumber, C012Control control, C012RequestType requestType,
+    out C012ChannelOutcome outcome, out C012WireResponse? response, bool expectNoResponse = false)
+{
+    string hmac = C012MessageAuthenticator.SignRequest(
+        signingSecret.Value, C012WireSchema.Version, sessionId, sequenceNumber, control, requestType);
+    var request = new C012WireRequest(C012WireSchema.Version, sessionId, sequenceNumber, control, requestType, hmac);
+    byte[] requestBytes = JsonSerializer.SerializeToUtf8Bytes(request, C012WireJsonOptions.Instance);
+
+    var stream = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(stream, requestBytes, CancellationToken.None).GetAwaiter().GetResult();
+    long requestEnd = stream.Position;
+    stream.Position = 0;
+
+    var server = new C012ServerChannel(stream, serverSecret, sequencer);
+    outcome = server.ProcessNextRequestAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    response = null;
+    if (!expectNoResponse && outcome == C012ChannelOutcome.RequestProcessed)
+    {
+        stream.Position = requestEnd;
+        byte[]? responseFrame = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+        Assert(responseFrame is not null, "a processed request must be followed by a response frame");
+        response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame!, C012WireJsonOptions.Instance);
+    }
+}
+
+static string CreateTemporaryDirectory()
+{
+    string path = Path.Combine(Path.GetTempPath(), $"c012-secret-test-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(path);
+    return path;
+}
+
+// Safety net for the client/server round-trip tests: if the deterministic ordering they
+// rely on is ever wrong, this turns a hang into a fast, clearly-reported failure instead of
+// exhausting the CI job's 25-minute ceiling.
+static CancellationToken ShortTestTimeout() => new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token;
+
+static void Assert(bool condition, string message)
+{
+    if (!condition)
+    {
+        throw new InvalidOperationException(message);
+    }
+}
+
+// ---- fakes and test-only types (must follow every top-level statement/local function
+// above: C# requires all top-level statements in a file to precede any type declaration) ----
+
 internal sealed class FakeRootProcessLauncher : IC012RootProcessLauncher
 {
     public List<string> Calls { get; } = new();
@@ -1432,61 +1490,6 @@ internal sealed class FakeRootProcessLauncher : IC012RootProcessLauncher
         Calls.Add(nameof(TeardownJob));
         TeardownJobCallCount++;
         TeardownJobFault?.Invoke();
-    }
-}
-
-// ---- shared helpers ----
-
-// Builds a fresh C012ServerChannel bound to a single MemoryStream pre-loaded with one
-// crafted, signed request, invokes it, then (for a processed request) seeks back to right
-// after the request bytes to read and parse whatever response the server wrote there. One
-// MemoryStream is enough because the server only ever reads then writes sequentially -- no
-// real duplex concurrency is needed to exercise C012ServerChannel in isolation.
-static void ExchangeSingleRequest(
-    C012SessionSecret serverSecret, C012RequestSequencer sequencer, C012SessionSecret signingSecret,
-    Guid sessionId, long sequenceNumber, C012Control control, C012RequestType requestType,
-    out C012ChannelOutcome outcome, out C012WireResponse? response, bool expectNoResponse = false)
-{
-    string hmac = C012MessageAuthenticator.SignRequest(
-        signingSecret.Value, C012WireSchema.Version, sessionId, sequenceNumber, control, requestType);
-    var request = new C012WireRequest(C012WireSchema.Version, sessionId, sequenceNumber, control, requestType, hmac);
-    byte[] requestBytes = JsonSerializer.SerializeToUtf8Bytes(request, C012WireJsonOptions.Instance);
-
-    var stream = new MemoryStream();
-    C012FrameCodec.WriteFrameAsync(stream, requestBytes, CancellationToken.None).GetAwaiter().GetResult();
-    long requestEnd = stream.Position;
-    stream.Position = 0;
-
-    var server = new C012ServerChannel(stream, serverSecret, sequencer);
-    outcome = server.ProcessNextRequestAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-    response = null;
-    if (!expectNoResponse && outcome == C012ChannelOutcome.RequestProcessed)
-    {
-        stream.Position = requestEnd;
-        byte[]? responseFrame = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
-        Assert(responseFrame is not null, "a processed request must be followed by a response frame");
-        response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame!, C012WireJsonOptions.Instance);
-    }
-}
-
-static string CreateTemporaryDirectory()
-{
-    string path = Path.Combine(Path.GetTempPath(), $"c012-secret-test-{Guid.NewGuid():N}");
-    Directory.CreateDirectory(path);
-    return path;
-}
-
-// Safety net for the client/server round-trip tests: if the deterministic ordering they
-// rely on is ever wrong, this turns a hang into a fast, clearly-reported failure instead of
-// exhausting the CI job's 25-minute ceiling.
-static CancellationToken ShortTestTimeout() => new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token;
-
-static void Assert(bool condition, string message)
-{
-    if (!condition)
-    {
-        throw new InvalidOperationException(message);
     }
 }
 
