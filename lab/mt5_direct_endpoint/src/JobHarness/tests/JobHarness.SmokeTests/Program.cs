@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -57,6 +58,8 @@ var tests = new (string Name, Action Body)[]
     ("target_lease_blocks_write_on_windows", TargetLeaseBlocksWriteOnWindows),
     ("optional_windows_actual_launch_remains_hard_disabled", OptionalWindowsActualLaunchRemainsHardDisabled),
     ("optional_windows_descendant_smoke_remains_hard_disabled", OptionalWindowsDescendantSmokeRemainsHardDisabled),
+    ("optional_windows_jobobject_natural_exit_runtime_smoke", OptionalWindowsJobObjectNaturalExitRuntimeSmoke),
+    ("optional_windows_jobobject_descendant_timeout_runtime_smoke", OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke),
 };
 
 int failures = 0;
@@ -656,6 +659,132 @@ static void OptionalWindowsDescendantSmokeRemainsHardDisabled()
     });
 }
 
+static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
+{
+    if (!LiveWindowsRuntimeSmokeEnabled())
+    {
+        return;
+    }
+
+    string systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
+        ?? throw new InvalidOperationException("SystemRoot is unavailable.");
+    string cmd = Path.Combine(systemRoot, "System32", "cmd.exe");
+    WithTemporaryDirectory(directory =>
+    {
+        using var lease = TargetExecutableLease.Open(cmd);
+        string metadataPath = Path.Combine(directory, "metadata.json");
+
+        var options = new LaunchOptions(
+            cmd,
+            ["/d", "/c", "exit", "0"],
+            Path.GetDirectoryName(cmd)!,
+            metadataPath,
+            ComputeSha256(cmd),
+            Guid.NewGuid().ToString("D"),
+            "RUNTIME_SMOKE",
+            null,
+            ExecuteRequested: false,
+            DryRun: false,
+            NoWindow: true,
+            ConfirmMetaTraderLaunch: false,
+            AllowedSignerSubjects: [],
+            AllowedSignerThumbprints: []);
+
+        HarnessMetadata metadata = HarnessMetadataFactory.Create(options, lease, "S-1-5-18");
+        metadata.Status = HarnessStatus.Validated;
+        using var writer = new MetadataWriter(metadataPath);
+
+        JobRunResult result = JobObjectRunner.Run(options, metadata, writer);
+        Assert(result.ExitCode == 0, "natural exit runtime smoke exit code");
+        Assert(metadata.Status == HarnessStatus.Completed, "natural exit runtime status");
+        Assert(metadata.Process.RootPid is not null, "natural exit root pid");
+        Assert(metadata.Process.PrimaryThreadId is not null, "natural exit primary thread id");
+        Assert(metadata.Process.WindowsSessionId is not null, "natural exit session id");
+        Assert(metadata.Process.KernelCreationUtc is not null, "natural exit kernel creation utc");
+        Assert(metadata.Process.CreatedSuspended, "natural exit created suspended");
+        Assert(metadata.Process.AssignedBeforeResume, "natural exit assigned before resume");
+        Assert(metadata.Process.ResumePreviousSuspendCount == 1, "natural exit resume suspend count");
+        Assert(metadata.JobPolicy.KillOnJobCloseVerified == true, "natural exit kill_on_job_close_verified");
+        Assert(metadata.JobPolicy.BreakawayAllowed == false, "natural exit breakaway flag false");
+        Assert(metadata.JobPolicy.SilentBreakawayAllowed == false, "natural exit silent breakaway flag false");
+        Assert(metadata.ProcessResult.JobTotalProcesses >= 1, "natural exit job process count");
+        Assert(!metadata.ProcessResult.TimedOut, "natural exit timed out false");
+        Assert(!metadata.ProcessResult.Cancelled, "natural exit cancelled false");
+        Assert(metadata.ProcessResult.PrimaryExitCode == 0u, "natural exit primary exit code");
+        Assert(metadata.LaunchPolicy.ActualLaunchCapability == "HARD_DISABLED", "natural exit hard-disabled launch policy");
+
+        string json = File.ReadAllText(metadataPath, Encoding.UTF8);
+        Assert(!json.Contains("/d", StringComparison.Ordinal), "natural exit metadata omitted /d");
+        Assert(!json.Contains("/c", StringComparison.Ordinal), "natural exit metadata omitted /c");
+        Assert(!json.Contains("exit 0", StringComparison.Ordinal), "natural exit metadata omitted command line");
+        Assert(!json.Contains("password", StringComparison.OrdinalIgnoreCase), "natural exit metadata no password");
+        Assert(!json.Contains("login", StringComparison.OrdinalIgnoreCase), "natural exit metadata no login");
+        Assert(!json.Contains("token", StringComparison.OrdinalIgnoreCase), "natural exit metadata no token");
+    });
+}
+
+static void OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke()
+{
+    if (!LiveWindowsRuntimeSmokeEnabled())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    WithTemporaryDirectory(directory =>
+    {
+        string metadataPath = Path.Combine(directory, "metadata.json");
+        string childReadyPath = Path.Combine(directory, "child-ready.txt");
+        var arguments = new List<string> { "--innocent-process-tree", childReadyPath };
+        using var lease = TargetExecutableLease.Open(executable);
+        var options = new LaunchOptions(
+            executable,
+            arguments,
+            Path.GetDirectoryName(executable)!,
+            metadataPath,
+            ComputeSha256(executable),
+            Guid.NewGuid().ToString("D"),
+            "RUNTIME_SMOKE_TIMEOUT",
+            TimeSpan.FromSeconds(6),
+            false,
+            false,
+            true,
+            false,
+            [],
+            []);
+
+        HarnessMetadata metadata = HarnessMetadataFactory.Create(options, lease, "S-1-5-18");
+        metadata.Status = HarnessStatus.Validated;
+        using var writer = new MetadataWriter(metadataPath);
+
+        JobRunResult result = JobObjectRunner.Run(options, metadata, writer);
+        Assert(result.ExitCode == 124, "descendant timeout runtime smoke exit code");
+        Assert(metadata.Status == HarnessStatus.TimedOut, "descendant timeout status");
+        Assert(metadata.ProcessResult.TimedOut, "descendant timeout metadata timed out");
+        Assert(!metadata.ProcessResult.Cancelled, "descendant timeout cancelled false");
+        Assert(metadata.ProcessResult.JobTotalProcesses >= 2, "descendant timeout job process count");
+        Assert(metadata.Process.CreatedSuspended, "descendant created suspended");
+        Assert(metadata.Process.AssignedBeforeResume, "descendant assigned before resume");
+        Assert(metadata.Process.ResumePreviousSuspendCount == 1, "descendant resume suspend count");
+        Assert(metadata.JobPolicy.KillOnJobCloseVerified == true, "descendant kill_on_job_close_verified");
+        Assert(metadata.JobPolicy.BreakawayAllowed == false, "descendant breakaway flag false");
+        Assert(metadata.JobPolicy.SilentBreakawayAllowed == false, "descendant silent breakaway flag false");
+
+        (int childPid, long childStartTime) = ParseChildReadyRecord(childReadyPath);
+        Assert(
+            WaitUntilProcessHasTerminatedOrChanged(
+                childPid,
+                childStartTime,
+                TimeSpan.FromSeconds(5)),
+            "descendant child process did not terminate");
+        Assert(
+            WaitUntilProcessNotFound(
+                metadata.Process.RootPid!.Value,
+                TimeSpan.FromSeconds(5)),
+            "descendant root process did not terminate");
+    });
+}
+
 static HarnessRuntime CreateFakeWindowsRuntime(
     LaunchProbe launchProbe,
     AuthenticodeVerification? authenticodeVerification = null) =>
@@ -718,6 +847,81 @@ static void WithTemporaryDirectory(Action<string> body)
 static bool LiveWindowsSmokeEnabled() =>
     OperatingSystem.IsWindows()
     && Environment.GetEnvironmentVariable("JOBHARNESS_RUN_LIVE_SMOKE") == "1";
+
+static bool LiveWindowsRuntimeSmokeEnabled() =>
+    OperatingSystem.IsWindows()
+    && Environment.GetEnvironmentVariable("JOBHARNESS_RUN_RUNTIME_SMOKE") == "1";
+
+static (int ChildPid, long ChildStartTime) ParseChildReadyRecord(string path)
+{
+    string raw = File.ReadAllText(path, Encoding.UTF8).Trim();
+    Assert(!string.IsNullOrWhiteSpace(raw), "child ready record exists");
+    string[] parts = raw.Split('|', 2, StringSplitOptions.RemoveEmptyEntries);
+    Assert(parts.Length == 2, "child ready record has pid and start time");
+
+    bool parsedPid = int.TryParse(parts[0], out int pid);
+    bool parsedStartTime = long.TryParse(parts[1], out long startTime);
+    Assert(parsedPid, "child pid parsed from ready record");
+    Assert(parsedStartTime, "child start time parsed from ready record");
+
+    return (pid, startTime);
+}
+
+static bool WaitUntilProcessNotFound(int? processId, TimeSpan timeout)
+{
+    if (processId is null)
+    {
+        return true;
+    }
+
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < timeout)
+    {
+        if (Process.GetProcesses().All(process => process.Id != processId.Value))
+        {
+            return true;
+        }
+
+        Thread.Sleep(50);
+    }
+
+    return false;
+}
+
+static bool WaitUntilProcessHasTerminatedOrChanged(int processId, long expectedStartTime, TimeSpan timeout)
+{
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < timeout)
+    {
+        Process? process = Process.GetProcesses().FirstOrDefault(process => process.Id == processId);
+        if (process is null)
+        {
+            return true;
+        }
+
+        using (process)
+        {
+            long observedStartTime;
+            try
+            {
+                observedStartTime = process.StartTime.ToUniversalTime().Ticks;
+            }
+            catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+            {
+                return true;
+            }
+
+            if (observedStartTime != expectedStartTime)
+            {
+                return true;
+            }
+        }
+
+        Thread.Sleep(50);
+    }
+
+    return false;
+}
 
 static ProcessStartInfo CreateSelfStartInfo(params string[] childArguments)
 {
