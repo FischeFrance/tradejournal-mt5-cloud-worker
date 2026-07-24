@@ -52,10 +52,7 @@ public sealed class C012InnocuousRootProcessLauncher : IC012RootProcessLauncher
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedSha256Hex);
         ArgumentNullException.ThrowIfNull(rootArguments);
         ArgumentNullException.ThrowIfNull(submitterArguments);
-        if (submitterWaitTimeout <= TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(nameof(submitterWaitTimeout));
-        }
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(submitterWaitTimeout, TimeSpan.Zero);
 
         string fileName = Path.GetFileName(executablePath);
         if (BlockedFileNames.Any(blocked => fileName.Equals(blocked, StringComparison.OrdinalIgnoreCase)))
@@ -276,7 +273,7 @@ public sealed class C012InnocuousRootProcessLauncher : IC012RootProcessLauncher
         }
     }
 
-    private void Assign(C012JobToken job, C012ProcessToken token)
+    private static void Assign(C012JobToken job, C012ProcessToken token)
     {
         SafeJobHandle jobHandle = Unwrap<SafeJobHandle>(job.NativeHandle);
         NativeProcessState state = Unwrap<NativeProcessState>(token.NativeHandle);
