@@ -206,7 +206,16 @@ public static class C012HostCli
         security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
         security.AddAccessRule(new PipeAccessRule(currentUser, PipeAccessRights.ReadWrite, AccessControlType.Allow));
 
-        return new NamedPipeServerStream(
+        // Verified signature (System.IO.Pipes.AccessControl, NamedPipeServerStreamAcl.Create):
+        // https://learn.microsoft.com/en-us/dotnet/api/system.io.pipes.namedpipeserverstreamacl.create
+        // Create(string pipeName, PipeDirection direction, int maxNumberOfServerInstances,
+        //   PipeTransmissionMode transmissionMode, PipeOptions options, int inBufferSize,
+        //   int outBufferSize, PipeSecurity? pipeSecurity,
+        //   HandleInheritability inheritability = HandleInheritability.None,
+        //   PipeAccessRights additionalAccessRights = 0)
+        // inheritability is passed explicitly even though it matches the default: the
+        // pipe handle must never be inheritable by a future child process.
+        return NamedPipeServerStreamAcl.Create(
             pipeName,
             PipeDirection.InOut,
             1,
@@ -214,7 +223,8 @@ public static class C012HostCli
             PipeOptions.Asynchronous,
             PipeBufferSize,
             PipeBufferSize,
-            security);
+            security,
+            HandleInheritability.None);
     }
 
     private static string? ParseSessionDir(string[] args)
