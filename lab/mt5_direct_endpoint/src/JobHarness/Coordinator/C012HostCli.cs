@@ -209,11 +209,11 @@ public static class C012HostCli
         return new NamedPipeServerStream(
             pipeName,
             PipeDirection.InOut,
-            maxNumberOfServerInstances: 1,
+            1,
             PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous,
-            inBufferSize: PipeBufferSize,
-            outBufferSize: PipeBufferSize,
+            PipeBufferSize,
+            PipeBufferSize,
             security);
     }
 
