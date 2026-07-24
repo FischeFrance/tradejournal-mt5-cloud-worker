@@ -877,20 +877,35 @@ static void ClientServerRoundTripHappyPathOverDuplexStreams()
     Assert(clientResult.ResultingState == C012State.C0JobCreating, "client must observe the resulting state");
 }
 
+// Deliberately bypasses C012ServerChannel: a real server signs requests and responses with
+// the same shared secret, so a client/server secret mismatch fails the *request* and, by
+// design, the server sends no response frame at all for an unauthenticated request -- the
+// client would then hang forever waiting for a reply that structurally cannot arrive (this
+// is exactly what the 10-second safety timeout above caught: OperationCanceledException,
+// not C012FramingException, in the version of this test that made that mistake). To test
+// "client rejects a wrongly-signed response" specifically, the request must be left
+// unanswered by any real server and instead answered by hand with a forged response signed
+// under a different secret than the client holds.
 static void ClientRejectsResponseWithWrongHmac()
 {
     using C012SessionSecret clientSecret = C012SessionSecret.Generate();
-    using C012SessionSecret serverSecret = C012SessionSecret.Generate();
+    byte[] wrongSecret = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
     Guid sessionId = Guid.NewGuid();
-    var sequencer = new C012RequestSequencer(sessionId);
 
     using DuplexPair pair = DuplexPair.Create();
-    var server = new C012ServerChannel(pair.ServerStream, serverSecret, sequencer);
     var client = new C012ClientChannel(pair.ClientStream, clientSecret, sessionId);
 
-    CancellationToken timeout = ShortTestTimeout();
-    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, timeout);
-    C012ChannelOutcome serverOutcome = server.ProcessNextRequestAsync(timeout).GetAwaiter().GetResult();
+    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, ShortTestTimeout());
+
+    byte[]? requestFrame = C012FrameCodec.ReadFrameAsync(pair.ServerStream, ShortTestTimeout()).GetAwaiter().GetResult();
+    Assert(requestFrame is not null, "setup: the client must have written a request");
+
+    string forgedHmac = C012MessageAuthenticator.SignResponse(
+        wrongSecret, C012WireSchema.Version, sessionId, 1, true, C012State.C0JobCreating, C012RejectionReason.None);
+    var forgedResponse = new C012WireResponse(
+        C012WireSchema.Version, sessionId, 1, true, C012State.C0JobCreating, C012RejectionReason.None, forgedHmac);
+    byte[] forgedResponseBytes = JsonSerializer.SerializeToUtf8Bytes(forgedResponse, C012WireJsonOptions.Instance);
+    C012FrameCodec.WriteFrameAsync(pair.ServerStream, forgedResponseBytes, ShortTestTimeout()).GetAwaiter().GetResult();
 
     bool threw = false;
     try
@@ -902,8 +917,7 @@ static void ClientRejectsResponseWithWrongHmac()
         threw = true;
     }
 
-    Assert(threw, "the client must refuse a response signed with the wrong secret");
-    Assert(serverOutcome == C012ChannelOutcome.AuthenticationFailed, "server must also reject the mismatched request");
+    Assert(threw, "the client must refuse a response signed with a secret it does not hold");
 }
 
 static void ClientKeepsSameSequenceSlotAfterServerRejection()
