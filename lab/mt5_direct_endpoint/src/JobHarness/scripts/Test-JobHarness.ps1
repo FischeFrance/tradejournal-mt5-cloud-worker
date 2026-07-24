@@ -13,6 +13,9 @@ $testDirectory = Join-Path $testsRoot 'JobHarness.SmokeTests'
 $testProject = Join-Path $testDirectory 'JobHarness.SmokeTests.csproj'
 
 dotnet build $testProject --configuration Release --nologo
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet build failed with exit code $LASTEXITCODE."
+}
 
 $previousLiveSmoke = [Environment]::GetEnvironmentVariable('JOBHARNESS_RUN_LIVE_SMOKE', 'Process')
 Remove-Item Env:\JOBHARNESS_RUN_LIVE_SMOKE -ErrorAction SilentlyContinue
@@ -37,6 +40,9 @@ try {
     }
 
     dotnet run --project $testProject --configuration Release --no-build
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet run failed with exit code $LASTEXITCODE."
+    }
 }
 finally {
     if ($null -eq $previousLiveSmoke) {

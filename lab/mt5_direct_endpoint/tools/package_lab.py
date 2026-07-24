@@ -8,6 +8,9 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
+if os.name == "nt":
+    import msvcrt  # type: ignore
+
 
 LAB_RELATIVE_ROOT = Path("lab/mt5_direct_endpoint")
 EXCLUDED_DIRECTORY_NAMES = frozenset(
@@ -190,6 +193,7 @@ def build_archive(
                     stat.S_IFREG | (source.stat().st_mode & 0o777)
                 ) << 16
                 archive.writestr(info, source.read_bytes())
+
         with zipfile.ZipFile(temporary, "r") as archive:
             actual_names = tuple(archive.namelist())
             if len(actual_names) != len(set(actual_names)):
@@ -201,12 +205,24 @@ def build_archive(
                 raise ValueError(
                     f"review archive integrity failure: {corrupt_member}"
                 )
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
 
-        # Same-directory hard-link publication is atomic and create-only.
-        # It cannot replace an existing file or follow a final symlink.
-        os.link(temporary, target)
+            read_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            write_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(
+                os.fspath(temporary),
+                write_flags if os.name == "nt" else read_flags,
+            )
+            try:
+                if os.name == "nt":
+                    msvcrt._commit(descriptor)
+                else:
+                    os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+            # Same-directory hard-link publication is atomic and create-only.
+            # It cannot replace an existing file or follow a final symlink.
+            os.link(temporary, target)
     finally:
         try:
             temporary.unlink()
