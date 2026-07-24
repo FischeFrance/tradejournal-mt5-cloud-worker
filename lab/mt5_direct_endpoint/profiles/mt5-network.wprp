@@ -18,12 +18,6 @@
       <FlushTimer Value="1" />
     </EventCollector>
 
-    <EventCollector Id="MT5LabMemoryEventCollector" Name="MT5 Lab Event Collector (Memory)">
-      <BufferSize Value="256" />
-      <Buffers Value="128" />
-      <FlushTimer Value="1" />
-    </EventCollector>
-
     <SystemProvider Id="MT5LabSystemProvider">
       <Keywords>
         <Keyword Value="ProcessThread" />
@@ -63,25 +57,5 @@
       </Collectors>
     </Profile>
 
-    <Profile
-      Id="MT5DirectEndpoint.Verbose.Memory"
-      Name="MT5DirectEndpoint"
-      Description="Process, image, TCP/IP and DNS evidence for the MT5 direct-endpoint lab"
-      DetailLevel="Verbose"
-      LoggingMode="Memory">
-      <ProblemCategories>
-        <ProblemCategory Value="First Level Triage" />
-      </ProblemCategories>
-      <Collectors>
-        <SystemCollectorId Value="MT5LabSystemCollector">
-          <SystemProviderId Value="MT5LabSystemProvider" />
-        </SystemCollectorId>
-        <EventCollectorId Value="MT5LabMemoryEventCollector">
-          <EventProviders>
-            <EventProviderId Value="MT5LabDnsClientProvider" />
-          </EventProviders>
-        </EventCollectorId>
-      </Collectors>
-    </Profile>
   </Profiles>
 </WindowsPerformanceRecorder>
