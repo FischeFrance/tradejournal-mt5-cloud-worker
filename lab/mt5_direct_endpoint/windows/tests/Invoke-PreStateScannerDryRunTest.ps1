@@ -12,7 +12,28 @@ function Assert-True {
 }
 
 $scanner = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Get-LabPreState.ps1'))
-$raw = & $scanner -Mode PlanOnly -PortableRoot 'C:\TJLab\DRYRUN_ONLY\terminal'
+$scannerArguments = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', $scanner,
+    '-Mode', 'PlanOnly',
+    '-PortableRoot', 'C:\TJLab\DRYRUN_ONLY\terminal'
+)
+
+# Get-LabPreState writes its CLI JSON directly to Console.Out. Execute it as a
+# child Windows PowerShell process so stdout can be captured exactly as an
+# external caller would observe it, without changing the scanner's output
+# contract or mixing PowerShell success-stream objects into the JSON.
+$rawLines = & powershell.exe @scannerArguments
+$scannerExitCode = $LASTEXITCODE
+if ($scannerExitCode -ne 0) {
+    throw ('SCANNER_PROCESS_FAILED_' + $scannerExitCode)
+}
+
+$raw = [string]::Join([Environment]::NewLine, [string[]]@($rawLines))
+if ([string]::IsNullOrWhiteSpace($raw)) {
+    throw 'SCANNER_STDOUT_EMPTY'
+}
 $report = $raw | ConvertFrom-Json
 
 Assert-True ($report.schema_version -eq 1) 'SCHEMA_VERSION'
@@ -34,4 +55,3 @@ Assert-True ($raw -notmatch [regex]::Escape('C:\TJLab\DRYRUN_ONLY\terminal')) 'R
 Assert-True ($raw -notmatch '(?i)password|bearer|account_number|proxyserver') 'NO_SECRET_FIELDS'
 
 [Console]::Out.WriteLine('PASS: pre-state scanner PlanOnly dry-run is non-mutating and sanitized.')
-
