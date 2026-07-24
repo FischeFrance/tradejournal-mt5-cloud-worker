@@ -18,6 +18,18 @@
       <FlushTimer Value="1" />
     </EventCollector>
 
+    <SystemCollector Id="MT5LabMemorySystemCollector" Name="NT Kernel Logger (Memory)">
+      <BufferSize Value="1024" />
+      <Buffers Value="128" />
+      <FlushTimer Value="1" />
+    </SystemCollector>
+
+    <EventCollector Id="MT5LabMemoryEventCollector" Name="MT5 Lab Event Collector (Memory)">
+      <BufferSize Value="256" />
+      <Buffers Value="128" />
+      <FlushTimer Value="1" />
+    </EventCollector>
+
     <SystemProvider Id="MT5LabSystemProvider">
       <Keywords>
         <Keyword Value="ProcessThread" />
@@ -67,10 +79,10 @@
         <ProblemCategory Value="First Level Triage" />
       </ProblemCategories>
       <Collectors>
-        <SystemCollectorId Value="MT5LabSystemCollector">
+        <SystemCollectorId Value="MT5LabMemorySystemCollector">
           <SystemProviderId Value="MT5LabSystemProvider" />
         </SystemCollectorId>
-        <EventCollectorId Value="MT5LabEventCollector">
+        <EventCollectorId Value="MT5LabMemoryEventCollector">
           <EventProviders>
             <EventProviderId Value="MT5LabDnsClientProvider" />
           </EventProviders>
