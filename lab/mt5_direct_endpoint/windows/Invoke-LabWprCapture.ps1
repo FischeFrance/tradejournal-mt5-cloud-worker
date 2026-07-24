@@ -10,7 +10,7 @@ param(
 
     [string]$EvidenceDirectory = 'C:\TJLab\evidence',
 
-    [string]$ProfilePath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'profiles\mt5-network.wprp'),
+    [string]$ProfilePath = '',
 
     [switch]$Execute,
 
@@ -19,6 +19,23 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw 'Impossibile risolvere ProfilePath: PSScriptRoot è assente.'
+    }
+
+    $labRoot = Split-Path -Path $PSScriptRoot -Parent
+    if ([string]::IsNullOrWhiteSpace($labRoot)) {
+        throw 'Impossibile risolvere la directory del laboratorio a partire da PSScriptRoot.'
+    }
+
+    if (-not (Test-Path -LiteralPath $labRoot -PathType Container)) {
+        throw "Lab root non valido o non disponibile: '$labRoot'."
+    }
+
+    $ProfilePath = Join-Path $labRoot 'profiles\mt5-network.wprp'
+}
 
 Import-Module (Join-Path $PSScriptRoot 'MT5DirectEndpoint.Lab.psm1') -Force
 Assert-LabRunId -RunId $RunId
