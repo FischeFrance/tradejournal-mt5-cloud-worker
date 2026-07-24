@@ -23,6 +23,54 @@ if (args is ["--innocent-exit-zero"])
     return 0;
 }
 
+// B4.4: same idea as the two flags above, but each also writes its own PID and kernel start
+// time to a caller-supplied ready file before doing anything else -- the only way a test
+// process can learn the real PID of a root/submitter launched by a separate, real host
+// process it does not share memory with. Format matches JobHarness.SmokeTests'
+// --innocent-child ("pid|start-time-ticks") for consistency, though this is a private,
+// project-local convention -- nothing reads across the two test projects.
+if (args is ["--innocent-ready-then-sleep", var readyPathForSleep])
+{
+    WriteReadyRecord(readyPathForSleep);
+    System.Threading.Thread.Sleep(TimeSpan.FromSeconds(30));
+    return 0;
+}
+
+if (args is ["--innocent-ready-then-exit", var readyPathForExit])
+{
+    WriteReadyRecord(readyPathForExit);
+    return 0;
+}
+
+// B4.4: the only way a test spawns a genuinely separate Windows process that hosts a real
+// C012 session with the real (innocuous-only) launcher. c012-host start itself never gains
+// this capability -- Program.cs (the production JobHarness.exe entry point) has no branch
+// like this one and never will; this exists solely inside the test executable, reusing the
+// already-existing, already test-only 5-argument C012HostCli.Run overload from B4.3/B4.4.
+if (args.Length > 0 && args[0] == "--run-real-host-for-testing")
+{
+    string sessionDirForRealHost = RequireNamedArg(args, "--session-dir");
+    string executableForRealHost = RequireNamedArg(args, "--executable");
+    string expectedSha256ForRealHost = RequireNamedArg(args, "--expected-sha256");
+    string rootReadyPathForRealHost = RequireNamedArg(args, "--root-ready-path");
+    int idleTimeoutSecondsForRealHost = int.Parse(
+        RequireNamedArg(args, "--idle-timeout-seconds"), System.Globalization.CultureInfo.InvariantCulture);
+
+    var realHostLauncher = new C012InnocuousRootProcessLauncher(
+        executableForRealHost,
+        expectedSha256ForRealHost,
+        SelfInvocationArguments(executableForRealHost, "--innocent-ready-then-sleep", rootReadyPathForRealHost),
+        SelfInvocationArguments(executableForRealHost, "--innocent-exit-zero"),
+        TimeSpan.FromSeconds(10));
+
+    return C012HostCli.Run(
+        ["--session-dir", sessionDirForRealHost],
+        Console.Out,
+        Console.Error,
+        realHostLauncher,
+        TimeSpan.FromSeconds(idleTimeoutSecondsForRealHost));
+}
+
 var tests = new (string Name, Action Body)[]
 {
     ("happy_path_c0_through_c2_reaches_terminated", HappyPathReachesTerminated),
@@ -150,6 +198,15 @@ var tests = new (string Name, Action Body)[]
     ("client_cli_leaves_sequence_cursor_pending_when_response_is_lost", ClientCliLeavesSequenceCursorPendingWhenResponseIsLost),
     ("host_cli_startup_rolls_back_all_four_session_files_when_secret_save_fails", HostCliStartupRollsBackAllFourSessionFilesWhenSecretSaveFails),
     ("host_and_client_real_named_pipe_accepts_full_c0_through_c2_with_fake_launcher_and_sequence_cursor", HostAndClientRealNamedPipeAcceptsFullC0ThroughC2WithFakeLauncherAndSequenceCursor),
+
+    // B4.4: real host process crash, real timeouts, real severed connections (Windows-only)
+    ("real_host_process_crash_kills_root_via_kill_on_job_close", RealHostProcessCrashKillsRootViaKillOnJobClose),
+    ("real_host_idle_timeout_before_any_connection_fails_closed_without_launching_root", RealHostIdleTimeoutBeforeAnyConnectionFailsClosedWithoutLaunchingRoot),
+    ("real_host_idle_timeout_after_c0_tears_down_root_and_fails_closed", RealHostIdleTimeoutAfterC0TearsDownRootAndFailsClosed),
+    ("real_submitter_timeout_during_c2_fails_closed_and_kills_submitter_and_root", RealSubmitterTimeoutDuringC2FailsClosedAndKillsSubmitterAndRoot),
+    ("raw_malformed_request_before_any_mutation_leaves_session_fully_usable", RawMalformedRequestBeforeAnyMutationLeavesSessionFullyUsable),
+    ("severed_connection_during_c1_does_not_allow_duplicate_acceptance_on_real_server", SeveredConnectionDuringC1DoesNotAllowDuplicateAcceptanceOnRealServer),
+    ("severed_connection_during_c2_still_tears_down_root_and_submitter_on_real_server", SeveredConnectionDuringC2StillTearsDownRootAndSubmitterOnRealServer),
 };
 
 int failures = 0;
@@ -2238,7 +2295,541 @@ static void HostAndClientRealNamedPipeAcceptsFullC0ThroughC2WithFakeLauncherAndS
     }
 }
 
-static IReadOnlyList<string> SelfInvocationArguments(string executable, string innocentFlag)
+// ---- B4.4: real host process crash, real timeouts, real severed connections (Windows-only;
+// each test returns immediately elsewhere) ----
+
+static void RealHostProcessCrashKillsRootViaKillOnJobClose()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    string rootReadyPath = Path.Combine(directory, "root-ready.txt");
+    Process? hostProcess = null;
+    try
+    {
+        hostProcess = StartRealHostProcessForCrashTest(directory, rootReadyPath, idleTimeoutSeconds: 30);
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start against the separate real host process must be accepted");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int rootPid, _) = WaitForReadyRecord(rootReadyPath, TimeSpan.FromSeconds(10));
+        Assert(IsProcessRunning((uint)rootPid), "the root must be running before the host process is killed");
+
+        // entireProcessTree:false is required, not incidental: .NET's tree-kill would hunt
+        // down and terminate the root process directly, which would make this test pass for
+        // the wrong reason. The root must die *only* because the Job's last handle -- owned
+        // solely by the host process -- closed when that process was terminated.
+        hostProcess.Kill(entireProcessTree: false);
+        Assert(hostProcess.WaitForExit(TimeSpan.FromSeconds(10)), "the killed host process must actually exit");
+
+        Assert(
+            WaitUntilProcessIdIsGone((uint)rootPid, TimeSpan.FromSeconds(10)),
+            "the root must be gone after the host process was killed, via KILL_ON_JOB_CLOSE alone");
+
+        // A hard kill gives the host's own finally block (which deletes session.secret) no
+        // chance to run: unlike every other B4.4 scenario, this is not a graceful exit.
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: false);
+        C012SessionSequenceState? finalState = C012SessionSequenceCursor.TryReadSnapshot(directory);
+        Assert(finalState is { Pending: false, SequenceNumber: 2 }, "the cursor must reflect the one confirmed, accepted c0-start");
+    }
+    finally
+    {
+        if (hostProcess is { HasExited: false })
+        {
+            hostProcess.Kill(entireProcessTree: false);
+        }
+
+        hostProcess?.Dispose();
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void RealHostIdleTimeoutBeforeAnyConnectionFailsClosedWithoutLaunchingRoot()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    var launcher = new C012InnocuousRootProcessLauncher(
+        executable,
+        ComputeSha256(executable),
+        SelfInvocationArguments(executable, "--innocent-sleeper"),
+        SelfInvocationArguments(executable, "--innocent-exit-zero"),
+        TimeSpan.FromSeconds(10));
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        int hostExitCode = C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(3));
+
+        Assert(hostExitCode == C012HostCli.ExitFailedClosed, "an idle timeout before any connection must fail closed");
+        Assert(launcher.RootProcessId is null, "the root must never be launched if no connection ever arrives");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void RealHostIdleTimeoutAfterC0TearsDownRootAndFailsClosed()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    string directory = CreateTemporaryDirectory();
+    string rootReadyPath = Path.Combine(directory, "root-ready.txt");
+    try
+    {
+        var launcher = new C012InnocuousRootProcessLauncher(
+            executable,
+            ComputeSha256(executable),
+            SelfInvocationArguments(executable, "--innocent-ready-then-sleep", rootReadyPath),
+            SelfInvocationArguments(executable, "--innocent-exit-zero"),
+            TimeSpan.FromSeconds(10));
+
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(3)));
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start must be accepted before the idle timeout is exercised");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int rootPid, _) = WaitForReadyRecord(rootReadyPath, TimeSpan.FromSeconds(10));
+
+        // No c1-query is ever attempted: the host's own idle timeout must fire while sitting
+        // in C0Retained, waiting for a connection that never comes.
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitFailedClosed, "an idle timeout after C0 must fail closed");
+
+        Assert(
+            WaitUntilProcessIdIsGone((uint)rootPid, TimeSpan.FromSeconds(10)),
+            "the root must be torn down once the session fails closed on idle timeout");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void RealSubmitterTimeoutDuringC2FailsClosedAndKillsSubmitterAndRoot()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    string directory = CreateTemporaryDirectory();
+    string rootReadyPath = Path.Combine(directory, "root-ready.txt");
+    string submitterReadyPath = Path.Combine(directory, "submitter-ready.txt");
+    try
+    {
+        var launcher = new C012InnocuousRootProcessLauncher(
+            executable,
+            ComputeSha256(executable),
+            SelfInvocationArguments(executable, "--innocent-ready-then-sleep", rootReadyPath),
+            // The submitter deliberately never exits on its own: this is what forces
+            // ResumeAndAwaitSubmitter's own WaitForSingleObject timeout (already implemented
+            // in B4.3, unmodified here) to fire for real.
+            SelfInvocationArguments(executable, "--innocent-ready-then-sleep", submitterReadyPath),
+            TimeSpan.FromSeconds(2));
+
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(30)));
+
+        (int c0ExitCode, _) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start must be accepted");
+        (int rootPid, _) = WaitForReadyRecord(rootReadyPath, TimeSpan.FromSeconds(10));
+
+        (int c1ExitCode, _) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query must be accepted");
+
+        (int c2ExitCode, string c2Report) = RunClientWithRetries("c2-submit", directory);
+        Assert(c2ExitCode == C012ClientCli.ExitRejected, "c2-submit must be rejected once the submitter times out");
+        Assert(
+            c2Report.Contains("resulting_state=FailedClosed", StringComparison.Ordinal),
+            "the session must fail closed on a real submitter timeout");
+
+        (int submitterPid, _) = WaitForReadyRecord(submitterReadyPath, TimeSpan.FromSeconds(10));
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitFailedClosed, "the host must exit with the FailedClosed code");
+
+        Assert(
+            WaitUntilProcessIdIsGone((uint)submitterPid, TimeSpan.FromSeconds(10)),
+            "the submitter must be killed by teardown after its own timeout");
+        Assert(
+            WaitUntilProcessIdIsGone((uint)rootPid, TimeSpan.FromSeconds(10)),
+            "the root must also be killed: teardown closes the whole Job, not just the submitter");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void RawMalformedRequestBeforeAnyMutationLeavesSessionFullyUsable()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        var launcher = new C012InnocuousRootProcessLauncher(
+            executable,
+            ComputeSha256(executable),
+            SelfInvocationArguments(executable, "--innocent-sleeper"),
+            SelfInvocationArguments(executable, "--innocent-exit-zero"),
+            TimeSpan.FromSeconds(10));
+
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(10)));
+
+        string pipeName = WaitForPipeName(directory, TimeSpan.FromSeconds(10));
+        SendRawMalformedFrameAndDisconnect(pipeName);
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "a real c0-start after a raw malformed attempt must still be accepted normally");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int c1ExitCode, _) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query must also proceed normally afterward");
+
+        (int c2ExitCode, string c2Report) = RunClientWithRetries("c2-submit", directory);
+        Assert(c2ExitCode == C012ClientCli.ExitAccepted, "c2-submit must also proceed normally afterward");
+        Assert(c2Report.Contains("resulting_state=Terminated", StringComparison.Ordinal), "the session must terminate normally");
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitTerminated, "the host must exit with the Terminated code");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SeveredConnectionDuringC1DoesNotAllowDuplicateAcceptanceOnRealServer()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    string directory = CreateTemporaryDirectory();
+    string rootReadyPath = Path.Combine(directory, "root-ready.txt");
+    try
+    {
+        var launcher = new C012InnocuousRootProcessLauncher(
+            executable,
+            ComputeSha256(executable),
+            SelfInvocationArguments(executable, "--innocent-ready-then-sleep", rootReadyPath),
+            SelfInvocationArguments(executable, "--innocent-exit-zero"),
+            TimeSpan.FromSeconds(10));
+
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(10)));
+
+        (int c0ExitCode, _) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start must be accepted");
+        (int rootPid, _) = WaitForReadyRecord(rootReadyPath, TimeSpan.FromSeconds(10));
+
+        Guid sessionId = C012SessionPaths.Inspect(directory).SessionId!.Value;
+        using (C012SessionSecret secret = C012SessionSecret.Load(C012SessionPaths.SessionSecretPath(directory)))
+        {
+            string pipeName = C012SessionPaths.DerivePipeName(sessionId);
+
+            // A real, correctly-signed C1 request against the real, fully-functioning host --
+            // severed immediately after the request is sent, before any response is read.
+            SendRawSignedRequest(pipeName, secret, sessionId, 2, C012Control.C1, C012RequestType.Query, readResponse: false);
+
+            // A duplicate at the same, already-consumed sequence number must be rejected:
+            // proof that the real server's FSM genuinely advanced from the severed attempt
+            // and was never re-executed.
+            C012TransitionResult? duplicate = SendRawSignedRequest(
+                pipeName, secret, sessionId, 2, C012Control.C1, C012RequestType.Query, readResponse: true);
+            Assert(duplicate is { Accepted: false }, "a duplicate C1 at the already-consumed sequence must be rejected");
+
+            // The correct next sequence number (C2) is still accepted: proof the real server
+            // is in a sane, coherent state, not stuck or corrupted by the severed connection.
+            C012TransitionResult? next = SendRawSignedRequest(
+                pipeName, secret, sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig, readResponse: true);
+            Assert(
+                next is { Accepted: true, ResultingState: C012State.Terminated },
+                "the real server must still accept the correct next request after the severed connection");
+        }
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(
+            hostExitCode == C012HostCli.ExitTerminated,
+            "the host must reach Terminated: C1 (via the severed-but-processed request) and C2 both genuinely succeeded server-side");
+
+        Assert(WaitUntilProcessIdIsGone((uint)rootPid, TimeSpan.FromSeconds(10)), "the root must be gone after the real teardown");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SeveredConnectionDuringC2StillTearsDownRootAndSubmitterOnRealServer()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    string directory = CreateTemporaryDirectory();
+    string rootReadyPath = Path.Combine(directory, "root-ready.txt");
+    string submitterReadyPath = Path.Combine(directory, "submitter-ready.txt");
+    try
+    {
+        var launcher = new C012InnocuousRootProcessLauncher(
+            executable,
+            ComputeSha256(executable),
+            SelfInvocationArguments(executable, "--innocent-ready-then-sleep", rootReadyPath),
+            SelfInvocationArguments(executable, "--innocent-ready-then-exit", submitterReadyPath),
+            TimeSpan.FromSeconds(10));
+
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(
+            ["--session-dir", directory], hostOut, hostErr, launcher, TimeSpan.FromSeconds(15)));
+
+        (int c0ExitCode, _) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start must be accepted");
+        (int rootPid, _) = WaitForReadyRecord(rootReadyPath, TimeSpan.FromSeconds(10));
+
+        (int c1ExitCode, _) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query must be accepted");
+
+        Guid sessionId = C012SessionPaths.Inspect(directory).SessionId!.Value;
+        using (C012SessionSecret secret = C012SessionSecret.Load(C012SessionPaths.SessionSecretPath(directory)))
+        {
+            string pipeName = C012SessionPaths.DerivePipeName(sessionId);
+
+            // A real, correctly-signed C2 request against the real, fully-functioning host --
+            // severed immediately after the request is sent. The server keeps running the
+            // real submitter-launch/wait/teardown sequence regardless of whether the client
+            // is still there to see the outcome.
+            SendRawSignedRequest(pipeName, secret, sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig, readResponse: false);
+        }
+
+        (int submitterPid, _) = WaitForReadyRecord(submitterReadyPath, TimeSpan.FromSeconds(10));
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(
+            hostExitCode == C012HostCli.ExitTerminated,
+            "the real server must still reach Terminated even though the client never read the C2 response");
+
+        Assert(WaitUntilProcessIdIsGone((uint)submitterPid, TimeSpan.FromSeconds(10)), "the submitter must have run and be gone");
+        Assert(WaitUntilProcessIdIsGone((uint)rootPid, TimeSpan.FromSeconds(10)), "the root must be gone after real teardown");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static Process StartRealHostProcessForCrashTest(string sessionDir, string rootReadyPath, int idleTimeoutSeconds)
+{
+    string executable = RequireCurrentExecutable();
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = executable,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+    };
+
+    if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+    {
+        startInfo.ArgumentList.Add(Assembly.GetExecutingAssembly().Location);
+    }
+
+    startInfo.ArgumentList.Add("--run-real-host-for-testing");
+    startInfo.ArgumentList.Add("--session-dir");
+    startInfo.ArgumentList.Add(sessionDir);
+    startInfo.ArgumentList.Add("--executable");
+    startInfo.ArgumentList.Add(executable);
+    startInfo.ArgumentList.Add("--expected-sha256");
+    startInfo.ArgumentList.Add(ComputeSha256(executable));
+    startInfo.ArgumentList.Add("--root-ready-path");
+    startInfo.ArgumentList.Add(rootReadyPath);
+    startInfo.ArgumentList.Add("--idle-timeout-seconds");
+    startInfo.ArgumentList.Add(idleTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+    return Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start the real host process for testing.");
+}
+
+static string RequireNamedArg(string[] args, string flag)
+{
+    for (int index = 0; index < args.Length - 1; index++)
+    {
+        if (args[index] == flag)
+        {
+            return args[index + 1];
+        }
+    }
+
+    throw new InvalidOperationException($"Missing required argument {flag} for --run-real-host-for-testing.");
+}
+
+static void WriteReadyRecord(string path)
+{
+    using Process current = Process.GetCurrentProcess();
+    File.WriteAllText(
+        path, $"{Environment.ProcessId}|{current.StartTime.ToUniversalTime().Ticks}", System.Text.Encoding.UTF8);
+}
+
+static (int Pid, long StartTimeTicks) WaitForReadyRecord(string path, TimeSpan timeout)
+{
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < timeout)
+    {
+        if (File.Exists(path))
+        {
+            string raw = File.ReadAllText(path, System.Text.Encoding.UTF8).Trim();
+            string[] parts = raw.Split('|', 2, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 2 && int.TryParse(parts[0], out int pid) && long.TryParse(parts[1], out long startTicks))
+            {
+                return (pid, startTicks);
+            }
+        }
+
+        System.Threading.Thread.Sleep(50);
+    }
+
+    throw new InvalidOperationException($"Ready record at '{path}' did not appear within {timeout}.");
+}
+
+static string WaitForPipeName(string directory, TimeSpan timeout)
+{
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < timeout)
+    {
+        if (C012SessionPaths.Inspect(directory).SessionId is { } sessionId)
+        {
+            return C012SessionPaths.DerivePipeName(sessionId);
+        }
+
+        System.Threading.Thread.Sleep(50);
+    }
+
+    throw new InvalidOperationException($"session.id never appeared under '{directory}' within {timeout}.");
+}
+
+// Bypasses C012ServerChannel/C012FrameCodec's own well-formedness by writing a completely
+// unrelated (but still correctly length-prefixed) payload -- so the server can fully read the
+// frame per its length header but fails to parse it as a C012WireRequest, which is the
+// well-formed-frame-but-invalid-content path already proven at the unit level in B3
+// (server_channel_rejects_malformed_frame_without_mutating_sequencer). An actually truncated
+// frame is deliberately avoided here: the server's exact behavior for a header cut off
+// mid-read is not something this test needs to depend on.
+static void SendRawMalformedFrameAndDisconnect(string pipeName)
+{
+    using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+    using var connectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    pipe.ConnectAsync(connectTimeout.Token).GetAwaiter().GetResult();
+    byte[] garbagePayload = System.Text.Encoding.UTF8.GetBytes("not-a-valid-wire-request");
+    C012FrameCodec.WriteFrameAsync(pipe, garbagePayload, CancellationToken.None).GetAwaiter().GetResult();
+}
+
+// Hand-signs and hand-frames a request exactly like C012ClientChannel does internally, but
+// against a real NamedPipeClientStream instead of an abstract Stream, and with full control
+// over whether the response is ever read -- readResponse:false disposes the pipe immediately
+// after the request is sent, simulating a client that dies or loses its connection right
+// after a fully-formed, correctly-signed request left its hands but before any response
+// arrives. C012ServerChannel.ProcessNextRequestAsync applies the request (mutating the real
+// server's FSM) before it ever attempts to write the response, so this always exercises a
+// real mutation on the real server, never a no-op.
+static C012TransitionResult? SendRawSignedRequest(
+    string pipeName,
+    C012SessionSecret secret,
+    Guid sessionId,
+    long sequenceNumber,
+    C012Control control,
+    C012RequestType requestType,
+    bool readResponse)
+{
+    string hmac = C012MessageAuthenticator.SignRequest(secret.Value, C012WireSchema.Version, sessionId, sequenceNumber, control, requestType);
+    var request = new C012WireRequest(C012WireSchema.Version, sessionId, sequenceNumber, control, requestType, hmac);
+    byte[] requestBytes = JsonSerializer.SerializeToUtf8Bytes(request, C012WireJsonOptions.Instance);
+
+    using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+    using var connectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    pipe.ConnectAsync(connectTimeout.Token).GetAwaiter().GetResult();
+    C012FrameCodec.WriteFrameAsync(pipe, requestBytes, CancellationToken.None).GetAwaiter().GetResult();
+
+    if (!readResponse)
+    {
+        return null;
+    }
+
+    byte[]? responseFrame = C012FrameCodec.ReadFrameAsync(pipe, CancellationToken.None).GetAwaiter().GetResult();
+    Assert(responseFrame is not null, "the real server must respond to a well-formed, correctly-sequenced raw request");
+    C012WireResponse? response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame!, C012WireJsonOptions.Instance);
+    Assert(response is not null, "the raw response must parse as a well-formed C012WireResponse");
+    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response!), "the raw response must be authentically signed");
+    return new C012TransitionResult(response!.Accepted, response!.ResultingState, response!.Reason);
+}
+
+// Shared final-verification step for every B4.4 scenario: session.id is a permanent record
+// and must never disappear; session.sequence must always remain present and parseable, never
+// corrupted, regardless of how the scenario ended; session.secret is deleted only on a
+// graceful exit (the host's own finally block does that) -- a hard Kill() gives that finally
+// block no chance to run, so expectSecretDeleted must be false for the one crash scenario.
+// Root/submitter liveness is scenario-specific (different tests know different PIDs) and is
+// asserted separately by each test, not here.
+static void AssertSessionFullyTornDown(string directory, bool expectSecretDeleted)
+{
+    Assert(File.Exists(C012SessionPaths.SessionIdPath(directory)), "session.id must remain present as a permanent record");
+    if (expectSecretDeleted)
+    {
+        Assert(!File.Exists(C012SessionPaths.SessionSecretPath(directory)), "session.secret must be deleted once the host loop exits gracefully");
+    }
+
+    C012SessionSequenceState? sequenceState = C012SessionSequenceCursor.TryReadSnapshot(directory);
+    Assert(sequenceState is not null, "session.sequence must still be present and parseable, never corrupted");
+}
+
+static IReadOnlyList<string> SelfInvocationArguments(string executable, params string[] trailingArguments)
 {
     var arguments = new List<string>();
     if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
@@ -2246,7 +2837,7 @@ static IReadOnlyList<string> SelfInvocationArguments(string executable, string i
         arguments.Add(Assembly.GetExecutingAssembly().Location);
     }
 
-    arguments.Add(innocentFlag);
+    arguments.AddRange(trailingArguments);
     return arguments;
 }
 

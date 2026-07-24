@@ -25,16 +25,25 @@ public static class C012HostCli
     private const int PipeBufferSize = 4096;
 
     public static int Run(string[] args, TextWriter output, TextWriter error) =>
-        RunAsync(args, output, error, new C012NotImplementedRootProcessLauncher()).GetAwaiter().GetResult();
+        RunAsync(args, output, error, new C012NotImplementedRootProcessLauncher(), TimeSpan.FromSeconds(DefaultIdleTimeoutSeconds))
+            .GetAwaiter().GetResult();
 
     // Test-only entry point: identical to the 3-argument overload except that the caller
-    // supplies the launcher instead of always getting C012NotImplementedRootProcessLauncher.
-    // Not called from Program.cs and not reachable from any CLI argument a user could type.
-    public static int Run(string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher) =>
-        RunAsync(args, output, error, launcher).GetAwaiter().GetResult();
+    // supplies the launcher instead of always getting C012NotImplementedRootProcessLauncher,
+    // and may optionally shorten the idle timeout (still 300s by default) so Windows-only
+    // tests can exercise real timeout behavior without waiting minutes. Not called from
+    // Program.cs and not reachable from any CLI argument a user could type.
+    public static int Run(
+        string[] args,
+        TextWriter output,
+        TextWriter error,
+        IC012RootProcessLauncher launcher,
+        TimeSpan? idleTimeout = null) =>
+        RunAsync(args, output, error, launcher, idleTimeout ?? TimeSpan.FromSeconds(DefaultIdleTimeoutSeconds))
+            .GetAwaiter().GetResult();
 
     private static async Task<int> RunAsync(
-        string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher)
+        string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher, TimeSpan idleTimeout)
     {
         ArgumentNullException.ThrowIfNull(args);
         ArgumentNullException.ThrowIfNull(output);
@@ -126,7 +135,7 @@ public static class C012HostCli
         int exitCode;
         try
         {
-            exitCode = await ListenLoopAsync(pipe, secret, processor, sequencer).ConfigureAwait(false);
+            exitCode = await ListenLoopAsync(pipe, secret, processor, sequencer, idleTimeout).ConfigureAwait(false);
         }
         finally
         {
@@ -142,16 +151,17 @@ public static class C012HostCli
         NamedPipeServerStream pipe,
         C012SessionSecret secret,
         C012OrchestratingProcessor processor,
-        C012RequestSequencer sequencer)
+        C012RequestSequencer sequencer,
+        TimeSpan idleTimeout)
     {
-        using var idleTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(DefaultIdleTimeoutSeconds));
+        using var idleTimeoutSource = new CancellationTokenSource(idleTimeout);
         int consecutiveUnproductiveFailures = 0;
 
         while (sequencer.CurrentState is not C012State.Terminated and not C012State.FailedClosed)
         {
             try
             {
-                await pipe.WaitForConnectionAsync(idleTimeout.Token).ConfigureAwait(false);
+                await pipe.WaitForConnectionAsync(idleTimeoutSource.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -163,7 +173,7 @@ public static class C012HostCli
             C012ChannelOutcome outcome;
             try
             {
-                outcome = await channel.ProcessNextRequestAsync(idleTimeout.Token).ConfigureAwait(false);
+                outcome = await channel.ProcessNextRequestAsync(idleTimeoutSource.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
