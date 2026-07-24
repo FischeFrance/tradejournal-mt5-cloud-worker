@@ -696,7 +696,7 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
             ["--innocent-exit-zero"],
             Path.GetDirectoryName(executable)!,
             metadataPath,
-            ComputeSha256(cmd),
+            ComputeSha256(executable),
             Guid.NewGuid().ToString("D"),
             "RUNTIME_SMOKE",
             null,
