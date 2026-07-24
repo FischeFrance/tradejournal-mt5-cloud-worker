@@ -84,6 +84,32 @@ var tests = new (string Name, Action Body)[]
     ("orchestrating_processor_c2_fails_when_teardown_throws_and_does_not_double_teardown", OrchestratingProcessorC2FailsWhenTeardownThrowsAndDoesNotDoubleTeardown),
     ("orchestrating_processor_never_calls_launcher_once_failed_closed", OrchestratingProcessorNeverCallsLauncherOnceFailedClosed),
     ("orchestrating_processor_rejects_illegal_request_without_touching_launcher", OrchestratingProcessorRejectsIllegalRequestWithoutTouchingLauncher),
+
+    // B4.2: session paths
+    ("session_paths_derive_pipe_name_is_deterministic_and_unique_per_session", SessionPathsDerivePipeNameIsDeterministicAndUniquePerSession),
+    ("session_paths_write_and_read_session_id_round_trips", SessionPathsWriteAndReadSessionIdRoundTrips),
+    ("session_paths_write_session_id_refuses_to_overwrite", SessionPathsWriteSessionIdRefusesToOverwrite),
+    ("session_paths_inspect_reports_missing_directory", SessionPathsInspectReportsMissingDirectory),
+    ("session_paths_inspect_reports_empty_directory", SessionPathsInspectReportsEmptyDirectory),
+    ("session_paths_inspect_reports_full_session", SessionPathsInspectReportsFullSession),
+
+    // B4.2: placeholder launcher
+    ("not_implemented_launcher_causes_c0_to_fail_closed_via_operation_failed", NotImplementedLauncherCausesC0ToFailClosedViaOperationFailed),
+
+    // B4.2: client CLI
+    ("client_cli_status_reports_missing_directory_without_claiming_liveness", ClientCliStatusReportsMissingDirectoryWithoutClaimingLiveness),
+    ("client_cli_status_reports_full_session_without_claiming_liveness", ClientCliStatusReportsFullSessionWithoutClaimingLiveness),
+    ("client_cli_requires_session_dir_flag", ClientCliRequiresSessionDirFlag),
+    ("client_cli_rejects_unknown_verb", ClientCliRejectsUnknownVerb),
+
+    // B4.2: host CLI
+    ("host_cli_requires_session_dir_flag", HostCliRequiresSessionDirFlag),
+    ("host_cli_refuses_when_session_dir_missing", HostCliRefusesWhenSessionDirMissing),
+    ("host_cli_refuses_when_session_already_exists", HostCliRefusesWhenSessionAlreadyExists),
+
+    // B4.2: real Named Pipe (Windows-only)
+    ("host_and_client_real_named_pipe_round_trip_reaches_failed_closed_via_placeholder_launcher", HostAndClientRealNamedPipeRoundTripReachesFailedClosedViaPlaceholderLauncher),
+    ("client_cli_fails_cleanly_when_no_pipe_is_listening", ClientCliFailsCleanlyWhenNoPipeIsListening),
 };
 
 int failures = 0;
@@ -1336,6 +1362,336 @@ static void DriveC1ToRetained(C012OrchestratingProcessor processor, Guid session
     C012TransitionResult result = processor.Apply(
         new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
     Assert(result.Accepted && result.ResultingState == C012State.C1Retained, "setup: C1 must reach C1Retained");
+}
+
+// ---- B4.2: session paths ----
+
+static void SessionPathsDerivePipeNameIsDeterministicAndUniquePerSession()
+{
+    Guid sessionId = Guid.NewGuid();
+    string first = C012SessionPaths.DerivePipeName(sessionId);
+    string second = C012SessionPaths.DerivePipeName(sessionId);
+    Assert(first == second, "the same session id must always derive the same pipe name");
+
+    string other = C012SessionPaths.DerivePipeName(Guid.NewGuid());
+    Assert(first != other, "different session ids must derive different pipe names");
+}
+
+static void SessionPathsWriteAndReadSessionIdRoundTrips()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        Guid read = C012SessionPaths.ReadSessionId(directory);
+        Assert(read == sessionId, "the read session id must match what was written");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionPathsWriteSessionIdRefusesToOverwrite()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionPaths.WriteSessionId(directory, Guid.NewGuid());
+        bool threw = false;
+        try
+        {
+            C012SessionPaths.WriteSessionId(directory, Guid.NewGuid());
+        }
+        catch (IOException)
+        {
+            threw = true;
+        }
+
+        Assert(threw, "writing session.id a second time must be refused");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionPathsInspectReportsMissingDirectory()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"c012-missing-{Guid.NewGuid():N}");
+    C012SessionDirStatus status = C012SessionPaths.Inspect(directory);
+    Assert(!status.DirectoryExists, "a missing directory must report DirectoryExists=false");
+    Assert(!status.SessionIdFilePresent && !status.SessionSecretFilePresent, "no files can be present in a missing directory");
+    Assert(status.SessionId is null, "no session id can be read from a missing directory");
+}
+
+static void SessionPathsInspectReportsEmptyDirectory()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionDirStatus status = C012SessionPaths.Inspect(directory);
+        Assert(status.DirectoryExists, "an existing empty directory must report DirectoryExists=true");
+        Assert(!status.SessionIdFilePresent && !status.SessionSecretFilePresent, "an empty directory has no session files");
+        Assert(status.SessionId is null, "no session id in an empty directory");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionPathsInspectReportsFullSession()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        C012SessionDirStatus status = C012SessionPaths.Inspect(directory);
+        Assert(
+            status.DirectoryExists && status.SessionIdFilePresent && status.SessionSecretFilePresent,
+            "a fully-started session must report both files present");
+        Assert(status.SessionId == sessionId, "the reported session id must match what was written");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ---- B4.2: placeholder launcher ----
+
+static void NotImplementedLauncherCausesC0ToFailClosedViaOperationFailed()
+{
+    var launcher = new C012NotImplementedRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(!result.Accepted, "C0 through the placeholder launcher must never be accepted");
+    Assert(result.ResultingState == C012State.FailedClosed, "C0 through the placeholder launcher must fail closed");
+    Assert(result.Reason == C012RejectionReason.OperationFailed, "the reason must be OperationFailed");
+}
+
+// ---- B4.2: client CLI ----
+
+static void ClientCliStatusReportsMissingDirectoryWithoutClaimingLiveness()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"c012-status-missing-{Guid.NewGuid():N}");
+    using var stdout = new StringWriter();
+    using var stderr = new StringWriter();
+    int exitCode = C012ClientCli.Run("status", ["--session-dir", directory], stdout, stderr);
+
+    string report = stdout.ToString();
+    Assert(report.Contains("session_dir_valid=False", StringComparison.Ordinal), "must report the directory is not valid");
+    Assert(!report.Contains("alive", StringComparison.OrdinalIgnoreCase), "status must never claim liveness");
+    Assert(!report.Contains("listening", StringComparison.OrdinalIgnoreCase), "status must never claim the host is listening");
+    Assert(exitCode == C012ClientCli.ExitRejected, "a missing session must be reported as not-fully-present via the exit code");
+}
+
+static void ClientCliStatusReportsFullSessionWithoutClaimingLiveness()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("status", ["--session-dir", directory], stdout, stderr);
+
+        string report = stdout.ToString();
+        Assert(report.Contains($"session_id={sessionId:D}", StringComparison.Ordinal), "must report the actual session id");
+        Assert(report.Contains("session_id_file_present=True", StringComparison.Ordinal), "must report session.id presence");
+        Assert(report.Contains("session_secret_file_present=True", StringComparison.Ordinal), "must report session.secret presence");
+        Assert(!report.Contains("alive", StringComparison.OrdinalIgnoreCase), "status must never claim liveness");
+        Assert(!report.Contains("listening", StringComparison.OrdinalIgnoreCase), "status must never claim the host is listening");
+        Assert(exitCode == C012ClientCli.ExitAccepted, "a fully-present session reports exit code 0 from status");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliRequiresSessionDirFlag()
+{
+    using var stdout = new StringWriter();
+    using var stderr = new StringWriter();
+    int exitCode = C012ClientCli.Run("status", [], stdout, stderr);
+    Assert(exitCode == C012ClientCli.ExitTransportFailure, "a missing --session-dir must be a transport-level failure");
+    Assert(stderr.ToString().Contains("Usage", StringComparison.Ordinal), "must print a usage message");
+}
+
+static void ClientCliRejectsUnknownVerb()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("not-a-real-verb", ["--session-dir", directory], stdout, stderr);
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "an unknown verb must be a transport-level failure");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ---- B4.2: host CLI ----
+
+static void HostCliRequiresSessionDirFlag()
+{
+    using var stdout = new StringWriter();
+    using var stderr = new StringWriter();
+    int exitCode = C012HostCli.Run([], stdout, stderr);
+    Assert(exitCode == C012HostCli.ExitStartupFailure, "a missing --session-dir must be a startup failure");
+    Assert(stderr.ToString().Contains("Usage", StringComparison.Ordinal), "must print a usage message");
+}
+
+static void HostCliRefusesWhenSessionDirMissing()
+{
+    string directory = Path.Combine(Path.GetTempPath(), $"c012-host-missing-{Guid.NewGuid():N}");
+    using var stdout = new StringWriter();
+    using var stderr = new StringWriter();
+    int exitCode = C012HostCli.Run(["--session-dir", directory], stdout, stderr);
+    Assert(exitCode == C012HostCli.ExitStartupFailure, "a non-existent --session-dir must be a startup failure");
+}
+
+static void HostCliRefusesWhenSessionAlreadyExists()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        C012SessionPaths.WriteSessionId(directory, Guid.NewGuid());
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012HostCli.Run(["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012HostCli.ExitStartupFailure, "an already-populated --session-dir must be refused");
+        Assert(
+            !File.Exists(C012SessionPaths.SessionSecretPath(directory)),
+            "no secret may be written when refusing to reuse a session");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ---- B4.2: real Named Pipe (Windows-only; each test returns immediately elsewhere) ----
+
+static void HostAndClientRealNamedPipeRoundTripReachesFailedClosedViaPlaceholderLauncher()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(["--session-dir", directory], hostOut, hostErr));
+
+        (int clientExitCode, string report) = RunClientWithRetries("c0-start", directory);
+
+        Assert(
+            clientExitCode == C012ClientCli.ExitRejected,
+            "c0-start through the placeholder launcher must be rejected (not a transport failure)");
+        Assert(report.Contains("accepted=False", StringComparison.Ordinal), "the request must not be accepted");
+        Assert(report.Contains("resulting_state=FailedClosed", StringComparison.Ordinal), "the session must fail closed");
+        Assert(report.Contains("reason=OperationFailed", StringComparison.Ordinal), "the reason must be OperationFailed");
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitFailedClosed, "the host must exit with the FailedClosed code");
+        Assert(
+            !File.Exists(C012SessionPaths.SessionSecretPath(directory)),
+            "the secret file must be deleted once the session ends");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void ClientCliFailsCleanlyWhenNoPipeIsListening()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        // A fully-populated session directory with no pipe ever created for it stands in
+        // for "there is no live host to talk to" -- whether it crashed, was killed, or
+        // never started, the client-observable behavior is the same: no pipe instance for
+        // the OS to hand a connection to.
+        Guid sessionId = Guid.NewGuid();
+        C012SessionPaths.WriteSessionId(directory, sessionId);
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(C012SessionPaths.SessionSecretPath(directory));
+        }
+
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012ClientCli.Run("c0-start", ["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012ClientCli.ExitTransportFailure, "connecting when no pipe is listening must be a transport failure");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static (int ExitCode, string Report) RunClientWithRetries(string verb, string directory)
+{
+    Exception? lastFailure = null;
+    for (int attempt = 0; attempt < 50; attempt++)
+    {
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        try
+        {
+            int exitCode = C012ClientCli.Run(verb, ["--session-dir", directory], stdout, stderr);
+            if (exitCode != C012ClientCli.ExitTransportFailure)
+            {
+                return (exitCode, stdout.ToString());
+            }
+
+            lastFailure = new InvalidOperationException(stderr.ToString());
+        }
+        catch (Exception exception)
+        {
+            lastFailure = exception;
+        }
+
+        System.Threading.Thread.Sleep(100);
+    }
+
+    throw new InvalidOperationException("The host never became ready to accept a connection.", lastFailure);
 }
 
 // ---- shared helpers ----
