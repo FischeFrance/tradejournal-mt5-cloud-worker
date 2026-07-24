@@ -1,5 +1,5 @@
-using System.IO.Pipes;
 using System.Text.Json;
+using System.Threading.Channels;
 using TradeJournal.Lab.JobHarness.Coordinator;
 
 var tests = new (string Name, Action Body)[]
@@ -61,6 +61,10 @@ var tests = new (string Name, Action Body)[]
     ("client_server_round_trip_happy_path_over_duplex_streams", ClientServerRoundTripHappyPathOverDuplexStreams),
     ("client_rejects_response_with_wrong_hmac", ClientRejectsResponseWithWrongHmac),
     ("client_keeps_same_sequence_slot_after_server_rejection", ClientKeepsSameSequenceSlotAfterServerRejection),
+
+    // B3: duplex stream EOF/closure
+    ("channel_stream_read_returns_zero_after_writer_completes", ChannelStreamReadReturnsZeroAfterWriterCompletes),
+    ("duplex_pair_dispose_completes_both_channels_without_hanging", DuplexPairDisposeCompletesBothChannelsWithoutHanging),
 };
 
 int failures = 0;
@@ -920,6 +924,29 @@ static void ClientKeepsSameSequenceSlotAfterServerRejection()
     Assert(secondClientTask.Result.Accepted, "sequence slot 1 must still be usable after the earlier rejection");
 }
 
+// ---- B3: duplex stream EOF/closure ----
+
+static void ChannelStreamReadReturnsZeroAfterWriterCompletes()
+{
+    Channel<byte[]> channel = Channel.CreateUnbounded<byte[]>();
+    channel.Writer.Complete();
+
+    var stream = new ChannelStream(channel.Reader, channel.Writer);
+    int read = stream.ReadAsync(new byte[4], CancellationToken.None).GetAwaiter().GetResult();
+    Assert(read == 0, "reading an already-completed, empty channel must return 0, not hang");
+}
+
+static void DuplexPairDisposeCompletesBothChannelsWithoutHanging()
+{
+    var pair = DuplexPair.Create();
+    pair.Dispose();
+
+    int serverRead = pair.ServerStream.ReadAsync(new byte[4], CancellationToken.None).GetAwaiter().GetResult();
+    int clientRead = pair.ClientStream.ReadAsync(new byte[4], CancellationToken.None).GetAwaiter().GetResult();
+    Assert(serverRead == 0, "reading the server side after Dispose must return 0, not hang");
+    Assert(clientRead == 0, "reading the client side after Dispose must return 0, not hang");
+}
+
 // ---- shared helpers ----
 
 // Builds a fresh C012ServerChannel bound to a single MemoryStream pre-loaded with one
@@ -1019,21 +1046,23 @@ internal sealed class OneByteAtATimeStream : Stream
     }
 }
 
-// Wraps two unidirectional streams into one bidirectional Stream so C012ServerChannel and
-// C012ClientChannel -- which each expect a single duplex Stream, matching a real named pipe
-// -- can be tested talking to each other concurrently. Built from anonymous pipes (BCL,
-// no NuGet package, cross-platform) rather than a real named pipe: no ACL, no transport
-// beyond an in-process kernel buffer, deliberately kept as close to "in-memory" as a truly
-// duplex, genuinely async test stream can be.
-internal sealed class BidirectionalStream : Stream
+// One direction of an in-process duplex stream, backed by an unbounded
+// System.Threading.Channels.Channel<byte[]>. Genuinely async (WaitToReadAsync suspends and
+// resumes via the channel's own continuation, never blocking a thread), entirely in-memory,
+// with no OS pipe involved -- anonymous pipes were tried first and dropped because Windows
+// anonymous pipes do not support true overlapped/async I/O, which deadlocked the
+// server/client round trip below (the "async" read blocked the calling thread before the
+// paired write could ever run).
+internal sealed class ChannelStream : Stream
 {
-    private readonly Stream _readFrom;
-    private readonly Stream _writeTo;
+    private readonly ChannelReader<byte[]> _reader;
+    private readonly ChannelWriter<byte[]> _writer;
+    private ReadOnlyMemory<byte> _pending;
 
-    public BidirectionalStream(Stream readFrom, Stream writeTo)
+    public ChannelStream(ChannelReader<byte[]> reader, ChannelWriter<byte[]> writer)
     {
-        _readFrom = readFrom;
-        _writeTo = writeTo;
+        _reader = reader;
+        _writer = writer;
     }
 
     public override bool CanRead => true;
@@ -1050,13 +1079,36 @@ internal sealed class BidirectionalStream : Stream
         set => throw new NotSupportedException();
     }
 
-    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
-        _readFrom.ReadAsync(buffer, cancellationToken);
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (_pending.IsEmpty)
+        {
+            if (!await _reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return 0;
+            }
 
-    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
-        _writeTo.WriteAsync(buffer, cancellationToken);
+            if (!_reader.TryRead(out byte[]? chunk) || chunk is null)
+            {
+                return 0;
+            }
 
-    public override Task FlushAsync(CancellationToken cancellationToken) => _writeTo.FlushAsync(cancellationToken);
+            _pending = chunk;
+        }
+
+        int toCopy = Math.Min(buffer.Length, _pending.Length);
+        _pending.Span[..toCopy].CopyTo(buffer.Span);
+        _pending = _pending[toCopy..];
+        return toCopy;
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        ValueTask writeTask = _writer.WriteAsync(buffer.ToArray(), cancellationToken);
+        return writeTask;
+    }
+
+    public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
@@ -1066,23 +1118,25 @@ internal sealed class BidirectionalStream : Stream
 
     public override void SetLength(long value) => throw new NotSupportedException();
 
-    public override void Flush() => _writeTo.Flush();
+    public override void Flush()
+    {
+    }
 
+    // Completes this stream's own writer so the peer's ReadAsync -- pending or future --
+    // observes a clean 0/EOF via WaitToReadAsync returning false, instead of waiting
+    // forever. TryComplete (not Complete) is idempotent: safe if Dispose runs more than
+    // once.
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            _readFrom.Dispose();
-            _writeTo.Dispose();
+            _writer.TryComplete();
         }
 
         base.Dispose(disposing);
     }
 }
 
-// Disposing ServerStream/ClientStream is sufficient: each of the four underlying
-// AnonymousPipe streams is captured by exactly one of the two BidirectionalStream wrappers
-// (as either its read or write side), so no separate handle needs to be tracked here.
 internal sealed class DuplexPair : IDisposable
 {
     private DuplexPair(Stream serverStream, Stream clientStream)
@@ -1097,16 +1151,17 @@ internal sealed class DuplexPair : IDisposable
 
     public static DuplexPair Create()
     {
-        var clientToServerServer = new AnonymousPipeServerStream(PipeDirection.In);
-        var clientToServerClient = new AnonymousPipeClientStream(PipeDirection.Out, clientToServerServer.ClientSafePipeHandle);
-        var serverToClientServer = new AnonymousPipeServerStream(PipeDirection.Out);
-        var serverToClientClient = new AnonymousPipeClientStream(PipeDirection.In, serverToClientServer.ClientSafePipeHandle);
+        Channel<byte[]> clientToServer = Channel.CreateUnbounded<byte[]>();
+        Channel<byte[]> serverToClient = Channel.CreateUnbounded<byte[]>();
 
-        var serverStream = new BidirectionalStream(readFrom: clientToServerServer, writeTo: serverToClientServer);
-        var clientStream = new BidirectionalStream(readFrom: serverToClientClient, writeTo: clientToServerClient);
+        var serverStream = new ChannelStream(clientToServer.Reader, serverToClient.Writer);
+        var clientStream = new ChannelStream(serverToClient.Reader, clientToServer.Writer);
         return new DuplexPair(serverStream, clientStream);
     }
 
+    // Disposing both streams completes both writers, so a read on either side after
+    // Dispose observes EOF rather than hanging -- verified by
+    // duplex_pair_dispose_completes_both_channels_without_hanging.
     public void Dispose()
     {
         ServerStream.Dispose();
