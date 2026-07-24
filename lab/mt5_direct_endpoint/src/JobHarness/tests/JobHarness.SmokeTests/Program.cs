@@ -73,7 +73,19 @@ foreach ((string name, Action body) in tests)
     catch (Exception exception)
     {
         failures++;
-        Console.Error.WriteLine($"FAIL {name}: {exception.GetType().Name}");
+        if (exception is InvalidOperationException)
+        {
+            Console.Error.WriteLine(
+                $"FAIL {name}: {exception.GetType().Name}: {exception.Message}");
+            if (!string.IsNullOrWhiteSpace(exception.StackTrace))
+            {
+                Console.Error.WriteLine(exception.StackTrace);
+            }
+        }
+        else
+        {
+            Console.Error.WriteLine($"FAIL {name}: {exception.GetType().Name}");
+        }
     }
 }
 
