@@ -24,7 +24,7 @@ public sealed class C012StateMachine
     // state, the two universal fail-closed edges (Timeout, RootProcessDied) to FailedClosed.
     public static IReadOnlyList<C012Transition> AllTransitions { get; } = BuildAllTransitions();
 
-    private static readonly IReadOnlyDictionary<(C012State From, C012Trigger Trigger), C012State> Table =
+    private static readonly Dictionary<(C012State From, C012Trigger Trigger), C012State> Table =
         AllTransitions.ToDictionary(transition => (transition.From, transition.Trigger), transition => transition.To);
 
     public C012State CurrentState { get; private set; } = C012State.NotStarted;
@@ -45,7 +45,7 @@ public sealed class C012StateMachine
         return C012TransitionResult.Accept(next);
     }
 
-    private static IReadOnlyList<C012Transition> BuildAllTransitions()
+    private static List<C012Transition> BuildAllTransitions()
     {
         var all = new List<C012Transition>(HappyPath);
         foreach (C012State state in Enum.GetValues<C012State>())
