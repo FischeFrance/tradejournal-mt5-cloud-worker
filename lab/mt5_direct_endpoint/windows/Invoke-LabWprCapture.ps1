@@ -99,8 +99,8 @@ if (-not $Execute -or $Action -eq 'Plan') {
     return
 }
 
-$isWindows = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
-if (-not $isWindows) {
+$platformIsWindows = ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+if (-not $platformIsWindows) {
     throw 'L esecuzione WPR e disponibile soltanto su Windows.'
 }
 
