@@ -8,10 +8,6 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
-if os.name == "nt":
-    import msvcrt  # type: ignore
-
-
 LAB_RELATIVE_ROOT = Path("lab/mt5_direct_endpoint")
 EXCLUDED_DIRECTORY_NAMES = frozenset(
     {"__pycache__", ".pytest_cache", "private", "raw", "sanitized"}
@@ -213,10 +209,7 @@ def build_archive(
                 write_flags if os.name == "nt" else read_flags,
             )
             try:
-                if os.name == "nt":
-                    msvcrt._commit(descriptor)
-                else:
-                    os.fsync(descriptor)
+                os.fsync(descriptor)
             finally:
                 os.close(descriptor)
 
