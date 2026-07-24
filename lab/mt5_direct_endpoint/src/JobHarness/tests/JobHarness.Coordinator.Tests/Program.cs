@@ -1,3 +1,5 @@
+using System.IO.Pipes;
+using System.Text.Json;
 using TradeJournal.Lab.JobHarness.Coordinator;
 
 var tests = new (string Name, Action Body)[]
@@ -19,6 +21,46 @@ var tests = new (string Name, Action Body)[]
     ("session_mismatch_is_rejected_without_mutating_state", SessionMismatchIsRejectedWithoutMutatingState),
     ("apply_internal_refuses_client_originated_triggers", ApplyInternalRefusesClientOriginatedTriggers),
     ("unmapped_request_combination_is_rejected_without_mutating_state", UnmappedRequestCombinationIsRejectedWithoutMutatingState),
+
+    // B3: framing
+    ("wire_frame_round_trip_preserves_bytes_exactly", WireFrameRoundTripPreservesBytesExactly),
+    ("wire_frame_write_rejects_zero_length_payload", WireFrameWriteRejectsZeroLengthPayload),
+    ("wire_frame_write_rejects_oversized_payload", WireFrameWriteRejectsOversizedPayload),
+    ("wire_frame_read_returns_null_on_clean_eof_before_any_byte", WireFrameReadReturnsNullOnCleanEofBeforeAnyByte),
+    ("wire_frame_read_throws_on_truncated_header", WireFrameReadThrowsOnTruncatedHeader),
+    ("wire_frame_read_throws_on_truncated_payload", WireFrameReadThrowsOnTruncatedPayload),
+    ("wire_frame_read_rejects_declared_length_over_max", WireFrameReadRejectsDeclaredLengthOverMax),
+    ("wire_frame_read_reassembles_partial_byte_by_byte_reads", WireFrameReadReassemblesPartialByteByByteReads),
+
+    // B3: canonical payload + authentication
+    ("canonical_payload_is_deterministic_for_identical_fields", CanonicalPayloadIsDeterministicForIdenticalFields),
+    ("authenticator_sign_then_verify_request_succeeds", AuthenticatorSignThenVerifyRequestSucceeds),
+    ("authenticator_sign_then_verify_response_succeeds", AuthenticatorSignThenVerifyResponseSucceeds),
+    ("authenticator_verify_fails_with_different_secret", AuthenticatorVerifyFailsWithDifferentSecret),
+    ("authenticator_verify_fails_when_signed_fields_are_tampered", AuthenticatorVerifyFailsWhenSignedFieldsAreTampered),
+    ("authenticator_verify_fails_when_hmac_bit_is_flipped", AuthenticatorVerifyFailsWhenHmacBitIsFlipped),
+
+    // B3: wire validation
+    ("wire_validation_rejects_wrong_schema_version", WireValidationRejectsWrongSchemaVersion),
+    ("wire_validation_rejects_malformed_hmac_hex", WireValidationRejectsMalformedHmacHex),
+
+    // B3: session secret
+    ("session_secret_generate_produces_distinct_values", SessionSecretGenerateProducesDistinctValues),
+    ("session_secret_save_then_load_round_trips_exact_bytes", SessionSecretSaveThenLoadRoundTripsExactBytes),
+    ("session_secret_save_refuses_to_overwrite_existing_file", SessionSecretSaveRefusesToOverwriteExistingFile),
+    ("session_secret_save_applies_windows_only_acl", SessionSecretSaveAppliesWindowsOnlyAcl),
+
+    // B3: server channel
+    ("server_channel_accepts_wellformed_signed_c0_start", ServerChannelAcceptsWellformedSignedC0Start),
+    ("server_channel_rejects_wrong_hmac_without_mutating_sequencer_or_responding", ServerChannelRejectsWrongHmacWithoutMutatingSequencerOrResponding),
+    ("server_channel_rejects_malformed_frame_without_mutating_sequencer", ServerChannelRejectsMalformedFrameWithoutMutatingSequencer),
+    ("server_channel_delegates_sequencer_rejection_and_signs_response", ServerChannelDelegatesSequencerRejectionAndSignsResponse),
+    ("server_channel_replaying_identical_rejected_request_is_rejected_identically", ServerChannelReplayingIdenticalRejectedRequestIsRejectedIdentically),
+
+    // B3: client/server round trip
+    ("client_server_round_trip_happy_path_over_duplex_streams", ClientServerRoundTripHappyPathOverDuplexStreams),
+    ("client_rejects_response_with_wrong_hmac", ClientRejectsResponseWithWrongHmac),
+    ("client_keeps_same_sequence_slot_after_server_rejection", ClientKeepsSameSequenceSlotAfterServerRejection),
 };
 
 int failures = 0;
@@ -419,10 +461,655 @@ static C012Trigger[] HappyPathTriggersUpTo(C012State target)
     return orderedTriggers.Take(targetIndex).ToArray();
 }
 
+// ---- B3: framing ----
+
+static void WireFrameRoundTripPreservesBytesExactly()
+{
+    byte[] payload = "hello-frame"u8.ToArray();
+    var stream = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(stream, payload, CancellationToken.None).GetAwaiter().GetResult();
+    stream.Position = 0;
+    byte[]? read = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    Assert(read is not null, "frame must round-trip");
+    Assert(read!.AsSpan().SequenceEqual(payload), "frame bytes must match exactly");
+}
+
+static void WireFrameWriteRejectsZeroLengthPayload()
+{
+    var stream = new MemoryStream();
+    bool threw = false;
+    try
+    {
+        C012FrameCodec.WriteFrameAsync(stream, ReadOnlyMemory<byte>.Empty, CancellationToken.None).GetAwaiter().GetResult();
+    }
+    catch (ArgumentOutOfRangeException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "zero-length payload must be rejected");
+}
+
+static void WireFrameWriteRejectsOversizedPayload()
+{
+    var stream = new MemoryStream();
+    byte[] oversized = new byte[C012FrameCodec.MaxFrameLength + 1];
+    bool threw = false;
+    try
+    {
+        C012FrameCodec.WriteFrameAsync(stream, oversized, CancellationToken.None).GetAwaiter().GetResult();
+    }
+    catch (ArgumentOutOfRangeException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "oversized payload must be rejected");
+}
+
+static void WireFrameReadReturnsNullOnCleanEofBeforeAnyByte()
+{
+    var stream = new MemoryStream();
+    byte[]? read = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    Assert(read is null, "clean EOF before any byte must return null, not throw");
+}
+
+static void WireFrameReadThrowsOnTruncatedHeader()
+{
+    var stream = new MemoryStream([0x00, 0x00]);
+    bool threw = false;
+    try
+    {
+        C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    }
+    catch (C012FramingException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "a truncated header must throw, not return null");
+}
+
+static void WireFrameReadThrowsOnTruncatedPayload()
+{
+    var stream = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(stream, new byte[10], CancellationToken.None).GetAwaiter().GetResult();
+    stream.SetLength(stream.Length - 3);
+    stream.Position = 0;
+    bool threw = false;
+    try
+    {
+        C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    }
+    catch (C012FramingException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "a truncated payload must throw");
+}
+
+static void WireFrameReadRejectsDeclaredLengthOverMax()
+{
+    var header = new byte[4];
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header, C012FrameCodec.MaxFrameLength + 1);
+    var stream = new MemoryStream(header);
+    bool threw = false;
+    try
+    {
+        C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    }
+    catch (C012FramingException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "a declared length over the maximum must be rejected");
+}
+
+static void WireFrameReadReassemblesPartialByteByByteReads()
+{
+    byte[] payload = "reassembled-across-many-tiny-reads"u8.ToArray();
+    var framed = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(framed, payload, CancellationToken.None).GetAwaiter().GetResult();
+
+    using var slowStream = new OneByteAtATimeStream(framed.ToArray());
+    byte[]? read = C012FrameCodec.ReadFrameAsync(slowStream, CancellationToken.None).GetAwaiter().GetResult();
+    Assert(read is not null, "frame must still be read when delivered one byte at a time");
+    Assert(read!.AsSpan().SequenceEqual(payload), "reassembled bytes must match exactly");
+}
+
+// ---- B3: canonical payload + authentication ----
+
+static void CanonicalPayloadIsDeterministicForIdenticalFields()
+{
+    Guid sessionId = Guid.NewGuid();
+    byte[] first = C012CanonicalPayload.ForRequest(1, sessionId, 7, C012Control.C1, C012RequestType.Query);
+    byte[] second = C012CanonicalPayload.ForRequest(1, sessionId, 7, C012Control.C1, C012RequestType.Query);
+    Assert(first.AsSpan().SequenceEqual(second), "identical fields must produce byte-identical canonical payloads");
+}
+
+static void AuthenticatorSignThenVerifyRequestSucceeds()
+{
+    byte[] secret = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    Guid sessionId = Guid.NewGuid();
+    string hmac = C012MessageAuthenticator.SignRequest(secret, 1, sessionId, 1, C012Control.C0, C012RequestType.Start);
+    var request = new C012WireRequest(1, sessionId, 1, C012Control.C0, C012RequestType.Start, hmac);
+    Assert(C012MessageAuthenticator.VerifyRequest(secret, request), "signed request must verify with the same secret");
+}
+
+static void AuthenticatorSignThenVerifyResponseSucceeds()
+{
+    byte[] secret = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    Guid sessionId = Guid.NewGuid();
+    string hmac = C012MessageAuthenticator.SignResponse(
+        secret, 1, sessionId, 1, true, C012State.C0JobCreating, C012RejectionReason.None);
+    var response = new C012WireResponse(1, sessionId, 1, true, C012State.C0JobCreating, C012RejectionReason.None, hmac);
+    Assert(C012MessageAuthenticator.VerifyResponse(secret, response), "signed response must verify with the same secret");
+}
+
+static void AuthenticatorVerifyFailsWithDifferentSecret()
+{
+    byte[] secretA = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    byte[] secretB = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    Guid sessionId = Guid.NewGuid();
+    string hmac = C012MessageAuthenticator.SignRequest(secretA, 1, sessionId, 1, C012Control.C0, C012RequestType.Start);
+    var request = new C012WireRequest(1, sessionId, 1, C012Control.C0, C012RequestType.Start, hmac);
+    Assert(!C012MessageAuthenticator.VerifyRequest(secretB, request), "verification with a different secret must fail");
+}
+
+static void AuthenticatorVerifyFailsWhenSignedFieldsAreTampered()
+{
+    byte[] secret = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    Guid sessionId = Guid.NewGuid();
+    string hmac = C012MessageAuthenticator.SignRequest(secret, 1, sessionId, 1, C012Control.C0, C012RequestType.Start);
+
+    var tamperedSequence = new C012WireRequest(1, sessionId, 2, C012Control.C0, C012RequestType.Start, hmac);
+    Assert(!C012MessageAuthenticator.VerifyRequest(secret, tamperedSequence), "tampered sequence number must fail verification");
+
+    var tamperedSession = new C012WireRequest(1, Guid.NewGuid(), 1, C012Control.C0, C012RequestType.Start, hmac);
+    Assert(!C012MessageAuthenticator.VerifyRequest(secret, tamperedSession), "tampered session id must fail verification");
+
+    var tamperedControl = new C012WireRequest(1, sessionId, 1, C012Control.C1, C012RequestType.Start, hmac);
+    Assert(!C012MessageAuthenticator.VerifyRequest(secret, tamperedControl), "tampered control must fail verification");
+}
+
+static void AuthenticatorVerifyFailsWhenHmacBitIsFlipped()
+{
+    byte[] secret = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+    Guid sessionId = Guid.NewGuid();
+    string hmac = C012MessageAuthenticator.SignRequest(secret, 1, sessionId, 1, C012Control.C0, C012RequestType.Start);
+    char flipped = hmac[0] == '0' ? '1' : '0';
+    string tamperedHmac = flipped + hmac[1..];
+    var request = new C012WireRequest(1, sessionId, 1, C012Control.C0, C012RequestType.Start, tamperedHmac);
+    Assert(!C012MessageAuthenticator.VerifyRequest(secret, request), "a flipped HMAC character must fail verification");
+}
+
+// ---- B3: wire validation ----
+
+static void WireValidationRejectsWrongSchemaVersion()
+{
+    var request = new C012WireRequest(
+        99, Guid.NewGuid(), 1, C012Control.C0, C012RequestType.Start, new string('a', 64));
+    Assert(!C012WireValidation.IsValid(request), "an unsupported schema version must be rejected");
+}
+
+static void WireValidationRejectsMalformedHmacHex()
+{
+    var tooShort = new C012WireRequest(1, Guid.NewGuid(), 1, C012Control.C0, C012RequestType.Start, "abc");
+    Assert(!C012WireValidation.IsValid(tooShort), "a too-short hmac must be rejected");
+
+    var upperCase = new C012WireRequest(1, Guid.NewGuid(), 1, C012Control.C0, C012RequestType.Start, new string('A', 64));
+    Assert(!C012WireValidation.IsValid(upperCase), "an upper-case hmac must be rejected");
+}
+
+// ---- B3: session secret ----
+
+static void SessionSecretGenerateProducesDistinctValues()
+{
+    using C012SessionSecret first = C012SessionSecret.Generate();
+    using C012SessionSecret second = C012SessionSecret.Generate();
+    Assert(!first.Value.SequenceEqual(second.Value), "two generated secrets must not be equal");
+    Assert(first.Value.Length == C012SessionSecret.LengthBytes, "secret must be 256 bits");
+}
+
+static void SessionSecretSaveThenLoadRoundTripsExactBytes()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        string path = Path.Combine(directory, "session.secret");
+        byte[] original;
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            original = secret.Value.ToArray();
+            secret.Save(path);
+        }
+
+        using C012SessionSecret loaded = C012SessionSecret.Load(path);
+        Assert(loaded.Value.SequenceEqual(original), "loaded secret must match the saved bytes exactly");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionSecretSaveRefusesToOverwriteExistingFile()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        string path = Path.Combine(directory, "session.secret");
+        using C012SessionSecret first = C012SessionSecret.Generate();
+        first.Save(path);
+
+        using C012SessionSecret second = C012SessionSecret.Generate();
+        bool threw = false;
+        try
+        {
+            second.Save(path);
+        }
+        catch (IOException)
+        {
+            threw = true;
+        }
+
+        Assert(threw, "saving to an existing path must be refused");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void SessionSecretSaveAppliesWindowsOnlyAcl()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        string path = Path.Combine(directory, "session.secret");
+        using (C012SessionSecret secret = C012SessionSecret.Generate())
+        {
+            secret.Save(path);
+        }
+
+        var fileInfo = new FileInfo(path);
+        System.Security.AccessControl.FileSecurity security = fileInfo.GetAccessControl();
+        Assert(security.AreAccessRulesProtected, "the secret file must not inherit ACEs from its parent directory");
+
+        var rules = security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+        System.Security.Principal.SecurityIdentifier currentUser =
+            System.Security.Principal.WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("current user SID unavailable");
+
+        Assert(rules.Count == 1, "the secret file must carry exactly one access rule");
+        var onlyRule = (System.Security.AccessControl.FileSystemAccessRule)rules[0]!;
+        var ruleSid = (System.Security.Principal.SecurityIdentifier)onlyRule.IdentityReference;
+        Assert(ruleSid.Value == currentUser.Value, "the single access rule must belong to the current user");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// ---- B3: server channel ----
+
+static void ServerChannelAcceptsWellformedSignedC0Start()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    ExchangeSingleRequest(secret, sequencer, secret, sessionId, 1, C012Control.C0, C012RequestType.Start,
+        out C012ChannelOutcome outcome, out C012WireResponse? response);
+
+    Assert(outcome == C012ChannelOutcome.RequestProcessed, "well-formed request must be processed");
+    Assert(response is not null && response.Accepted, "C0 start from NotStarted must be accepted");
+    Assert(response!.ResultingState == C012State.C0JobCreating, "resulting state must be C0JobCreating");
+    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response), "response must be validly signed");
+    Assert(sequencer.CurrentState == C012State.C0JobCreating, "sequencer must reflect the accepted transition");
+}
+
+static void ServerChannelRejectsWrongHmacWithoutMutatingSequencerOrResponding()
+{
+    using C012SessionSecret serverSecret = C012SessionSecret.Generate();
+    using C012SessionSecret wrongSecret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    ExchangeSingleRequest(serverSecret, sequencer, wrongSecret, sessionId, 1, C012Control.C0, C012RequestType.Start,
+        out C012ChannelOutcome outcome, out C012WireResponse? response, expectNoResponse: true);
+
+    Assert(outcome == C012ChannelOutcome.AuthenticationFailed, "wrong HMAC must be reported as authentication failure");
+    Assert(response is null, "no response frame may be sent for an unauthenticated request");
+    Assert(sequencer.CurrentState == C012State.NotStarted, "sequencer state must not move on authentication failure");
+}
+
+static void ServerChannelRejectsMalformedFrameWithoutMutatingSequencer()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var stream = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(stream, "not valid json"u8.ToArray(), CancellationToken.None).GetAwaiter().GetResult();
+    stream.Position = 0;
+
+    var server = new C012ServerChannel(stream, secret, sequencer);
+    C012ChannelOutcome outcome = server.ProcessNextRequestAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert(outcome == C012ChannelOutcome.Malformed, "invalid JSON must be reported as malformed");
+    Assert(sequencer.CurrentState == C012State.NotStarted, "sequencer state must not move on a malformed frame");
+}
+
+static void ServerChannelDelegatesSequencerRejectionAndSignsResponse()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    // C2 before C0/C1: a protocol violation the underlying sequencer already rejects.
+    ExchangeSingleRequest(secret, sequencer, secret, sessionId, 1, C012Control.C2, C012RequestType.SubmitConfig,
+        out C012ChannelOutcome outcome, out C012WireResponse? response);
+
+    Assert(outcome == C012ChannelOutcome.RequestProcessed, "an authenticated but FSM-rejected request still gets a response");
+    Assert(response is not null && !response.Accepted, "premature C2 must be rejected by the FSM");
+    Assert(response!.Reason == C012RejectionReason.IllegalTransition, "rejection reason must surface the FSM's reason");
+    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response), "rejection response must still be signed");
+    Assert(sequencer.CurrentState == C012State.NotStarted, "a rejected request must not advance sequencer state");
+}
+
+static void ServerChannelReplayingIdenticalRejectedRequestIsRejectedIdentically()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    ExchangeSingleRequest(secret, sequencer, secret, sessionId, 1, C012Control.C2, C012RequestType.SubmitConfig,
+        out C012ChannelOutcome firstOutcome, out C012WireResponse? firstResponse);
+    ExchangeSingleRequest(secret, sequencer, secret, sessionId, 1, C012Control.C2, C012RequestType.SubmitConfig,
+        out C012ChannelOutcome secondOutcome, out C012WireResponse? secondResponse);
+
+    Assert(firstOutcome == C012ChannelOutcome.RequestProcessed && secondOutcome == C012ChannelOutcome.RequestProcessed,
+        "resending an identical rejected request must still be processed, not blocked");
+    Assert(!firstResponse!.Accepted && !secondResponse!.Accepted, "both attempts must be rejected");
+    Assert(firstResponse.Reason == secondResponse.Reason, "the resend must be rejected for the identical reason");
+    Assert(sequencer.CurrentState == C012State.NotStarted, "state must never move as a result of a rejected replay");
+}
+
+// ---- B3: client/server round trip ----
+
+static void ClientServerRoundTripHappyPathOverDuplexStreams()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    using DuplexPair pair = DuplexPair.Create();
+    var server = new C012ServerChannel(pair.ServerStream, secret, sequencer);
+    var client = new C012ClientChannel(pair.ClientStream, secret, sessionId);
+
+    Task<C012ChannelOutcome> serverTask = server.ProcessNextRequestAsync(CancellationToken.None);
+    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
+    Task.WhenAll(serverTask, clientTask).GetAwaiter().GetResult();
+
+    Assert(serverTask.Result == C012ChannelOutcome.RequestProcessed, "server must process the request");
+    Assert(clientTask.Result.Accepted, "client must observe acceptance");
+    Assert(clientTask.Result.ResultingState == C012State.C0JobCreating, "client must observe the resulting state");
+}
+
+static void ClientRejectsResponseWithWrongHmac()
+{
+    using C012SessionSecret clientSecret = C012SessionSecret.Generate();
+    using C012SessionSecret serverSecret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    using DuplexPair pair = DuplexPair.Create();
+    var server = new C012ServerChannel(pair.ServerStream, serverSecret, sequencer);
+    var client = new C012ClientChannel(pair.ClientStream, clientSecret, sessionId);
+
+    Task<C012ChannelOutcome> serverTask = server.ProcessNextRequestAsync(CancellationToken.None);
+    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
+
+    bool threw = false;
+    try
+    {
+        Task.WhenAll(serverTask, clientTask).GetAwaiter().GetResult();
+    }
+    catch (C012FramingException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "the client must refuse a response signed with the wrong secret");
+    Assert(serverTask.Result == C012ChannelOutcome.AuthenticationFailed, "server must also reject the mismatched request");
+}
+
+static void ClientKeepsSameSequenceSlotAfterServerRejection()
+{
+    using C012SessionSecret secret = C012SessionSecret.Generate();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+
+    using DuplexPair firstPair = DuplexPair.Create();
+    var serverForFirst = new C012ServerChannel(firstPair.ServerStream, secret, sequencer);
+    var client = new C012ClientChannel(firstPair.ClientStream, secret, sessionId);
+
+    Task<C012ChannelOutcome> firstServerTask = serverForFirst.ProcessNextRequestAsync(CancellationToken.None);
+    Task<C012TransitionResult> firstClientTask = client.SendAsync(C012Control.C2, C012RequestType.SubmitConfig, CancellationToken.None);
+    Task.WhenAll(firstServerTask, firstClientTask).GetAwaiter().GetResult();
+    Assert(!firstClientTask.Result.Accepted, "premature C2 must be rejected");
+
+    using DuplexPair secondPair = DuplexPair.Create();
+    var serverForSecond = new C012ServerChannel(secondPair.ServerStream, secret, sequencer);
+    var clientOnSecondPipe = new C012ClientChannel(secondPair.ClientStream, secret, sessionId);
+    // A fresh C012ClientChannel starts at sequence 1 again; since the first (rejected) call
+    // never advanced the shared sequencer's counter either, sequence 1 is still legal here.
+    Task<C012ChannelOutcome> secondServerTask = serverForSecond.ProcessNextRequestAsync(CancellationToken.None);
+    Task<C012TransitionResult> secondClientTask =
+        clientOnSecondPipe.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
+    Task.WhenAll(secondServerTask, secondClientTask).GetAwaiter().GetResult();
+
+    Assert(secondClientTask.Result.Accepted, "sequence slot 1 must still be usable after the earlier rejection");
+}
+
+// ---- shared helpers ----
+
+// Builds a fresh C012ServerChannel bound to a single MemoryStream pre-loaded with one
+// crafted, signed request, invokes it, then (for a processed request) seeks back to right
+// after the request bytes to read and parse whatever response the server wrote there. One
+// MemoryStream is enough because the server only ever reads then writes sequentially -- no
+// real duplex concurrency is needed to exercise C012ServerChannel in isolation.
+static void ExchangeSingleRequest(
+    C012SessionSecret serverSecret, C012RequestSequencer sequencer, C012SessionSecret signingSecret,
+    Guid sessionId, long sequenceNumber, C012Control control, C012RequestType requestType,
+    out C012ChannelOutcome outcome, out C012WireResponse? response, bool expectNoResponse = false)
+{
+    string hmac = C012MessageAuthenticator.SignRequest(
+        signingSecret.Value, C012WireSchema.Version, sessionId, sequenceNumber, control, requestType);
+    var request = new C012WireRequest(C012WireSchema.Version, sessionId, sequenceNumber, control, requestType, hmac);
+    byte[] requestBytes = JsonSerializer.SerializeToUtf8Bytes(request, C012WireJsonOptions.Instance);
+
+    var stream = new MemoryStream();
+    C012FrameCodec.WriteFrameAsync(stream, requestBytes, CancellationToken.None).GetAwaiter().GetResult();
+    long requestEnd = stream.Position;
+    stream.Position = 0;
+
+    var server = new C012ServerChannel(stream, serverSecret, sequencer);
+    outcome = server.ProcessNextRequestAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    response = null;
+    if (!expectNoResponse && outcome == C012ChannelOutcome.RequestProcessed)
+    {
+        stream.Position = requestEnd;
+        byte[]? responseFrame = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+        Assert(responseFrame is not null, "a processed request must be followed by a response frame");
+        response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame, C012WireJsonOptions.Instance);
+    }
+}
+
+static string CreateTemporaryDirectory()
+{
+    string path = Path.Combine(Path.GetTempPath(), $"c012-secret-test-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(path);
+    return path;
+}
+
 static void Assert(bool condition, string message)
 {
     if (!condition)
     {
         throw new InvalidOperationException(message);
+    }
+}
+
+internal sealed class OneByteAtATimeStream : Stream
+{
+    private readonly MemoryStream _inner;
+
+    public OneByteAtATimeStream(byte[] data)
+    {
+        _inner = new MemoryStream(data);
+    }
+
+    public override bool CanRead => true;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => false;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+        buffer.IsEmpty ? ValueTask.FromResult(0) : _inner.ReadAsync(buffer[..1], cancellationToken);
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Flush()
+    {
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+}
+
+// Wraps two unidirectional streams into one bidirectional Stream so C012ServerChannel and
+// C012ClientChannel -- which each expect a single duplex Stream, matching a real named pipe
+// -- can be tested talking to each other concurrently. Built from anonymous pipes (BCL,
+// no NuGet package, cross-platform) rather than a real named pipe: no ACL, no transport
+// beyond an in-process kernel buffer, deliberately kept as close to "in-memory" as a truly
+// duplex, genuinely async test stream can be.
+internal sealed class BidirectionalStream : Stream
+{
+    private readonly Stream _readFrom;
+    private readonly Stream _writeTo;
+
+    public BidirectionalStream(Stream readFrom, Stream writeTo)
+    {
+        _readFrom = readFrom;
+        _writeTo = writeTo;
+    }
+
+    public override bool CanRead => true;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => true;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+        _readFrom.ReadAsync(buffer, cancellationToken);
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+        _writeTo.WriteAsync(buffer, cancellationToken);
+
+    public override Task FlushAsync(CancellationToken cancellationToken) => _writeTo.FlushAsync(cancellationToken);
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Flush() => _writeTo.Flush();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _readFrom.Dispose();
+            _writeTo.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+}
+
+// Disposing ServerStream/ClientStream is sufficient: each of the four underlying
+// AnonymousPipe streams is captured by exactly one of the two BidirectionalStream wrappers
+// (as either its read or write side), so no separate handle needs to be tracked here.
+internal sealed class DuplexPair : IDisposable
+{
+    private DuplexPair(Stream serverStream, Stream clientStream)
+    {
+        ServerStream = serverStream;
+        ClientStream = clientStream;
+    }
+
+    public Stream ServerStream { get; }
+
+    public Stream ClientStream { get; }
+
+    public static DuplexPair Create()
+    {
+        var clientToServerServer = new AnonymousPipeServerStream(PipeDirection.In);
+        var clientToServerClient = new AnonymousPipeClientStream(PipeDirection.Out, clientToServerServer.ClientSafePipeHandle);
+        var serverToClientServer = new AnonymousPipeServerStream(PipeDirection.Out);
+        var serverToClientClient = new AnonymousPipeClientStream(PipeDirection.In, serverToClientServer.ClientSafePipeHandle);
+
+        var serverStream = new BidirectionalStream(readFrom: clientToServerServer, writeTo: serverToClientServer);
+        var clientStream = new BidirectionalStream(readFrom: serverToClientClient, writeTo: clientToServerClient);
+        return new DuplexPair(serverStream, clientStream);
+    }
+
+    public void Dispose()
+    {
+        ServerStream.Dispose();
+        ClientStream.Dispose();
     }
 }
