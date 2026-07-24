@@ -9,8 +9,11 @@ namespace TradeJournal.Lab.JobHarness.Coordinator;
 // Session startup is transactional -- session.id is written first, but is rolled back
 // (deleted, along with any secret file already written) if any later step fails, so a
 // --session-dir is only ever left holding a fully-initialized, listening session or no
-// session at all. Uses C012NotImplementedRootProcessLauncher exclusively: no Job Object, no
-// process, no MT5/MetaEditor is ever started by this class.
+// session at all. The public, production-facing overload (the one Program.cs calls) uses
+// C012NotImplementedRootProcessLauncher exclusively: no Job Object, no process, no
+// MT5/MetaEditor is ever started through it. The launcher-injecting overload exists only so
+// Windows-only tests can drive a real launcher (e.g. C012InnocuousRootProcessLauncher)
+// through this same host loop; Program.cs never calls it.
 public static class C012HostCli
 {
     public const int ExitTerminated = 0;
@@ -22,13 +25,21 @@ public static class C012HostCli
     private const int PipeBufferSize = 4096;
 
     public static int Run(string[] args, TextWriter output, TextWriter error) =>
-        RunAsync(args, output, error).GetAwaiter().GetResult();
+        RunAsync(args, output, error, new C012NotImplementedRootProcessLauncher()).GetAwaiter().GetResult();
 
-    private static async Task<int> RunAsync(string[] args, TextWriter output, TextWriter error)
+    // Test-only entry point: identical to the 3-argument overload except that the caller
+    // supplies the launcher instead of always getting C012NotImplementedRootProcessLauncher.
+    // Not called from Program.cs and not reachable from any CLI argument a user could type.
+    public static int Run(string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher) =>
+        RunAsync(args, output, error, launcher).GetAwaiter().GetResult();
+
+    private static async Task<int> RunAsync(
+        string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher)
     {
         ArgumentNullException.ThrowIfNull(args);
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(error);
+        ArgumentNullException.ThrowIfNull(launcher);
 
         string? sessionDir = ParseSessionDir(args);
         if (sessionDir is null)
@@ -106,7 +117,6 @@ public static class C012HostCli
         // From here on, initialization is complete and both files are the confirmed,
         // durable session -- session.id is never rolled back again after this point.
         var sequencer = new C012RequestSequencer(sessionId);
-        var launcher = new C012NotImplementedRootProcessLauncher();
         var processor = new C012OrchestratingProcessor(sequencer, launcher);
 
         int exitCode;

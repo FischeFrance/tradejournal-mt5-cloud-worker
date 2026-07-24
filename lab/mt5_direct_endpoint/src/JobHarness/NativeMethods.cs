@@ -169,6 +169,13 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool AssignProcessToJobObject(SafeJobHandle job, SafeKernelObjectHandle process);
 
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsProcessInJob(
+        SafeKernelObjectHandle processHandle,
+        SafeJobHandle jobHandle,
+        [MarshalAs(UnmanagedType.Bool)] out bool result);
+
 #pragma warning disable CA1838
     // CreateProcessW may mutate the command-line buffer (LPWSTR in/out); StringBuilder
     // preserves the required mutable semantics for this native signature.

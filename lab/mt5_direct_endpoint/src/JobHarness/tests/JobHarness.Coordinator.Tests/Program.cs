@@ -1,6 +1,26 @@
+using System.Diagnostics;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading.Channels;
 using TradeJournal.Lab.JobHarness.Coordinator;
+
+// Self-invocation targets for C012InnocuousRootProcessLauncher's Windows-only smoke tests
+// below: the launcher re-invokes this same executable as its root/submitter, so this process
+// must understand these two flags and behave innocuously (long-lived vs. immediate exit)
+// instead of running the whole test suite again. Must run before the test harness below --
+// C# requires every top-level statement in a file to precede any type declaration, and these
+// checks must in turn run before "var tests = ..." starts building the harness.
+if (args is ["--innocent-sleeper"])
+{
+    System.Threading.Thread.Sleep(TimeSpan.FromSeconds(30));
+    return 0;
+}
+
+if (args is ["--innocent-exit-zero"])
+{
+    return 0;
+}
 
 var tests = new (string Name, Action Body)[]
 {
@@ -110,6 +130,12 @@ var tests = new (string Name, Action Body)[]
     // B4.2: real Named Pipe (Windows-only)
     ("host_and_client_real_named_pipe_round_trip_reaches_failed_closed_via_placeholder_launcher", HostAndClientRealNamedPipeRoundTripReachesFailedClosedViaPlaceholderLauncher),
     ("client_cli_fails_cleanly_when_no_pipe_is_listening", ClientCliFailsCleanlyWhenNoPipeIsListening),
+
+    // B4.3: real Windows launcher (Windows-only)
+    ("innocuous_launcher_c0_through_c2_reaches_terminated_and_root_is_gone_after_teardown", InnocuousLauncherC0ThroughC2ReachesTerminatedAndRootIsGoneAfterTeardown),
+    ("innocuous_launcher_end_to_end_over_real_named_pipe_reaches_terminated", InnocuousLauncherEndToEndOverRealNamedPipeReachesTerminated),
+    ("innocuous_launcher_closing_last_job_handle_kills_root_via_kill_on_job_close", InnocuousLauncherClosingLastJobHandleKillsRootViaKillOnJobClose),
+    ("innocuous_launcher_constructor_refuses_metatrader_like_executable_name", InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName),
 };
 
 int failures = 0;
@@ -1664,6 +1690,225 @@ static void ClientCliFailsCleanlyWhenNoPipeIsListening()
     {
         Directory.Delete(directory, recursive: true);
     }
+}
+
+// ---- B4.3: real Windows launcher (Windows-only; each test returns immediately elsewhere) ----
+
+static void InnocuousLauncherC0ThroughC2ReachesTerminatedAndRootIsGoneAfterTeardown()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    var launcher = new C012InnocuousRootProcessLauncher(
+        executable,
+        ComputeSha256(executable),
+        SelfInvocationArguments(executable, "--innocent-sleeper"),
+        SelfInvocationArguments(executable, "--innocent-exit-zero"),
+        TimeSpan.FromSeconds(10));
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult c0 = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+    Assert(c0.Accepted && c0.ResultingState == C012State.C0Retained, "C0 must reach C0Retained with the real launcher");
+    Assert(launcher.RootProcessId is not null, "the real root PID must be known after C0");
+
+    uint rootPid = launcher.RootProcessId!.Value;
+    long startTimeAfterC0;
+    using (Process rootAfterC0 = Process.GetProcessById((int)rootPid))
+    {
+        startTimeAfterC0 = rootAfterC0.StartTime.ToUniversalTime().Ticks;
+    }
+
+    C012TransitionResult c1 = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+    Assert(c1.Accepted && c1.ResultingState == C012State.C1Retained, "C1 must reach C1Retained: same root, same generation");
+
+    using (Process rootAfterC1 = Process.GetProcessById((int)rootPid))
+    {
+        Assert(
+            rootAfterC1.StartTime.ToUniversalTime().Ticks == startTimeAfterC0,
+            "the root observed at C1 must be the exact same process generation observed at C0");
+    }
+
+    C012TransitionResult c2 = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+    Assert(
+        c2.Accepted && c2.ResultingState == C012State.Terminated,
+        "C2 must reach Terminated: the real submitter ran in the same real Job and real teardown succeeded");
+
+    Assert(
+        WaitUntilProcessIdIsGone(rootPid, TimeSpan.FromSeconds(5)),
+        "the sleeper root (30s runtime) must already be gone immediately after C2 teardown, proving KILL_ON_JOB_CLOSE fired");
+}
+
+static void InnocuousLauncherEndToEndOverRealNamedPipeReachesTerminated()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    var launcher = new C012InnocuousRootProcessLauncher(
+        executable,
+        ComputeSha256(executable),
+        SelfInvocationArguments(executable, "--innocent-sleeper"),
+        SelfInvocationArguments(executable, "--innocent-exit-zero"),
+        TimeSpan.FromSeconds(10));
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.Run(["--session-dir", directory], hostOut, hostErr, launcher));
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start over the real pipe with the real launcher must be accepted");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int c1ExitCode, string c1Report) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query over the real pipe must be accepted");
+        Assert(c1Report.Contains("resulting_state=C1Retained", StringComparison.Ordinal), "c1-query must reach C1Retained");
+
+        (int c2ExitCode, string c2Report) = RunClientWithRetries("c2-submit", directory);
+        Assert(c2ExitCode == C012ClientCli.ExitAccepted, "c2-submit over the real pipe must be accepted");
+        Assert(c2Report.Contains("resulting_state=Terminated", StringComparison.Ordinal), "c2-submit must reach Terminated");
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitTerminated, "the host must exit with the Terminated code");
+        Assert(
+            !File.Exists(C012SessionPaths.SessionSecretPath(directory)),
+            "the secret file must be deleted once the session ends");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void InnocuousLauncherClosingLastJobHandleKillsRootViaKillOnJobClose()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string executable = RequireCurrentExecutable();
+    var launcher = new C012InnocuousRootProcessLauncher(
+        executable,
+        ComputeSha256(executable),
+        SelfInvocationArguments(executable, "--innocent-sleeper"),
+        SelfInvocationArguments(executable, "--innocent-exit-zero"),
+        TimeSpan.FromSeconds(10));
+
+    C012JobToken job = launcher.CreateJob();
+    C012ProcessToken root = launcher.LaunchSuspendedRoot(job);
+    launcher.AssignRootToJob(job, root);
+    launcher.ResumeRoot(root);
+
+    uint rootPid = launcher.RootProcessId!.Value;
+    Assert(IsProcessRunning(rootPid), "the root must be running before the Job handle is closed");
+
+    // Simulates "the last handle to this Job closed" -- identical at the OS level whether
+    // that happens via this explicit call or because the owning host process was killed --
+    // without needing to spawn and kill a second real process.
+    C012InnocuousRootProcessLauncher.CloseJobHandleForTesting(job);
+
+    Assert(
+        WaitUntilProcessIdIsGone(rootPid, TimeSpan.FromSeconds(5)),
+        "closing the last Job handle must kill the root process via KILL_ON_JOB_CLOSE");
+}
+
+static void InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        string target = Path.Combine(directory, "terminal64.exe");
+        File.Copy(RequireCurrentExecutable(), target);
+
+        bool refused = false;
+        try
+        {
+            _ = new C012InnocuousRootProcessLauncher(
+                target,
+                ComputeSha256(target),
+                ["--innocent-exit-zero"],
+                ["--innocent-exit-zero"],
+                TimeSpan.FromSeconds(10));
+        }
+        catch (InvalidOperationException)
+        {
+            refused = true;
+        }
+
+        Assert(refused, "the constructor must refuse an executable named terminal64.exe regardless of its actual contents/hash");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static IReadOnlyList<string> SelfInvocationArguments(string executable, string innocentFlag)
+{
+    var arguments = new List<string>();
+    if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+    {
+        arguments.Add(Assembly.GetExecutingAssembly().Location);
+    }
+
+    arguments.Add(innocentFlag);
+    return arguments;
+}
+
+static string RequireCurrentExecutable() =>
+    Environment.ProcessPath ?? throw new InvalidOperationException("Current process path is unavailable.");
+
+static string ComputeSha256(string path)
+{
+    using FileStream stream = File.OpenRead(path);
+    return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+}
+
+static bool IsProcessRunning(uint processId)
+{
+    try
+    {
+        using Process process = Process.GetProcessById((int)processId);
+        return !process.HasExited;
+    }
+    catch (ArgumentException)
+    {
+        return false;
+    }
+}
+
+static bool WaitUntilProcessIdIsGone(uint processId, TimeSpan timeout)
+{
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < timeout)
+    {
+        if (!IsProcessRunning(processId))
+        {
+            return true;
+        }
+
+        System.Threading.Thread.Sleep(50);
+    }
+
+    return false;
 }
 
 static (int ExitCode, string Report) RunClientWithRetries(string verb, string directory)
