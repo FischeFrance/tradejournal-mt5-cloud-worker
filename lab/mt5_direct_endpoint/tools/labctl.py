@@ -27,6 +27,7 @@ from lab_model import (
     validate_evidence,
     validate_experiment_manifest,
 )
+from lab_evidence_verifier import verify_captured_run
 
 
 def _load_json(path: str) -> object:
@@ -138,6 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_evidence_parser = subparsers.add_parser("validate-evidence")
     validate_evidence_parser.add_argument("--evidence", required=True)
+
+    verifier_parser = subparsers.add_parser(
+        "verify-captured-evidence",
+        help="independently verify a materialized captured-evidence run",
+    )
+    verifier_parser.add_argument("--run-dir", required=True)
+    verifier_parser.add_argument("--run-id", required=True)
+    verifier_parser.add_argument("--output", default="-")
 
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--evidence", required=True)
@@ -289,6 +298,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_evidence(_load_json(args.evidence))
             sys.stdout.write("VALID\n")
             return 0
+        if args.command == "verify-captured-evidence":
+            evaluation = verify_captured_run(args.run_dir, args.run_id)
+            _emit(evaluation.to_dict(), args.output)
+            return {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 2, "SYNTHETIC_PASS": 3}[evaluation.outcome]
         if args.command == "evaluate":
             evaluation = evaluate_evidence(
                 _load_json(args.evidence),
