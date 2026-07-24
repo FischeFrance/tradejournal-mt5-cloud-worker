@@ -11,6 +11,9 @@ Obiettivo: allineamento offline di lifecycle, binding e pre-state C0-C5
 PATCH: PATCH_READY NEL SOLO SCOPE OFFLINE
 HARNESS: PARTIALLY_READY
 OFFLINE REVIEW: READY
+WINDOWS HOSTED OFFLINE VALIDATION: GO (CI run #20, commit 0182629)
+HARMLESS JOB OBJECT RUNTIME SMOKE: PASS
+C012 PERSISTENT RUNTIME: NO-GO
 C0-C5: NON ESEGUITI
 WINDOWS RUNTIME: NO-GO
 MT5 EXECUTION: NOT RUN
@@ -18,6 +21,12 @@ MT5 / CREDENZIALI / RETE BROKER: NO-GO
 GO AL TEST REALE: NO-GO
 GO SUCCESSIVO: esclusivamente revisione indipendente offline
 ```
+
+Nota (addendum successivo alla Patch 7): la CI Windows offline run #20 sul
+commit `0182629e27a6ef76795f721d885bd98f9e4cfefd` ha successivamente compilato
+ed esercitato il JobHarness su Windows con processi innocui — vedi
+§20. Questo aggiorna, senza contraddirle, le sezioni §13 e §16 che
+descrivevano il runtime .NET e il Job Object come mai provati su Windows.
 
 `PATCH_READY` si riferisce al contratto offline e deve essere confermato dai
 risultati finali riportati nella sezione 13. Non significa che il runtime sia
@@ -431,10 +440,10 @@ Non sono stati eseguiti:
 | Verifica | Motivo |
 |---|---|
 | PowerShell runtime | ambiente corrente non Windows; runtime vietato |
-| JobHarness .NET runtime | actual launch vietato; coordinator C012 assente |
+| JobHarness .NET runtime (in questa patch) | ambiente corrente non Windows; eseguito successivamente in CI su Windows come smoke innocuo one-shot — vedi §20. `actual launch` resta vietato/`HARD_DISABLED` e il coordinator C012 resta assente |
 | MetaEditor | non disponibile e avvio vietato |
 | MT5 / login / C0-C5 | vietati dalla consegna |
-| ETW/WFP/Firewall runtime | vietati dalla consegna |
+| ETW/WFP/Firewall runtime | vietati dalla consegna; solo lo schema del profilo WPR è stato validato in CI (§20), non una cattura reale |
 | rete esterna | vietata dalla consegna |
 
 ## 14. File Patch 7
@@ -517,11 +526,15 @@ La CLI ordinaria non può promuovere fixture sintetiche a `PASS`.
 1. Il JobHarness è one-shot. Per eseguire davvero C0→C1→C2 serve un
    coordinator persistente/IPC che mantenga ownership di Job, processo,
    clone e root tra le fasi. Il contratto offline è coerente, il runtime
-   corrente non lo è ancora.
+   corrente non lo è ancora. La CI run #20 ha provato che il one-shot
+   compila e funziona su Windows con un eseguibile innocuo (§20); non ha
+   introdotto il coordinator persistente.
 2. Manca il verifier indipendente degli artefatti captured.
 3. Manca il deployment verifier EX5 per attestare source, binary e probe
    effettivamente caricato.
-4. Job Object, ETW, WFP, exporter e marker non sono stati provati su Windows.
+4. ETW (cattura reale), WFP, exporter e marker non sono stati provati su
+   Windows. Il Job Object è stato provato su Windows solo come smoke
+   innocuo one-shot in CI (§20), non nel contesto C012/C0-C5.
 5. I digest sono commitment, non firme, TPM quote o attestazioni hardware.
 6. La sorgente captured richiede connection ID provider-derived; una
    attribuzione assente o ambigua degrada la prova.
@@ -587,3 +600,50 @@ dell'archivio.
 
 Il solo GO espresso è per la revisione indipendente offline. Patch 7 non
 autorizza C0, Windows runtime, MT5 o credenziali.
+
+## 20. Addendum — CI Windows offline run #20 (post-Patch 7)
+
+Successivamente alla stesura di questo report, la GitHub Action
+`MT5 Direct Endpoint — Offline Windows Validation` è risultata verde su
+runner Windows Server 2025 hosted, sul commit
+`0182629e27a6ef76795f721d885bd98f9e4cfefd` (run #20, job
+`offline-validation`). Evidenza:
+
+```text
+suite Python (lab + mql5 + windows) e compileall:  PASS
+build Release .NET 8 JobHarness:                   0 warning, 0 errori
+smoke offline parser/gate + gate hard-disabled:     PASS
+harmless Job Object runtime smoke:                  PASS
+  - natural-exit (exit code 0):                     verde
+  - descendant-timeout:                              verde
+  - assegnazione al Job prima di ResumeThread:        verificata
+  - termination/drain e metadata hygiene:             verificati
+validazione schema profilo WPR (ValidateProfile):    exit code 0
+dry-run PowerShell:                                 986 assert, 0 mutazioni, 0 rete
+pre-state scanner PlanOnly:                          PASS
+processi terminal/terminal64/metaeditor:             assenti prima e dopo i test
+```
+
+Questo run prova compilazione, meccanica Job Object con eseguibili innocui,
+validità di schema del profilo WPR e correttezza dei dry-run non mutanti,
+tutto su Windows. Il test del Job Object invoca l'API interna
+`JobObjectRunner` con `ExecuteRequested=false`; il metadata prodotto impegna
+comunque `ActualLaunchCapability=HARD_DISABLED`, quindi il gate CLI
+`--execute` non è stato attraversato né allentato.
+
+Non prova e non autorizza: coordinatore persistente C012, IPC autenticato,
+esecuzione di C0-C5, MT5/MetaEditor, credenziali, connettività broker,
+cattura ETW reale, Firewall/WFP/bootstrap/registry promotion, o verifier di
+evidence captured. Restano invariati:
+
+```text
+HARNESS: PARTIALLY_READY
+C012 PERSISTENT RUNTIME: NO-GO
+C0-C5: NOT RUN
+MT5 / CREDENTIALS / BROKER NETWORK: NO-GO
+ACTUAL LAUNCH: HARD_DISABLED
+CAPTURED EVIDENCE VERIFIER: non implementato
+```
+
+`SYNTHETIC_PASS` e `PASS` mantengono il significato definito in README.md e
+RUNBOOK.md; questo run non promuove nessuna fixture a `PASS`.

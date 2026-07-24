@@ -33,6 +33,40 @@ Se assegnazione, verifica della policy o persistenza dell’evidenza falliscono,
 thread primario non viene eseguito. Alla chiusura del launcher tutti i processi
 rimasti nel job vengono terminati.
 
+## CI Windows offline — run #20 (harmless runtime smoke, GO)
+
+Sul commit `0182629e27a6ef76795f721d885bd98f9e4cfefd`, la CI Windows offline
+(runner Windows Server 2025 hosted) ha compilato questo progetto in Release
+(.NET 8, 0 warning/errori) ed eseguito `-RunWindowsRuntimeSmoke` di
+`Test-JobHarness.ps1`. Questo smoke chiama direttamente l'API interna
+`JobObjectRunner.Run(...)` con `ExecuteRequested: false`, usando l'eseguibile
+del test harness stesso (`--innocent-exit-zero`) come target innocuo — non
+passa dal gate CLI `--execute`, che resta interamente `HARD_DISABLED` e viene
+comunque impegnato come tale nel metadata prodotto
+(`ActualLaunchCapability=HARD_DISABLED`).
+
+Due scenari, entrambi verdi:
+
+- **natural-exit**: `CreateProcessW(CREATE_SUSPENDED)` → assegnazione al Job
+  prima di `ResumeThread` → uscita naturale con `exit code 0` →
+  `KillOnJobCloseVerified=true`, `BreakawayAllowed=false`,
+  `SilentBreakawayAllowed=false`; il JSON di evidenza non contiene la command
+  line (`--innocent-exit-zero`) né stringhe `password`/`login`/`token`;
+- **descendant-timeout**: processo padre/figlio con timeout, stessa
+  assegnazione pre-resume, terminazione e drain del Job verificati.
+
+Questo dimostra che il Job Object, una volta compilato ed eseguito su
+Windows, si comporta secondo il contratto dichiarato (assegnazione prima del
+resume, kill-on-job-close puro, metadata sanitizzati) con un eseguibile
+innocuo. È **harmless Windows smoke**, non validazione del runtime MT5: non
+dimostra il comportamento con `terminal64.exe`, non attraversa
+`WinVerifyTrust`/signer allowlist su un target reale, non implica un
+coordinatore persistente C012 né IPC, e non autorizza C0-C5. Le frasi più
+sotto che descrivono il Job Object e il runtime .NET come "mai compilati o
+provati su Windows" vanno lette come riferite al codice del gate
+`--execute`/actual-launch, che questo smoke non attraversa e che resta
+`HARD_DISABLED`.
+
 ## Requisiti
 
 - Windows 10/11 o Windows Server moderno per l’esecuzione reale;
@@ -225,9 +259,13 @@ dimostra da solo l'identità finale del file attraverso alias/reparse point e no
 lega l'immagine sospesa all'handle hashato. Il blocker è il motivo per cui ogni
 actual launch è hard-disabled.
 
-Il codice dormiente contiene un timer one-shot e una gestione timeout del Job,
-ma non è stato compilato o esercitato su Windows in questa fase. In particolare,
-il comportamento puro `KILL_ON_JOB_CLOSE` non è ancora provato.
+Il codice dormiente contiene un timer one-shot e una gestione timeout del Job.
+La CI run #20 lo ha compilato ed esercitato su Windows con un eseguibile
+innocuo (vedi sezione "CI Windows offline — run #20" sopra), confermando
+`KillOnJobCloseVerified=true` sia per l'uscita naturale sia per il timeout del
+discendente in quello scenario diretto via API interna. Questo non equivale a
+una verifica nel contesto del gate `--execute`/actual-launch, che resta
+interamente `HARD_DISABLED` e non è stato esercitato.
 
 ## Exit code
 

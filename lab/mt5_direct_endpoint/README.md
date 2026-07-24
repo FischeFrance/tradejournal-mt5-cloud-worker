@@ -11,12 +11,43 @@ laboratorio né MetaTrader 5.
 PATCH: PATCH_READY NEL SOLO SCOPE OFFLINE
 HARNESS: PARTIALLY_READY
 OFFLINE REVIEW: READY
+WINDOWS HOSTED OFFLINE VALIDATION: GO (CI run #20, commit 0182629)
+HARMLESS JOB OBJECT RUNTIME SMOKE: PASS
+C012 PERSISTENT RUNTIME: NO-GO
 C0-C5: NON ESEGUITI
 WINDOWS RUNTIME: NO-GO
 MT5 EXECUTION: NOT RUN
 GO AL TEST REALE: NO-GO
 GO SUCCESSIVO: esclusivamente revisione indipendente offline
 ```
+
+### CI Windows offline — run #20 (commit `0182629e27a6ef76795f721d885bd98f9e4cfefd`)
+
+La GitHub Action `MT5 Direct Endpoint — Offline Windows Validation` è verde su runner
+Windows Server 2025 hosted. Ha esercitato, tutto in modo innocuo e senza MT5:
+
+- suite Python (lab + mql5 + windows) e `compileall`: verdi;
+- build Release .NET 8 del `JobHarness`: 0 warning, 0 errori;
+- smoke offline del parser/gate (`Test-JobHarness.ps1`) e gate hard-disabled
+  (`-RunWindowsProcessSmoke`): PASS;
+- **harmless Job Object runtime smoke** (`-RunWindowsRuntimeSmoke`): natural-exit
+  (exit code 0) e descendant-timeout, entrambi verdi, con assegnazione al Job
+  prima di `ResumeThread`, termination/drain corretti e metadata JSON senza
+  command line/argomenti/segreti;
+- validazione schema del profilo WPR ETW (`ValidateProfile`, solo
+  `LoggingMode=File`): exit code 0 — è una validazione di schema, non una
+  cattura ETW reale;
+- dry-run PowerShell: 986 assert, 0 mutazioni, 0 rete;
+- nessun processo `terminal`/`terminal64`/`metaeditor` presente prima o dopo i
+  test.
+
+Questo run prova la meccanica del Job Object con eseguibili innocui e la
+build su Windows. **Non** prova e non autorizza: sessione persistente C012,
+IPC autenticato, esecuzione di C0-C5, MT5/MetaEditor, credenziali, rete
+broker, cattura ETW reale o Firewall/WFP. `actual launch` resta
+`HARD_DISABLED` end-to-end, incluso durante questo smoke (il test invoca
+l'API interna `JobObjectRunner` con `ExecuteRequested=false` e
+`ActualLaunchCapability=HARD_DISABLED` resta impegnato nel metadata).
 
 Questi stati non autorizzano C0. Durante la patch:
 
@@ -149,6 +180,16 @@ mantenere Job e processo tra C0, C1 e C2 e ricevere comandi tramite IPC. Prima
 di un dry-run Windows serve quel coordinatore, con protocollo autenticato e
 fail-closed, oppure un'estensione equivalente del JobHarness. Per questo
 `HARNESS` resta `PARTIALLY_READY` e `WINDOWS RUNTIME` resta `NO-GO`.
+
+La CI run #20 ha confermato che il Job Object, una volta compilato ed
+esercitato su Windows con un eseguibile innocuo, si comporta secondo il
+contratto (assegnazione prima del resume, kill-on-job-close, metadata
+sanitizzati). Questo chiude solo la parte "il codice compila e la meccanica
+Job Object funziona su Windows": non introduce un coordinatore persistente,
+non fornisce IPC e non cambia lo stato `C012 PERSISTENT RUNTIME: NO-GO`. Le
+affermazioni precedenti secondo cui il Job Object non fosse mai stato
+compilato o esercitato su Windows sono da considerarsi superate da questo
+run, limitatamente allo smoke innocuo qui descritto.
 
 ## Portable root: una sola semantica
 

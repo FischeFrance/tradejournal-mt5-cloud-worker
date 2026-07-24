@@ -64,6 +64,13 @@ jobs:
       - name: Build JobHarness in offline mode
         run: dotnet build lab/mt5_direct_endpoint/src/JobHarness/JobHarness.csproj --configuration Release --nologo
 
+      - name: Build and run JobHarness.Coordinator.Tests
+        run: |
+          dotnet build lab/mt5_direct_endpoint/src/JobHarness/tests/JobHarness.Coordinator.Tests/JobHarness.Coordinator.Tests.csproj --configuration Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw "JobHarness.Coordinator.Tests build failed with exit code $LASTEXITCODE." }
+          dotnet run --project lab/mt5_direct_endpoint/src/JobHarness/tests/JobHarness.Coordinator.Tests/JobHarness.Coordinator.Tests.csproj --configuration Release --no-build
+          if ($LASTEXITCODE -ne 0) { throw "JobHarness.Coordinator.Tests failed with exit code $LASTEXITCODE." }
+
       - name: Run JobHarness smoke tests (offline harness)
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/src/JobHarness/scripts/Test-JobHarness.ps1
 

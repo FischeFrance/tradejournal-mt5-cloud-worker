@@ -7,12 +7,25 @@ Patch 7. Non autorizza l'esecuzione del laboratorio.
 PATCH: PATCH_READY NEL SOLO SCOPE OFFLINE
 HARNESS: PARTIALLY_READY
 OFFLINE REVIEW: READY
+WINDOWS HOSTED OFFLINE VALIDATION: GO (CI run #20, commit 0182629)
+HARMLESS JOB OBJECT RUNTIME SMOKE: PASS
+C012 PERSISTENT RUNTIME: NO-GO
 C0-C5: NON ESEGUITI
 WINDOWS RUNTIME: NO-GO
 MT5 EXECUTION: NOT RUN
 GO AL TEST REALE: NO-GO
 GO SUCCESSIVO: esclusivamente revisione indipendente offline
 ```
+
+La CI Windows offline (run #20, commit `0182629e27a6ef76795f721d885bd98f9e4cfefd`,
+runner Windows Server 2025 hosted) ha compilato il JobHarness (.NET 8 Release,
+0 warning/errori) ed esercitato il Job Object con un eseguibile innocuo:
+natural-exit e descendant-timeout smoke verdi, assegnazione al Job prima del
+resume, termination/drain e metadata hygiene verificati. Ha inoltre validato
+lo schema del profilo WPR ETW (`ValidateProfile`, exit code 0) e il dry-run
+PowerShell (986 assert, 0 mutazioni, 0 rete). Questo è harmless Windows
+smoke, non validazione del runtime MT5: non implica coordinatore C012, IPC,
+esecuzione di C0-C5 o `actual launch`, che resta `HARD_DISABLED`.
 
 Non avviare MT5 o MetaEditor, non usare credenziali, non creare bootstrap
 reali, non aprire rete esterna, non applicare Firewall/WFP, non leggere
@@ -306,6 +319,13 @@ fail-closed. Quel componente non è implementato da Patch 7. Non improvvisare
 tre lanci del JobHarness: violerebbero il contratto di sessione e root
 generation.
 
+La CI run #20 ha esercitato il Job Object one-shot con un eseguibile innocuo
+su Windows (natural-exit e descendant-timeout smoke, entrambi verdi) e ha
+confermato la meccanica di assegnazione/kill-on-close descritta sopra. Questo
+prova che il JobHarness compila e funziona come launcher one-shot su
+Windows; non introduce il coordinator persistente C012 né IPC, e non
+autorizza a simulare C0-C2 con tre invocazioni separate.
+
 ## 7. Pre-state e transizioni
 
 Acquisire concettualmente una sola fotografia
@@ -505,7 +525,9 @@ Servono almeno:
 1. review indipendente offline finale e freeze del contratto;
 2. coordinator persistente C012/IPC e threat model approvati;
 3. verifier captured indipendente;
-4. build .NET e test Job Object con processo innocuo su Windows;
+4. build .NET e test Job Object con processo innocuo su Windows —
+   **soddisfatto da CI run #20** per il solo smoke innocuo one-shot; resta
+   aperto il test del coordinator persistente C012 quando esisterà;
 5. test PowerShell PlanOnly/AST e dry-run Windows;
 6. deployment verifier EX5 del probe source/binary;
 7. validazione ETW/WFP senza broker, credenziali o rete esterna;
@@ -516,6 +538,9 @@ Decisione corrente:
 
 ```text
 REVISIONE INDIPENDENTE OFFLINE:        GO
+WINDOWS HOSTED OFFLINE VALIDATION:     GO (CI run #20, commit 0182629)
+HARMLESS JOB OBJECT RUNTIME SMOKE:     PASS
+C012 PERSISTENT RUNTIME:               NO-GO
 WINDOWS RUNTIME VALIDATION:            NO-GO
 C0-C5:                                 NO-GO
 MT5 / METAEDITOR / CREDENZIALI:        NO-GO
