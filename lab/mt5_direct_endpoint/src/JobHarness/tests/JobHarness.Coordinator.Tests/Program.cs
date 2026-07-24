@@ -849,6 +849,14 @@ static void ServerChannelReplayingIdenticalRejectedRequestIsRejectedIdentically(
 
 // ---- B3: client/server round trip ----
 
+// No Task.WhenAll here: ChannelWriter.WriteAsync on an unbounded channel always completes
+// synchronously (there is no capacity to wait for), so client.SendAsync(...) runs its write
+// inline on this thread and only genuinely suspends once it reaches the response read.
+// Calling the server synchronously right after therefore always finds the request already
+// sitting in the channel -- and once the server writes its response the same way, the
+// client task (awaited last) always finds it waiting too. This removes any dependency on
+// task-scheduler interleaving, which is what made the two earlier attempts at this test
+// (anonymous pipes, then Task.WhenAll over Channel-backed streams) hang in CI.
 static void ClientServerRoundTripHappyPathOverDuplexStreams()
 {
     using C012SessionSecret secret = C012SessionSecret.Generate();
@@ -859,13 +867,14 @@ static void ClientServerRoundTripHappyPathOverDuplexStreams()
     var server = new C012ServerChannel(pair.ServerStream, secret, sequencer);
     var client = new C012ClientChannel(pair.ClientStream, secret, sessionId);
 
-    Task<C012ChannelOutcome> serverTask = server.ProcessNextRequestAsync(CancellationToken.None);
-    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
-    Task.WhenAll(serverTask, clientTask).GetAwaiter().GetResult();
+    CancellationToken timeout = ShortTestTimeout();
+    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, timeout);
+    C012ChannelOutcome serverOutcome = server.ProcessNextRequestAsync(timeout).GetAwaiter().GetResult();
+    C012TransitionResult clientResult = clientTask.GetAwaiter().GetResult();
 
-    Assert(serverTask.Result == C012ChannelOutcome.RequestProcessed, "server must process the request");
-    Assert(clientTask.Result.Accepted, "client must observe acceptance");
-    Assert(clientTask.Result.ResultingState == C012State.C0JobCreating, "client must observe the resulting state");
+    Assert(serverOutcome == C012ChannelOutcome.RequestProcessed, "server must process the request");
+    Assert(clientResult.Accepted, "client must observe acceptance");
+    Assert(clientResult.ResultingState == C012State.C0JobCreating, "client must observe the resulting state");
 }
 
 static void ClientRejectsResponseWithWrongHmac()
@@ -879,13 +888,14 @@ static void ClientRejectsResponseWithWrongHmac()
     var server = new C012ServerChannel(pair.ServerStream, serverSecret, sequencer);
     var client = new C012ClientChannel(pair.ClientStream, clientSecret, sessionId);
 
-    Task<C012ChannelOutcome> serverTask = server.ProcessNextRequestAsync(CancellationToken.None);
-    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
+    CancellationToken timeout = ShortTestTimeout();
+    Task<C012TransitionResult> clientTask = client.SendAsync(C012Control.C0, C012RequestType.Start, timeout);
+    C012ChannelOutcome serverOutcome = server.ProcessNextRequestAsync(timeout).GetAwaiter().GetResult();
 
     bool threw = false;
     try
     {
-        Task.WhenAll(serverTask, clientTask).GetAwaiter().GetResult();
+        clientTask.GetAwaiter().GetResult();
     }
     catch (C012FramingException)
     {
@@ -893,7 +903,7 @@ static void ClientRejectsResponseWithWrongHmac()
     }
 
     Assert(threw, "the client must refuse a response signed with the wrong secret");
-    Assert(serverTask.Result == C012ChannelOutcome.AuthenticationFailed, "server must also reject the mismatched request");
+    Assert(serverOutcome == C012ChannelOutcome.AuthenticationFailed, "server must also reject the mismatched request");
 }
 
 static void ClientKeepsSameSequenceSlotAfterServerRejection()
@@ -906,22 +916,23 @@ static void ClientKeepsSameSequenceSlotAfterServerRejection()
     var serverForFirst = new C012ServerChannel(firstPair.ServerStream, secret, sequencer);
     var client = new C012ClientChannel(firstPair.ClientStream, secret, sessionId);
 
-    Task<C012ChannelOutcome> firstServerTask = serverForFirst.ProcessNextRequestAsync(CancellationToken.None);
-    Task<C012TransitionResult> firstClientTask = client.SendAsync(C012Control.C2, C012RequestType.SubmitConfig, CancellationToken.None);
-    Task.WhenAll(firstServerTask, firstClientTask).GetAwaiter().GetResult();
-    Assert(!firstClientTask.Result.Accepted, "premature C2 must be rejected");
+    Task<C012TransitionResult> firstClientTask =
+        client.SendAsync(C012Control.C2, C012RequestType.SubmitConfig, ShortTestTimeout());
+    _ = serverForFirst.ProcessNextRequestAsync(ShortTestTimeout()).GetAwaiter().GetResult();
+    C012TransitionResult firstClientResult = firstClientTask.GetAwaiter().GetResult();
+    Assert(!firstClientResult.Accepted, "premature C2 must be rejected");
 
     using DuplexPair secondPair = DuplexPair.Create();
     var serverForSecond = new C012ServerChannel(secondPair.ServerStream, secret, sequencer);
     var clientOnSecondPipe = new C012ClientChannel(secondPair.ClientStream, secret, sessionId);
     // A fresh C012ClientChannel starts at sequence 1 again; since the first (rejected) call
     // never advanced the shared sequencer's counter either, sequence 1 is still legal here.
-    Task<C012ChannelOutcome> secondServerTask = serverForSecond.ProcessNextRequestAsync(CancellationToken.None);
     Task<C012TransitionResult> secondClientTask =
-        clientOnSecondPipe.SendAsync(C012Control.C0, C012RequestType.Start, CancellationToken.None);
-    Task.WhenAll(secondServerTask, secondClientTask).GetAwaiter().GetResult();
+        clientOnSecondPipe.SendAsync(C012Control.C0, C012RequestType.Start, ShortTestTimeout());
+    _ = serverForSecond.ProcessNextRequestAsync(ShortTestTimeout()).GetAwaiter().GetResult();
+    C012TransitionResult secondClientResult = secondClientTask.GetAwaiter().GetResult();
 
-    Assert(secondClientTask.Result.Accepted, "sequence slot 1 must still be usable after the earlier rejection");
+    Assert(secondClientResult.Accepted, "sequence slot 1 must still be usable after the earlier rejection");
 }
 
 // ---- B3: duplex stream EOF/closure ----
@@ -988,6 +999,11 @@ static string CreateTemporaryDirectory()
     Directory.CreateDirectory(path);
     return path;
 }
+
+// Safety net for the client/server round-trip tests: if the deterministic ordering they
+// rely on is ever wrong, this turns a hang into a fast, clearly-reported failure instead of
+// exhausting the CI job's 25-minute ceiling.
+static CancellationToken ShortTestTimeout() => new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token;
 
 static void Assert(bool condition, string message)
 {
