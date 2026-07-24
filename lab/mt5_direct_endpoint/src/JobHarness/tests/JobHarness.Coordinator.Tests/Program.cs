@@ -773,7 +773,7 @@ static void ServerChannelAcceptsWellformedSignedC0Start()
     Assert(outcome == C012ChannelOutcome.RequestProcessed, "well-formed request must be processed");
     Assert(response is not null && response.Accepted, "C0 start from NotStarted must be accepted");
     Assert(response!.ResultingState == C012State.C0JobCreating, "resulting state must be C0JobCreating");
-    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response), "response must be validly signed");
+    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response!), "response must be validly signed");
     Assert(sequencer.CurrentState == C012State.C0JobCreating, "sequencer must reflect the accepted transition");
 }
 
@@ -821,7 +821,7 @@ static void ServerChannelDelegatesSequencerRejectionAndSignsResponse()
     Assert(outcome == C012ChannelOutcome.RequestProcessed, "an authenticated but FSM-rejected request still gets a response");
     Assert(response is not null && !response.Accepted, "premature C2 must be rejected by the FSM");
     Assert(response!.Reason == C012RejectionReason.IllegalTransition, "rejection reason must surface the FSM's reason");
-    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response), "rejection response must still be signed");
+    Assert(C012MessageAuthenticator.VerifyResponse(secret.Value, response!), "rejection response must still be signed");
     Assert(sequencer.CurrentState == C012State.NotStarted, "a rejected request must not advance sequencer state");
 }
 
@@ -839,7 +839,7 @@ static void ServerChannelReplayingIdenticalRejectedRequestIsRejectedIdentically(
     Assert(firstOutcome == C012ChannelOutcome.RequestProcessed && secondOutcome == C012ChannelOutcome.RequestProcessed,
         "resending an identical rejected request must still be processed, not blocked");
     Assert(!firstResponse!.Accepted && !secondResponse!.Accepted, "both attempts must be rejected");
-    Assert(firstResponse.Reason == secondResponse.Reason, "the resend must be rejected for the identical reason");
+    Assert(firstResponse!.Reason == secondResponse!.Reason, "the resend must be rejected for the identical reason");
     Assert(sequencer.CurrentState == C012State.NotStarted, "state must never move as a result of a rejected replay");
 }
 
@@ -951,7 +951,7 @@ static void ExchangeSingleRequest(
         stream.Position = requestEnd;
         byte[]? responseFrame = C012FrameCodec.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
         Assert(responseFrame is not null, "a processed request must be followed by a response frame");
-        response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame, C012WireJsonOptions.Instance);
+        response = JsonSerializer.Deserialize<C012WireResponse>(responseFrame!, C012WireJsonOptions.Instance);
     }
 }
 
