@@ -53,9 +53,13 @@ jobs:
       - name: Run offline Python test suite
         run: |
           python -m unittest discover -s lab/mt5_direct_endpoint/tests -q
+          if ($LASTEXITCODE -ne 0) { throw "Offline Python tests failed (lab suite) with exit code $LASTEXITCODE." }
           python -m unittest discover -s lab/mt5_direct_endpoint/mql5/tests -q
+          if ($LASTEXITCODE -ne 0) { throw "Offline Python tests failed (mql5 suite) with exit code $LASTEXITCODE." }
           python -m unittest discover -s lab/mt5_direct_endpoint/windows/tests -p "test_*.py" -q
+          if ($LASTEXITCODE -ne 0) { throw "Offline Python tests failed (windows suite) with exit code $LASTEXITCODE." }
           python -m compileall -q lab/mt5_direct_endpoint
+          if ($LASTEXITCODE -ne 0) { throw "compileall failed with exit code $LASTEXITCODE." }
 
       - name: Build JobHarness in offline mode
         run: dotnet build lab/mt5_direct_endpoint/src/JobHarness/JobHarness.csproj --configuration Release --nologo
@@ -71,12 +75,19 @@ jobs:
           -File lab/mt5_direct_endpoint/src/JobHarness/scripts/Test-JobHarness.ps1 -RunWindowsRuntimeSmoke
 
       - name: Validate WPR ETW profile
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass `
-          -File lab/mt5_direct_endpoint/windows/Invoke-LabWprCapture.ps1 `
-          -Action ValidateProfile `
-          -RunId ciwprprofile `
-          -Execute `
-          -Confirm:$false
+        run: |
+          $oldConfirmPreference = $ConfirmPreference
+          try {
+              $ErrorActionPreference = 'Stop'
+              $ConfirmPreference = 'None'
+              & "${{ github.workspace }}\lab\mt5_direct_endpoint\windows\Invoke-LabWprCapture.ps1" -Action ValidateProfile -RunId ciwprprofile -Execute -Confirm:$false
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Validate WPR profile failed with exit code $LASTEXITCODE."
+              }
+          }
+          finally {
+              $ConfirmPreference = $oldConfirmPreference
+          }
 
       - name: Run PowerShell dry-run self test
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/windows/tests/Invoke-DryRunSelfTest.ps1
@@ -85,6 +96,7 @@ jobs:
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/windows/tests/Invoke-PreStateScannerDryRunTest.ps1
 
       - name: Verify no blocked terminal/metaeditor processes remain
+        if: always()
         run: |
           $forbiddenProcesses = @('terminal', 'terminal64', 'metaeditor', 'metaeditor64')
           $found = @()

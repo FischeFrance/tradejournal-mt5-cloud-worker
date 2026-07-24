@@ -669,7 +669,9 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
     string systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
         ?? throw new InvalidOperationException("SystemRoot is unavailable.");
     string cmd = Path.Combine(systemRoot, "System32", "cmd.exe");
-    WithTemporaryDirectory(directory =>
+    string directory = Path.Combine(Path.GetTempPath(), $"jobharness-test-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
     {
         using var lease = TargetExecutableLease.Open(cmd);
         string metadataPath = Path.Combine(directory, "metadata.json");
@@ -692,7 +694,7 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
 
         HarnessMetadata metadata = HarnessMetadataFactory.Create(options, lease, "S-1-5-18");
         metadata.Status = HarnessStatus.Validated;
-        using var writer = new MetadataWriter(metadataPath);
+        var writer = new MetadataWriter(metadataPath);
 
         JobRunResult result = JobObjectRunner.Run(options, metadata, writer);
         Assert(result.ExitCode == 0, "natural exit runtime smoke exit code");
@@ -720,7 +722,11 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
         Assert(!json.Contains("password", StringComparison.OrdinalIgnoreCase), "natural exit metadata no password");
         Assert(!json.Contains("login", StringComparison.OrdinalIgnoreCase), "natural exit metadata no login");
         Assert(!json.Contains("token", StringComparison.OrdinalIgnoreCase), "natural exit metadata no token");
-    });
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
 }
 
 static void OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke()
@@ -731,7 +737,9 @@ static void OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke()
     }
 
     string executable = RequireCurrentExecutable();
-    WithTemporaryDirectory(directory =>
+    string directory = Path.Combine(Path.GetTempPath(), $"jobharness-test-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(directory);
+    try
     {
         string metadataPath = Path.Combine(directory, "metadata.json");
         string childReadyPath = Path.Combine(directory, "child-ready.txt");
@@ -755,7 +763,7 @@ static void OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke()
 
         HarnessMetadata metadata = HarnessMetadataFactory.Create(options, lease, "S-1-5-18");
         metadata.Status = HarnessStatus.Validated;
-        using var writer = new MetadataWriter(metadataPath);
+        var writer = new MetadataWriter(metadataPath);
 
         JobRunResult result = JobObjectRunner.Run(options, metadata, writer);
         Assert(result.ExitCode == 124, "descendant timeout runtime smoke exit code");
@@ -779,10 +787,14 @@ static void OptionalWindowsJobObjectDescendantTimeoutRuntimeSmoke()
             "descendant child process did not terminate");
         Assert(
             WaitUntilProcessNotFound(
-                metadata.Process.RootPid!.Value,
+                metadata.Process.RootPid,
                 TimeSpan.FromSeconds(5)),
             "descendant root process did not terminate");
-    });
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
 }
 
 static HarnessRuntime CreateFakeWindowsRuntime(
@@ -867,7 +879,7 @@ static (int ChildPid, long ChildStartTime) ParseChildReadyRecord(string path)
     return (pid, startTime);
 }
 
-static bool WaitUntilProcessNotFound(int? processId, TimeSpan timeout)
+static bool WaitUntilProcessNotFound(uint? processId, TimeSpan timeout)
 {
     if (processId is null)
     {
@@ -877,7 +889,7 @@ static bool WaitUntilProcessNotFound(int? processId, TimeSpan timeout)
     Stopwatch timer = Stopwatch.StartNew();
     while (timer.Elapsed < timeout)
     {
-        if (Process.GetProcesses().All(process => process.Id != processId.Value))
+        if (Process.GetProcesses().All(process => process.Id != (int)processId.Value))
         {
             return true;
         }
