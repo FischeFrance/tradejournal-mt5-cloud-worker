@@ -75,7 +75,8 @@ jobs:
           -File lab/mt5_direct_endpoint/windows/Invoke-LabWprCapture.ps1 `
           -Action ValidateProfile `
           -RunId ciwprprofile `
-          -Execute
+          -Execute `
+          -Confirm:$false
 
       - name: Run PowerShell dry-run self test
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/windows/tests/Invoke-DryRunSelfTest.ps1
