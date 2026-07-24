@@ -10,6 +10,7 @@ var tests = new (string Name, Action Body)[]
     ("no_transition_ever_moves_backward_or_repeats_a_state", NoTransitionEverMovesBackwardOrRepeatsAState),
     ("timeout_from_several_states_fails_closed", TimeoutFromSeveralStatesFailsClosed),
     ("root_process_died_from_several_states_fails_closed", RootProcessDiedFromSeveralStatesFailsClosed),
+    ("operation_failed_from_several_states_fails_closed", OperationFailedFromSeveralStatesFailsClosed),
     ("failed_closed_rejects_every_further_trigger", FailedClosedRejectsEveryFurtherTrigger),
     ("terminated_is_irreversible", TerminatedIsIrreversible),
     ("c1_is_accepted_only_after_c0_retained", C1IsAcceptedOnlyAfterC0Retained),
@@ -65,6 +66,24 @@ var tests = new (string Name, Action Body)[]
     // B3: duplex stream EOF/closure
     ("channel_stream_read_returns_zero_after_writer_completes", ChannelStreamReadReturnsZeroAfterWriterCompletes),
     ("duplex_pair_dispose_completes_both_channels_without_hanging", DuplexPairDisposeCompletesBothChannelsWithoutHanging),
+
+    // B4.1: orchestrating processor
+    ("orchestrating_processor_c0_success_calls_launcher_in_order_and_reaches_c0_retained", OrchestratingProcessorC0SuccessCallsLauncherInOrderAndReachesC0Retained),
+    ("orchestrating_processor_c0_fails_when_create_job_throws", OrchestratingProcessorC0FailsWhenCreateJobThrows),
+    ("orchestrating_processor_c0_fails_when_launch_root_throws", OrchestratingProcessorC0FailsWhenLaunchRootThrows),
+    ("orchestrating_processor_c0_fails_when_assign_root_throws", OrchestratingProcessorC0FailsWhenAssignRootThrows),
+    ("orchestrating_processor_c0_fails_when_resume_root_throws", OrchestratingProcessorC0FailsWhenResumeRootThrows),
+    ("orchestrating_processor_c1_success_reaches_c1_retained", OrchestratingProcessorC1SuccessReachesC1Retained),
+    ("orchestrating_processor_c1_fails_root_died_when_verify_root_alive_returns_false", OrchestratingProcessorC1FailsRootDiedWhenVerifyRootAliveReturnsFalse),
+    ("orchestrating_processor_c1_fails_operation_when_verify_root_alive_throws", OrchestratingProcessorC1FailsOperationWhenVerifyRootAliveThrows),
+    ("orchestrating_processor_c2_fails_when_launch_submitter_throws", OrchestratingProcessorC2FailsWhenLaunchSubmitterThrows),
+    ("orchestrating_processor_c2_fails_when_assign_submitter_throws", OrchestratingProcessorC2FailsWhenAssignSubmitterThrows),
+    ("orchestrating_processor_c2_fails_when_verify_same_job_returns_false", OrchestratingProcessorC2FailsWhenVerifySameJobReturnsFalse),
+    ("orchestrating_processor_c2_fails_when_verify_same_job_throws", OrchestratingProcessorC2FailsWhenVerifySameJobThrows),
+    ("orchestrating_processor_c2_success_reaches_terminated_and_tears_down_exactly_once", OrchestratingProcessorC2SuccessReachesTerminatedAndTearsDownExactlyOnce),
+    ("orchestrating_processor_c2_fails_when_teardown_throws_and_does_not_double_teardown", OrchestratingProcessorC2FailsWhenTeardownThrowsAndDoesNotDoubleTeardown),
+    ("orchestrating_processor_never_calls_launcher_once_failed_closed", OrchestratingProcessorNeverCallsLauncherOnceFailedClosed),
+    ("orchestrating_processor_rejects_illegal_request_without_touching_launcher", OrchestratingProcessorRejectsIllegalRequestWithoutTouchingLauncher),
 };
 
 int failures = 0;
@@ -148,11 +167,14 @@ static void AllTransitionsTableMatchesExpectedShape()
             t.From == state && t.Trigger == C012Trigger.Timeout && t.To == C012State.FailedClosed);
         bool hasRootDiedEdge = C012StateMachine.AllTransitions.Any(t =>
             t.From == state && t.Trigger == C012Trigger.RootProcessDied && t.To == C012State.FailedClosed);
+        bool hasOperationFailedEdge = C012StateMachine.AllTransitions.Any(t =>
+            t.From == state && t.Trigger == C012Trigger.OperationFailed && t.To == C012State.FailedClosed);
         Assert(hasTimeoutEdge, $"missing Timeout edge from {state}");
         Assert(hasRootDiedEdge, $"missing RootProcessDied edge from {state}");
+        Assert(hasOperationFailedEdge, $"missing OperationFailed edge from {state}");
     }
 
-    int expectedCount = expectedHappyPath.Length + (nonTerminal.Length * 2);
+    int expectedCount = expectedHappyPath.Length + (nonTerminal.Length * 3);
     Assert(C012StateMachine.AllTransitions.Count == expectedCount, "transition table size");
 }
 
@@ -232,6 +254,19 @@ static void RootProcessDiedFromSeveralStatesFailsClosed()
         C012StateMachine machine = MachineForcedInto(state);
         C012TransitionResult result = machine.Apply(C012Trigger.RootProcessDied);
         Assert(result.Accepted && result.ResultingState == C012State.FailedClosed, $"root died from {state} must fail closed");
+    }
+}
+
+static void OperationFailedFromSeveralStatesFailsClosed()
+{
+    foreach (C012State state in new[]
+             {
+                 C012State.C0JobCreating, C012State.C1DiscoveryRunning, C012State.C2LoginWindow,
+             })
+    {
+        C012StateMachine machine = MachineForcedInto(state);
+        C012TransitionResult result = machine.Apply(C012Trigger.OperationFailed);
+        Assert(result.Accepted && result.ResultingState == C012State.FailedClosed, $"operation failed from {state} must fail closed");
     }
 }
 
@@ -970,6 +1005,434 @@ static void DuplexPairDisposeCompletesBothChannelsWithoutHanging()
     int clientRead = pair.ClientStream.ReadAsync(new byte[4], CancellationToken.None).GetAwaiter().GetResult();
     Assert(serverRead == 0, "reading the server side after Dispose must return 0, not hang");
     Assert(clientRead == 0, "reading the client side after Dispose must return 0, not hang");
+}
+
+// ---- B4.1: orchestrating processor ----
+
+static void OrchestratingProcessorC0SuccessCallsLauncherInOrderAndReachesC0Retained()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(result.Accepted, "C0 must be accepted when every launcher call succeeds");
+    Assert(result.ResultingState == C012State.C0Retained, "C0 success must reach C0Retained");
+    Assert(
+        launcher.Calls.SequenceEqual(new[]
+        {
+            nameof(IC012RootProcessLauncher.CreateJob),
+            nameof(IC012RootProcessLauncher.LaunchSuspendedRoot),
+            nameof(IC012RootProcessLauncher.AssignRootToJob),
+            nameof(IC012RootProcessLauncher.ResumeRoot),
+        }),
+        "C0 must call exactly these launcher operations in this order");
+}
+
+static void OrchestratingProcessorC0FailsWhenCreateJobThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        CreateJobFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(!result.Accepted, "a CreateJob failure must not be accepted");
+    Assert(result.ResultingState == C012State.FailedClosed, "a CreateJob failure must fail closed");
+    Assert(result.Reason == C012RejectionReason.OperationFailed, "reason must be OperationFailed");
+    Assert(
+        launcher.Calls.SequenceEqual(new[] { nameof(IC012RootProcessLauncher.CreateJob) }),
+        "no further launcher call may happen after CreateJob fails");
+    Assert(launcher.TeardownJobCallCount == 0, "nothing was created, so nothing may be torn down");
+}
+
+static void OrchestratingProcessorC0FailsWhenLaunchRootThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        LaunchSuspendedRootFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "a LaunchSuspendedRoot failure must fail closed");
+    Assert(result.Reason == C012RejectionReason.OperationFailed, "reason must be OperationFailed");
+    Assert(
+        !launcher.Calls.Contains(nameof(IC012RootProcessLauncher.AssignRootToJob)),
+        "AssignRootToJob must never run once LaunchSuspendedRoot has failed");
+    Assert(launcher.TeardownJobCallCount == 1, "the already-created Job must be torn down");
+}
+
+static void OrchestratingProcessorC0FailsWhenAssignRootThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        AssignRootToJobFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "an AssignRootToJob failure must fail closed");
+    Assert(
+        !launcher.Calls.Contains(nameof(IC012RootProcessLauncher.ResumeRoot)),
+        "ResumeRoot must never run once AssignRootToJob has failed");
+    Assert(launcher.TeardownJobCallCount == 1, "the already-created Job must be torn down");
+}
+
+static void OrchestratingProcessorC0FailsWhenResumeRootThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        ResumeRootFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "a ResumeRoot failure must fail closed");
+    Assert(launcher.TeardownJobCallCount == 1, "the already-created Job must be torn down");
+}
+
+static void OrchestratingProcessorC1SuccessReachesC1Retained()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+
+    Assert(result.Accepted && result.ResultingState == C012State.C1Retained, "C1 success must reach C1Retained");
+    Assert(launcher.Calls.Contains(nameof(IC012RootProcessLauncher.VerifyRootAlive)), "C1 must verify root liveness");
+}
+
+static void OrchestratingProcessorC1FailsRootDiedWhenVerifyRootAliveReturnsFalse()
+{
+    var launcher = new FakeRootProcessLauncher { VerifyRootAliveResult = false };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+
+    Assert(
+        !result.Accepted && result.ResultingState == C012State.FailedClosed,
+        "a negative liveness check must fail closed");
+    Assert(
+        result.Reason == C012RejectionReason.RootProcessDied,
+        "a completed check that determined the root is gone must report RootProcessDied, not OperationFailed");
+}
+
+static void OrchestratingProcessorC1FailsOperationWhenVerifyRootAliveThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        VerifyRootAliveFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+
+    Assert(
+        !result.Accepted && result.ResultingState == C012State.FailedClosed,
+        "a liveness check that could not run must fail closed");
+    Assert(
+        result.Reason == C012RejectionReason.OperationFailed,
+        "a check that could not complete must report OperationFailed, not RootProcessDied");
+}
+
+static void OrchestratingProcessorC2FailsWhenLaunchSubmitterThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        LaunchSuspendedSubmitterFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "a LaunchSuspendedSubmitter failure must fail closed");
+    Assert(
+        !launcher.Calls.Contains(nameof(IC012RootProcessLauncher.AssignSubmitterToJob)),
+        "AssignSubmitterToJob must never run once LaunchSuspendedSubmitter has failed");
+}
+
+static void OrchestratingProcessorC2FailsWhenAssignSubmitterThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        AssignSubmitterToJobFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "an AssignSubmitterToJob failure must fail closed");
+    Assert(
+        !launcher.Calls.Contains(nameof(IC012RootProcessLauncher.VerifySubmitterSameJob)),
+        "VerifySubmitterSameJob must never run once AssignSubmitterToJob has failed");
+}
+
+static void OrchestratingProcessorC2FailsWhenVerifySameJobReturnsFalse()
+{
+    var launcher = new FakeRootProcessLauncher { VerifySubmitterSameJobResult = false };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(
+        !result.Accepted && result.ResultingState == C012State.FailedClosed,
+        "the submitter must never be resumed if it is not confirmed to be in the same Job");
+    Assert(result.Reason == C012RejectionReason.OperationFailed, "reason must be OperationFailed");
+    Assert(
+        !launcher.Calls.Contains(nameof(IC012RootProcessLauncher.ResumeAndAwaitSubmitter)),
+        "the submitter must not be resumed once same-job verification fails");
+}
+
+static void OrchestratingProcessorC2FailsWhenVerifySameJobThrows()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        VerifySubmitterSameJobFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "a same-job check that could not run must fail closed");
+}
+
+static void OrchestratingProcessorC2SuccessReachesTerminatedAndTearsDownExactlyOnce()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(result.Accepted && result.ResultingState == C012State.Terminated, "C2 success must reach Terminated");
+    Assert(launcher.TeardownJobCallCount == 1, "the Job must be torn down exactly once on success");
+    Assert(
+        launcher.Calls.Contains(nameof(IC012RootProcessLauncher.ResumeAndAwaitSubmitter)),
+        "the submitter must be resumed and awaited once verified to be in the same Job");
+}
+
+static void OrchestratingProcessorC2FailsWhenTeardownThrowsAndDoesNotDoubleTeardown()
+{
+    var launcher = new FakeRootProcessLauncher
+    {
+        TeardownJobFault = () => throw new InvalidOperationException("simulated"),
+    };
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+    DriveC1ToRetained(processor, sessionId);
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 3, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(
+        !result.Accepted && result.ResultingState == C012State.FailedClosed,
+        "a teardown failure must not be reported as a successful Terminated session");
+    Assert(launcher.TeardownJobCallCount == 1, "teardown must be attempted exactly once, never retried");
+}
+
+static void OrchestratingProcessorNeverCallsLauncherOnceFailedClosed()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    // Simulate a host-driven watchdog timeout applied directly to the shared sequencer,
+    // bypassing the processor entirely -- exactly as a real host's timer would.
+    sequencer.ApplyInternal(C012Trigger.Timeout);
+    launcher.Calls.Clear();
+
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+
+    Assert(!result.Accepted && result.ResultingState == C012State.FailedClosed, "a request after FailedClosed must be rejected");
+    Assert(launcher.Calls.Count == 0, "no launcher call may happen once the session is FailedClosed");
+}
+
+static void OrchestratingProcessorRejectsIllegalRequestWithoutTouchingLauncher()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    // C2 before C0/C1: the gate must reject this before the launcher is ever touched.
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C2, C012RequestType.SubmitConfig));
+
+    Assert(!result.Accepted, "C2 before C0/C1 must be rejected");
+    Assert(launcher.Calls.Count == 0, "an illegal request must never reach the launcher");
+}
+
+static void DriveC0ToRetained(C012OrchestratingProcessor processor, Guid sessionId)
+{
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 1, C012Control.C0, C012RequestType.Start));
+    Assert(result.Accepted && result.ResultingState == C012State.C0Retained, "setup: C0 must reach C0Retained");
+}
+
+static void DriveC1ToRetained(C012OrchestratingProcessor processor, Guid sessionId)
+{
+    C012TransitionResult result = processor.Apply(
+        new C012RequestEnvelope(sessionId, 2, C012Control.C1, C012RequestType.Query));
+    Assert(result.Accepted && result.ResultingState == C012State.C1Retained, "setup: C1 must reach C1Retained");
+}
+
+internal sealed class FakeRootProcessLauncher : IC012RootProcessLauncher
+{
+    public List<string> Calls { get; } = new();
+
+    public Action? CreateJobFault { get; set; }
+
+    public Action? LaunchSuspendedRootFault { get; set; }
+
+    public Action? AssignRootToJobFault { get; set; }
+
+    public Action? ResumeRootFault { get; set; }
+
+    public bool VerifyRootAliveResult { get; set; } = true;
+
+    public Action? VerifyRootAliveFault { get; set; }
+
+    public Action? LaunchSuspendedSubmitterFault { get; set; }
+
+    public Action? AssignSubmitterToJobFault { get; set; }
+
+    public bool VerifySubmitterSameJobResult { get; set; } = true;
+
+    public Action? VerifySubmitterSameJobFault { get; set; }
+
+    public Action? ResumeAndAwaitSubmitterFault { get; set; }
+
+    public Action? TeardownJobFault { get; set; }
+
+    public int TeardownJobCallCount { get; private set; }
+
+    public C012JobToken CreateJob()
+    {
+        Calls.Add(nameof(CreateJob));
+        CreateJobFault?.Invoke();
+        return new C012JobToken(new object());
+    }
+
+    public C012ProcessToken LaunchSuspendedRoot(C012JobToken job)
+    {
+        Calls.Add(nameof(LaunchSuspendedRoot));
+        LaunchSuspendedRootFault?.Invoke();
+        return new C012ProcessToken(new object());
+    }
+
+    public void AssignRootToJob(C012JobToken job, C012ProcessToken root)
+    {
+        Calls.Add(nameof(AssignRootToJob));
+        AssignRootToJobFault?.Invoke();
+    }
+
+    public void ResumeRoot(C012ProcessToken root)
+    {
+        Calls.Add(nameof(ResumeRoot));
+        ResumeRootFault?.Invoke();
+    }
+
+    public bool VerifyRootAlive(C012JobToken job, C012ProcessToken root)
+    {
+        Calls.Add(nameof(VerifyRootAlive));
+        VerifyRootAliveFault?.Invoke();
+        return VerifyRootAliveResult;
+    }
+
+    public C012ProcessToken LaunchSuspendedSubmitter(C012JobToken job)
+    {
+        Calls.Add(nameof(LaunchSuspendedSubmitter));
+        LaunchSuspendedSubmitterFault?.Invoke();
+        return new C012ProcessToken(new object());
+    }
+
+    public void AssignSubmitterToJob(C012JobToken job, C012ProcessToken submitter)
+    {
+        Calls.Add(nameof(AssignSubmitterToJob));
+        AssignSubmitterToJobFault?.Invoke();
+    }
+
+    public bool VerifySubmitterSameJob(C012JobToken job, C012ProcessToken submitter)
+    {
+        Calls.Add(nameof(VerifySubmitterSameJob));
+        VerifySubmitterSameJobFault?.Invoke();
+        return VerifySubmitterSameJobResult;
+    }
+
+    public void ResumeAndAwaitSubmitter(C012JobToken job, C012ProcessToken submitter)
+    {
+        Calls.Add(nameof(ResumeAndAwaitSubmitter));
+        ResumeAndAwaitSubmitterFault?.Invoke();
+    }
+
+    public void TeardownJob(C012JobToken job)
+    {
+        Calls.Add(nameof(TeardownJob));
+        TeardownJobCallCount++;
+        TeardownJobFault?.Invoke();
+    }
 }
 
 // ---- shared helpers ----

@@ -21,7 +21,11 @@ public enum C012State
 
 // BeginC0/BeginC1/BeginC2 are the only triggers that may originate from a sequence-gated
 // client request (see C012RequestSequencer). The rest are host-internal progress or failure
-// signals, applied directly and never sequence-numbered.
+// signals, applied directly and never sequence-numbered. OperationFailed is the third
+// universal fail-closed signal (alongside Timeout and RootProcessDied): a real side effect
+// (Job creation, process launch, assignment, resume, same-job verification, teardown)
+// failed or could not be completed. It is distinct from RootProcessDied, which is reserved
+// for a completed liveness check that determined the root is specifically gone.
 public enum C012Trigger
 {
     BeginC0,
@@ -35,8 +39,12 @@ public enum C012Trigger
     C2TeardownComplete,
     Timeout,
     RootProcessDied,
+    OperationFailed,
 }
 
+// OperationFailed and RootProcessDied here mirror the identically-named triggers: they let
+// a client-facing response say *why* its specific request was not accepted (Accepted=false)
+// even though the underlying FSM trigger that produced FailedClosed was itself legal.
 public enum C012RejectionReason
 {
     None,
@@ -45,6 +53,8 @@ public enum C012RejectionReason
     SessionMismatch,
     SequenceOutOfOrder,
     InvalidRequest,
+    OperationFailed,
+    RootProcessDied,
 }
 
 public sealed record C012Transition(C012State From, C012Trigger Trigger, C012State To);

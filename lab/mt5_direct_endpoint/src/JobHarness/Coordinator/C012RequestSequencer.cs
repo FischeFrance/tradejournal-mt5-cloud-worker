@@ -3,7 +3,7 @@ namespace TradeJournal.Lab.JobHarness.Coordinator;
 // Binds a C012StateMachine to one session id and enforces strictly monotonic request
 // sequencing before any trigger reaches the machine. A rejected request never reaches
 // C012StateMachine.Apply, so state and the accepted-sequence counter are provably untouched.
-public sealed class C012RequestSequencer
+public sealed class C012RequestSequencer : IC012RequestProcessor
 {
     private readonly C012StateMachine _machine = new();
     private long _lastAcceptedSequence;

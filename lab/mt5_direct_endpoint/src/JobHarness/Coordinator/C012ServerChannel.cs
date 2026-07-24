@@ -11,25 +11,27 @@ public enum C012ChannelOutcome
 }
 
 // Server side of one accepted IPC connection. Every incoming frame is framed, structurally
-// validated, and HMAC-verified before it ever reaches the wrapped C012RequestSequencer; a
+// validated, and HMAC-verified before it ever reaches the wrapped IC012RequestProcessor; a
 // message that fails any of those checks is refused silently (no response frame is sent)
-// and never mutates the sequencer's state. A message that reaches the sequencer and is
-// rejected there gets a normal, signed rejection response -- that is ordinary protocol
-// operation, not a security event.
+// and never mutates any state. A message that reaches the processor and is rejected there
+// gets a normal, signed rejection response -- that is ordinary protocol operation, not a
+// security event. The processor is a bare C012RequestSequencer for B2/B3-level testing, or
+// a C012OrchestratingProcessor once real side effects are involved (B4.1) -- this class
+// does not need to know which.
 public sealed class C012ServerChannel
 {
     private readonly Stream _stream;
     private readonly C012SessionSecret _secret;
-    private readonly C012RequestSequencer _sequencer;
+    private readonly IC012RequestProcessor _requestProcessor;
 
-    public C012ServerChannel(Stream stream, C012SessionSecret secret, C012RequestSequencer sequencer)
+    public C012ServerChannel(Stream stream, C012SessionSecret secret, IC012RequestProcessor requestProcessor)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(secret);
-        ArgumentNullException.ThrowIfNull(sequencer);
+        ArgumentNullException.ThrowIfNull(requestProcessor);
         _stream = stream;
         _secret = secret;
-        _sequencer = sequencer;
+        _requestProcessor = requestProcessor;
     }
 
     public async Task<C012ChannelOutcome> ProcessNextRequestAsync(CancellationToken cancellationToken)
@@ -65,7 +67,7 @@ public sealed class C012ServerChannel
         }
 
         var envelope = new C012RequestEnvelope(request.SessionId, request.SequenceNumber, request.Control, request.RequestType);
-        C012TransitionResult result = _sequencer.Apply(envelope);
+        C012TransitionResult result = _requestProcessor.Apply(envelope);
         C012WireResponse response = BuildSignedResponse(request, result);
 
         try

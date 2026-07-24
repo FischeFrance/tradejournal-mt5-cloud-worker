@@ -57,6 +57,7 @@ public sealed class C012StateMachine
 
             all.Add(new C012Transition(state, C012Trigger.Timeout, C012State.FailedClosed));
             all.Add(new C012Transition(state, C012Trigger.RootProcessDied, C012State.FailedClosed));
+            all.Add(new C012Transition(state, C012Trigger.OperationFailed, C012State.FailedClosed));
         }
 
         return all;
