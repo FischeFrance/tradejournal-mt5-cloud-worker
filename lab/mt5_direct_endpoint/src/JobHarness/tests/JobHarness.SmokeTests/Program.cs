@@ -12,6 +12,11 @@ if (args is ["--innocent-sleeper"])
     return 0;
 }
 
+if (args is ["--innocent-exit-zero"])
+{
+    return 0;
+}
+
 if (args is ["--innocent-process-tree", var childReadyPath])
 {
     using Process child = Process.Start(CreateSelfStartInfo("--innocent-child", childReadyPath))
@@ -678,20 +683,18 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
         return;
     }
 
-    string systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
-        ?? throw new InvalidOperationException("SystemRoot is unavailable.");
-    string cmd = Path.Combine(systemRoot, "System32", "cmd.exe");
+    string executable = RequireCurrentExecutable();
     string directory = Path.Combine(Path.GetTempPath(), $"jobharness-test-{Guid.NewGuid():N}");
     Directory.CreateDirectory(directory);
     try
     {
-        using var lease = TargetExecutableLease.Open(cmd);
+        using var lease = TargetExecutableLease.Open(executable);
         string metadataPath = Path.Combine(directory, "metadata.json");
 
         var options = new LaunchOptions(
-            cmd,
-            ["/d", "/c", "exit", "0"],
-            Path.GetDirectoryName(cmd)!,
+            executable,
+            ["--innocent-exit-zero"],
+            Path.GetDirectoryName(executable)!,
             metadataPath,
             ComputeSha256(cmd),
             Guid.NewGuid().ToString("D"),
@@ -728,9 +731,7 @@ static void OptionalWindowsJobObjectNaturalExitRuntimeSmoke()
         Assert(metadata.LaunchPolicy.ActualLaunchCapability == "HARD_DISABLED", "natural exit hard-disabled launch policy");
 
         string json = File.ReadAllText(metadataPath, Encoding.UTF8);
-        Assert(!json.Contains("/d", StringComparison.Ordinal), "natural exit metadata omitted /d");
-        Assert(!json.Contains("/c", StringComparison.Ordinal), "natural exit metadata omitted /c");
-        Assert(!json.Contains("exit 0", StringComparison.Ordinal), "natural exit metadata omitted command line");
+        Assert(!json.Contains("--innocent-exit-zero", StringComparison.Ordinal), "natural exit metadata omitted command line");
         Assert(!json.Contains("password", StringComparison.OrdinalIgnoreCase), "natural exit metadata no password");
         Assert(!json.Contains("login", StringComparison.OrdinalIgnoreCase), "natural exit metadata no login");
         Assert(!json.Contains("token", StringComparison.OrdinalIgnoreCase), "natural exit metadata no token");
