@@ -184,6 +184,27 @@ public sealed class C012OrchestratingProcessor : IC012RequestProcessor
         return new C012TransitionResult(false, C012State.FailedClosed, C012RejectionReason.RootProcessDied);
     }
 
+    // The only path by which a host loop (C012HostCli.ListenLoopAsync) may fail a session
+    // closed: an idle timeout (waiting for a connection, or while a request was in flight),
+    // the malformed/auth-failure cap being exceeded, or an unexpected internal loop error --
+    // none of these are a client request, so none of them can go through Apply. Applies the
+    // trigger through the sequencer, the same gate every other transition goes through, then
+    // runs the exact same teardown path as every other failure. TryTeardownReporting's own
+    // guard makes a redundant or overlapping call harmless, so the host loop never needs its
+    // own teardown logic or its own handle to the launcher.
+    public void FailFromHost(C012Trigger trigger)
+    {
+        if (trigger is C012Trigger.BeginC0 or C012Trigger.BeginC1 or C012Trigger.BeginC2)
+        {
+            throw new ArgumentException(
+                $"{trigger} is client-originated and must go through {nameof(Apply)}({nameof(C012RequestEnvelope)}).",
+                nameof(trigger));
+        }
+
+        _sequencer.ApplyInternal(trigger);
+        TryTeardownReporting();
+    }
+
     // Tears down the Job at most once, regardless of whether it is called from the normal
     // C2 completion path or from a failure path -- calling it twice would either be a
     // meaningless no-op or, for a real native implementation, an error on an

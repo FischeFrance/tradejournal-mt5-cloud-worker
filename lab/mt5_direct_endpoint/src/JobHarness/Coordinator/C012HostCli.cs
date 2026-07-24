@@ -165,7 +165,19 @@ public static class C012HostCli
             }
             catch (OperationCanceledException)
             {
-                sequencer.ApplyInternal(C012Trigger.Timeout);
+                // Every host-originated fail-closed path goes through the orchestrator, never
+                // straight through the sequencer: only FailFromHost tears down a real
+                // Job/root/submitter, and it does so idempotently.
+                processor.FailFromHost(C012Trigger.Timeout);
+                break;
+            }
+            catch (Exception)
+            {
+                // An unexpected failure while merely waiting for a connection is still a
+                // host-loop-level error, not a normal protocol outcome: fail closed and tear
+                // down rather than let it escape uncontrolled or leave the Job/root/submitter
+                // running with nothing left listening for them.
+                processor.FailFromHost(C012Trigger.OperationFailed);
                 break;
             }
 
@@ -178,7 +190,13 @@ public static class C012HostCli
             catch (OperationCanceledException)
             {
                 TryDisconnect(pipe);
-                sequencer.ApplyInternal(C012Trigger.Timeout);
+                processor.FailFromHost(C012Trigger.Timeout);
+                break;
+            }
+            catch (Exception)
+            {
+                TryDisconnect(pipe);
+                processor.FailFromHost(C012Trigger.OperationFailed);
                 break;
             }
 
@@ -191,7 +209,7 @@ public static class C012HostCli
                     is C012State.C2Submitting or C012State.C2LoginWindow or C012State.C2Teardown;
                 if (afterC2Dispatch || consecutiveUnproductiveFailures > ConsecutiveUnproductiveFailureCap)
                 {
-                    sequencer.ApplyInternal(C012Trigger.OperationFailed);
+                    processor.FailFromHost(C012Trigger.OperationFailed);
                     break;
                 }
             }
@@ -207,16 +225,21 @@ public static class C012HostCli
         return sequencer.CurrentState == C012State.Terminated ? ExitTerminated : ExitFailedClosed;
     }
 
+    // Always attempts the reset, never gated on IsConnected: after a response write fails
+    // because the peer already severed the connection, IsConnected is not guaranteed to have
+    // already flipped to false (it is a .NET-tracked flag, not necessarily updated by a
+    // failed I/O operation), so gating on it here could skip the one call that frees this
+    // pipe instance for the next WaitForConnectionAsync. Catches any exception, not only
+    // IOException: disconnecting an already-broken or never-fully-connected pipe instance can
+    // surface other exception types, and none of them may be allowed to escape uncaught --
+    // doing so would silently stop the whole host loop from ever listening again.
     private static void TryDisconnect(NamedPipeServerStream pipe)
     {
         try
         {
-            if (pipe.IsConnected)
-            {
-                pipe.Disconnect();
-            }
+            pipe.Disconnect();
         }
-        catch (IOException)
+        catch (Exception)
         {
         }
     }

@@ -154,6 +154,11 @@ var tests = new (string Name, Action Body)[]
     ("orchestrating_processor_never_calls_launcher_once_failed_closed", OrchestratingProcessorNeverCallsLauncherOnceFailedClosed),
     ("orchestrating_processor_rejects_illegal_request_without_touching_launcher", OrchestratingProcessorRejectsIllegalRequestWithoutTouchingLauncher),
 
+    // B4.4 fix: the host-loop-to-orchestrator teardown seam
+    ("orchestrating_processor_fail_from_host_tears_down_after_c0_and_reaches_failed_closed", OrchestratingProcessorFailFromHostTearsDownAfterC0AndReachesFailedClosed),
+    ("orchestrating_processor_fail_from_host_is_idempotent_if_called_twice", OrchestratingProcessorFailFromHostIsIdempotentIfCalledTwice),
+    ("orchestrating_processor_fail_from_host_rejects_client_originated_triggers", OrchestratingProcessorFailFromHostRejectsClientOriginatedTriggers),
+
     // B4.2: session paths
     ("session_paths_derive_pipe_name_is_deterministic_and_unique_per_session", SessionPathsDerivePipeNameIsDeterministicAndUniquePerSession),
     ("session_paths_write_and_read_session_id_round_trips", SessionPathsWriteAndReadSessionIdRoundTrips),
@@ -1445,6 +1450,58 @@ static void OrchestratingProcessorRejectsIllegalRequestWithoutTouchingLauncher()
 
     Assert(!result.Accepted, "C2 before C0/C1 must be rejected");
     Assert(launcher.Calls.Count == 0, "an illegal request must never reach the launcher");
+}
+
+static void OrchestratingProcessorFailFromHostTearsDownAfterC0AndReachesFailedClosed()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    // Simulates exactly what C012HostCli.ListenLoopAsync does on an idle timeout or an
+    // unexpected loop error: call FailFromHost directly, never sequencer.ApplyInternal.
+    processor.FailFromHost(C012Trigger.Timeout);
+
+    Assert(sequencer.CurrentState == C012State.FailedClosed, "FailFromHost must fail the session closed");
+    Assert(launcher.TeardownJobCallCount == 1, "FailFromHost must tear down the real Job created during C0");
+}
+
+static void OrchestratingProcessorFailFromHostIsIdempotentIfCalledTwice()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+    DriveC0ToRetained(processor, sessionId);
+
+    processor.FailFromHost(C012Trigger.Timeout);
+    processor.FailFromHost(C012Trigger.OperationFailed);
+
+    Assert(sequencer.CurrentState == C012State.FailedClosed, "the session must remain failed closed");
+    Assert(launcher.TeardownJobCallCount == 1, "a second FailFromHost call must never tear down the Job twice");
+}
+
+static void OrchestratingProcessorFailFromHostRejectsClientOriginatedTriggers()
+{
+    var launcher = new FakeRootProcessLauncher();
+    Guid sessionId = Guid.NewGuid();
+    var sequencer = new C012RequestSequencer(sessionId);
+    var processor = new C012OrchestratingProcessor(sequencer, launcher);
+
+    bool threw = false;
+    try
+    {
+        processor.FailFromHost(C012Trigger.BeginC0);
+    }
+    catch (ArgumentException)
+    {
+        threw = true;
+    }
+
+    Assert(threw, "FailFromHost must refuse a client-originated trigger, exactly like ApplyInternal does");
+    Assert(launcher.Calls.Count == 0, "a refused FailFromHost call must never touch the launcher");
 }
 
 static void DriveC0ToRetained(C012OrchestratingProcessor processor, Guid sessionId)
