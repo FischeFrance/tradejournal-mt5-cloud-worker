@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.endpoint_registry import register_verified
 from tools.mt5_dry_run import DryRunError, dry_run_json, mt5_config_dry_run
