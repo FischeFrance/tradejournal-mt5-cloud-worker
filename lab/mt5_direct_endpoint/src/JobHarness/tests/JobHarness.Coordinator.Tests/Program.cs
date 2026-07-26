@@ -2061,13 +2061,18 @@ static void HostCliStartInnocuousWithSelfSleeperTargetReachesTerminatedOverRealN
         return;
     }
 
+    // Must spawn the real, separate JobHarness.exe/.dll process rather than call
+    // C012HostCli.RunInnocuous in-process here: RunInnocuous's self-invocation resolves
+    // against Environment.ProcessPath of whatever process calls it, and this test project's
+    // own Program.cs does not understand --innocent-lab-sleeper/--innocent-lab-exit-zero (it
+    // has its own, differently-named self-invocation flags) -- calling it in-process would
+    // silently re-run this entire test suite as the "root"/"submitter" instead of a harmless
+    // sleeper/immediate-exit, and was exactly the bug a first version of this test had.
     string directory = CreateTemporaryDirectory();
+    Process? hostProcess = null;
     try
     {
-        using var hostOut = new StringWriter();
-        using var hostErr = new StringWriter();
-        Task<int> hostTask = Task.Run(() => C012HostCli.RunInnocuous(
-            ["--session-dir", directory, "--target", C012HostCli.InnocuousTargetSelfSleeper], hostOut, hostErr));
+        hostProcess = StartInnocuousHostProcess(directory);
 
         (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
         Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start against a real start-innocuous host must be accepted");
@@ -2081,18 +2086,66 @@ static void HostCliStartInnocuousWithSelfSleeperTargetReachesTerminatedOverRealN
         Assert(c2ExitCode == C012ClientCli.ExitAccepted, "c2-submit must be accepted");
         Assert(c2Report.Contains("resulting_state=Terminated", StringComparison.Ordinal), "c2-submit must reach Terminated");
 
-        int hostExitCode = hostTask.GetAwaiter().GetResult();
-        Assert(hostExitCode == C012HostCli.ExitTerminated, "the start-innocuous host must exit with the Terminated code");
-        Assert(
-            string.IsNullOrEmpty(hostErr.ToString()),
-            "a fully successful start-innocuous run must not report any error output");
+        Assert(hostProcess.WaitForExit(TimeSpan.FromSeconds(10)), "the start-innocuous host process must exit on its own after Terminated");
+        Assert(hostProcess.ExitCode == C012HostCli.ExitTerminated, "the start-innocuous host must exit with the Terminated code");
 
         AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
     }
     finally
     {
+        if (hostProcess is { HasExited: false })
+        {
+            hostProcess.Kill(entireProcessTree: false);
+        }
+
+        hostProcess?.Dispose();
         Directory.Delete(directory, recursive: true);
     }
+}
+
+static string FindJobHarnessDll()
+{
+    DirectoryInfo? directory = new DirectoryInfo(AppContext.BaseDirectory);
+    while (directory is not null && directory.Name != "JobHarness")
+    {
+        directory = directory.Parent;
+    }
+
+    if (directory is null)
+    {
+        throw new InvalidOperationException("Could not locate the JobHarness project directory from the test's own output path.");
+    }
+
+    string binDirectory = Path.Combine(directory.FullName, "bin");
+    string[] candidates = Directory.Exists(binDirectory)
+        ? Directory.GetFiles(binDirectory, "JobHarness.dll", SearchOption.AllDirectories)
+        : [];
+
+    if (candidates.Length == 0)
+    {
+        throw new InvalidOperationException($"JobHarness.dll has not been built yet under '{binDirectory}'.");
+    }
+
+    return candidates.OrderByDescending(File.GetLastWriteTimeUtc).First();
+}
+
+static Process StartInnocuousHostProcess(string sessionDir)
+{
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = "dotnet",
+        UseShellExecute = false,
+        CreateNoWindow = true,
+    };
+    startInfo.ArgumentList.Add(FindJobHarnessDll());
+    startInfo.ArgumentList.Add("c012-host");
+    startInfo.ArgumentList.Add("start-innocuous");
+    startInfo.ArgumentList.Add("--session-dir");
+    startInfo.ArgumentList.Add(sessionDir);
+    startInfo.ArgumentList.Add("--target");
+    startInfo.ArgumentList.Add(C012HostCli.InnocuousTargetSelfSleeper);
+
+    return Process.Start(startInfo) ?? throw new InvalidOperationException("Unable to start the start-innocuous host process for testing.");
 }
 
 // ---- B4.2 fix: session sequence cursor continuity (Windows-only; each test returns
