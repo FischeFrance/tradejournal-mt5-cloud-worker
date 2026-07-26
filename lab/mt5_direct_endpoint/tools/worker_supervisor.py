@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -248,9 +249,10 @@ class JobHarnessCliLauncherHandle:
 
     def __init__(self, jobharness_path: Path, session_dir: Path, *, dotnet_executable: str = "dotnet") -> None:
         self._jobharness_path = jobharness_path
-        self._session_dir = session_dir
+        self._session_root = session_dir
         self._dotnet_executable = dotnet_executable
         self._host_process: subprocess.Popen | None = None
+        self._session_dir: Path | None = None
 
     @property
     def host_pid(self) -> int | None:
@@ -274,7 +276,15 @@ class JobHarnessCliLauncherHandle:
         )
 
     def start(self) -> None:
-        self._session_dir.mkdir(parents=True, exist_ok=True)
+        # A fresh, uniquely-named subdirectory per attempt: C012HostCli refuses to reuse a
+        # --session-dir that already holds a prior session's files (session.id in particular
+        # is a permanent record that is never deleted), so restarting with the same directory
+        # a second time would make the new host fail closed at startup rather than restart.
+        # Each JobHarnessCliLauncherHandle instance is itself fresh per restart (the
+        # Supervisor's launcher_factory is called anew each time), so this only ever creates
+        # one subdirectory per instance.
+        self._session_dir = self._session_root / f"attempt-{uuid.uuid4().hex}"
+        self._session_dir.mkdir(parents=True)
         self._host_process = subprocess.Popen(
             self._command(
                 "c012-host", "start-innocuous",

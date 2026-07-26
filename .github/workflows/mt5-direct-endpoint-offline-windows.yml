@@ -71,16 +71,20 @@ jobs:
           dotnet run --project lab/mt5_direct_endpoint/src/JobHarness/tests/JobHarness.Coordinator.Tests/JobHarness.Coordinator.Tests.csproj --configuration Release --no-build
           if ($LASTEXITCODE -ne 0) { throw "JobHarness.Coordinator.Tests failed with exit code $LASTEXITCODE." }
 
-      - name: Re-run offline Python test suite (now exercising the real worker/supervisor Windows smoke test)
+      - name: Run the real worker/supervisor Windows smoke test
         run: |
           # test_worker_supervisor_windows_smoke.py skips cleanly (not a failure) if
           # JobHarness.dll isn't built yet -- it ran once already above, before this job's
           # .NET build steps, and skipped for exactly that reason. Now that JobHarness has
-          # been built, re-running the same discovery command lets that one module actually
-          # exercise the real start-innocuous verb end to end; every other test in the suite
-          # just passes again, unchanged.
-          python -m unittest discover -s lab/mt5_direct_endpoint/tests -q
-          if ($LASTEXITCODE -ne 0) { throw "Offline Python tests failed on re-run (worker/supervisor Windows smoke) with exit code $LASTEXITCODE." }
+          # been built, run just this one module so it actually exercises the real
+          # start-innocuous verb end to end. Deliberately scoped to this single module rather
+          # than re-running the whole `tests` discovery: by this point bin/obj build output
+          # exists on disk under lab/mt5_direct_endpoint, which the packaging allowlist test
+          # elsewhere in this suite correctly flags as unapproved source file types -- that
+          # test is validating the real, permanent state of the tree and is not the thing
+          # this step means to re-check.
+          python -m unittest lab.mt5_direct_endpoint.tests.test_worker_supervisor_windows_smoke -v
+          if ($LASTEXITCODE -ne 0) { throw "Worker/supervisor Windows smoke test failed with exit code $LASTEXITCODE." }
 
       - name: Run JobHarness smoke tests (offline harness)
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File lab/mt5_direct_endpoint/src/JobHarness/scripts/Test-JobHarness.ps1
