@@ -370,7 +370,17 @@ def start_persistent_worker(
     while time.monotonic() < deadline:
         pid = _read_pid(pid_path)
         if pid is not None and pid_is_alive(pid):
-            break
+            fresh = AccountWorker.resume(base_dir, worker.state_file.account_id, credential_provider=worker.credential_provider)
+            # Wait for the host to have actually finished supervisor.start() and recorded
+            # the launcher's own PID, not just for the host process itself to exist -- a
+            # host PID can be alive and pid_is_alive() already for some time before its own
+            # child launcher has started and been synced to the state file (spawning a
+            # child process and waiting for it to become alive is not instantaneous, and
+            # its exact timing is platform- and load-dependent). Reporting readiness before
+            # that sync landed would be a real race, not just a slow-CI flake: the caller
+            # could observe process_alive=True but launcher_process_alive=False.
+            if fresh.state_file.launcher_pid is not None or fresh.state_file.state is WorkerState.FAILED_CLOSED:
+                return read_persistent_status(fresh)
         time.sleep(0.2)
 
     fresh = AccountWorker.resume(base_dir, worker.state_file.account_id, credential_provider=worker.credential_provider)
