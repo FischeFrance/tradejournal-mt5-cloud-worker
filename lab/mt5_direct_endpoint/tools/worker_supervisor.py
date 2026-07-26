@@ -243,9 +243,17 @@ class JobHarnessCliLauncherHandle:
     No cross-platform test ever constructs this class.
     """
 
-    _START_TIMEOUT_SECONDS = 20.0
+    # Each c012-client invocation cold-starts the .NET runtime on top of the real named-pipe
+    # round trip, so these are generous on purpose: killing a client call mid-request (via
+    # subprocess.run's own timeout) is worse than slow, not just slow -- C012's write-ahead
+    # sequence cursor has no automated recovery from an unconfirmed attempt (by design), so a
+    # client process killed between "wrote PENDING" and "received the response" leaves that
+    # session's cursor permanently ambiguous. A tight timeout here previously did exactly
+    # that on a loaded CI runner.
+    _START_TIMEOUT_SECONDS = 60.0
     _POLL_INTERVAL_SECONDS = 0.2
-    _CLIENT_CALL_TIMEOUT_SECONDS = 10.0
+    _CLIENT_CALL_TIMEOUT_SECONDS = 30.0
+    _CLIENT_EXIT_TRANSPORT_FAILURE = 2  # C012ClientCli.ExitTransportFailure
 
     def __init__(self, jobharness_path: Path, session_dir: Path, *, dotnet_executable: str = "dotnet") -> None:
         self._jobharness_path = jobharness_path
@@ -268,12 +276,22 @@ class JobHarnessCliLauncherHandle:
         return [str(self._jobharness_path), *args]
 
     def _run_client(self, verb: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            self._command("c012-client", verb, "--session-dir", str(self._session_dir)),
-            capture_output=True,
-            text=True,
-            timeout=self._CLIENT_CALL_TIMEOUT_SECONDS,
-        )
+        try:
+            return subprocess.run(
+                self._command("c012-client", verb, "--session-dir", str(self._session_dir)),
+                capture_output=True,
+                text=True,
+                timeout=self._CLIENT_CALL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Not retryable: killing the client here means we genuinely do not know whether
+            # the request landed, so the session's sequence cursor may now be permanently
+            # ambiguous (by design -- see the class-level comment). Surface this plainly
+            # instead of letting a bare TimeoutExpired propagate, and never loop on it.
+            raise SupervisorError(
+                f"c012-client {verb} did not respond within {self._CLIENT_CALL_TIMEOUT_SECONDS}s; "
+                "the session's sequence cursor may now be unrecoverably ambiguous"
+            ) from exc
 
     def start(self) -> None:
         # A fresh, uniquely-named subdirectory per attempt: C012HostCli refuses to reuse a
@@ -304,6 +322,17 @@ class JobHarnessCliLauncherHandle:
             result = self._run_client("c0-start")
             if result.returncode == 0 and "resulting_state=C0Retained" in result.stdout:
                 return
+            if result.returncode != self._CLIENT_EXIT_TRANSPORT_FAILURE:
+                # A definitive answer (accepted-but-unexpected, or rejected) was already
+                # received -- c012-client's own sequence cursor discipline means retrying
+                # this same request is exactly the "silently retry an ambiguous outcome"
+                # anti-pattern C012 is designed to refuse. Only a transport failure (pipe
+                # not listening yet) is safe to retry, mirroring the C# test suite's own
+                # RunClientWithRetries helper, which retries on that exit code alone.
+                raise SupervisorError(
+                    f"start-innocuous c0-start was not accepted: exit={result.returncode} "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}"
+                )
             last_error = result.stderr or result.stdout
             time.sleep(self._POLL_INTERVAL_SECONDS)
 
