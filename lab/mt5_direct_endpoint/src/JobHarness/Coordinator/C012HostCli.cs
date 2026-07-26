@@ -133,7 +133,7 @@ public static class C012HostCli
     // process host is the "dotnet" muxer rather than a published apphost, the target assembly
     // path must be prepended so the re-invoked process actually runs JobHarness again instead
     // of just "dotnet" with no program to load.
-    private static IReadOnlyList<string> SelfInvocationArguments(string executable, params string[] trailingArguments)
+    private static List<string> SelfInvocationArguments(string executable, params string[] trailingArguments)
     {
         var arguments = new List<string>();
         if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
