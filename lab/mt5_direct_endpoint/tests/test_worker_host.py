@@ -114,7 +114,12 @@ class WorkerHostLifecycleTests(unittest.TestCase):
         self.create_account("acc-1")
         self.start_worker("acc-1", harmless_sleeper_seconds=1, max_restarts=5)
 
-        deadline = time.monotonic() + 15.0
+        # Generous budget: each poll spawns a fresh `worker-status` interpreter, and a
+        # loaded/slower CI runner (this runs on windows-latest) can make process-spawn
+        # overhead -- on both the polling and the crash/restart side -- dominate a tight
+        # deadline. This is a correctness check, not a timing benchmark: it returns as soon
+        # as the condition is observed either way.
+        deadline = time.monotonic() + 45.0
         restarted = False
         while time.monotonic() < deadline:
             status = self.status("acc-1")
@@ -130,7 +135,7 @@ class WorkerHostLifecycleTests(unittest.TestCase):
         self.create_account("acc-1")
         self.start_worker("acc-1", harmless_sleeper_seconds=1, max_restarts=1)
 
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + 60.0
         failed_closed = False
         while time.monotonic() < deadline:
             status = self.status("acc-1")

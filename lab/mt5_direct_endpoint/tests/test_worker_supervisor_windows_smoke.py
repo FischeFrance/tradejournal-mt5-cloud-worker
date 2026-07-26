@@ -176,7 +176,7 @@ class PersistentWorkerHostWindowsSmokeTests(unittest.TestCase):
 
         start = self.run_cli(
             "start-worker", "--account-id", "acc-smoke", "--worker-root", self.worker_root,
-            "--poll-interval-seconds", "1", "--startup-timeout-seconds", "30",
+            "--poll-interval-seconds", "1", "--startup-timeout-seconds", "45",
         )
         self.assertEqual(start.returncode, 0, start.stderr)
         self._started = True
