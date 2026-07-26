@@ -14,8 +14,12 @@ namespace TradeJournal.Lab.JobHarness.Coordinator;
 // ConfigureAndVerifyJob/GetCreationTime logic is duplicated here in miniature by explicit
 // B4.3 design decision (avoids widening JobObjectRunner's visibility for a single caller).
 //
-// Not wired into C012HostCli's production `c012-host start` path: only the launcher-
-// injecting overload of C012HostCli.Run (test-only) can ever hand this class a real session.
+// Not wired into C012HostCli's production `c012-host start` path -- that path still uses only
+// C012NotImplementedRootProcessLauncher, untouched. Reachable in production solely through
+// `c012-host start-innocuous` (C012HostCli.RunInnocuous), a narrow, explicitly authorized
+// exception that only ever constructs this class pinned to the running JobHarness process
+// re-invoking itself with a fixed, harmless flag -- never a caller-supplied path or hash.
+// Windows-only tests also drive it directly via C012HostCli.Run's launcher-injecting overload.
 // This class has no credential, config-file, or network parameter anywhere in its surface.
 public sealed class C012InnocuousRootProcessLauncher : IC012RootProcessLauncher
 {

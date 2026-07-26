@@ -1,19 +1,24 @@
 using System.IO.Pipes;
+using System.Reflection;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 
 namespace TradeJournal.Lab.JobHarness.Coordinator;
 
-// c012-host start: owns the Named Pipe and the C012RequestSequencer for one C012 session.
-// Session startup is transactional -- session.id is written first, but is rolled back
-// (deleted, along with any secret file already written) if any later step fails, so a
-// --session-dir is only ever left holding a fully-initialized, listening session or no
-// session at all. The public, production-facing overload (the one Program.cs calls) uses
+// c012-host start / start-innocuous: owns the Named Pipe and the C012RequestSequencer for one
+// C012 session. Session startup is transactional -- session.id is written first, but is rolled
+// back (deleted, along with any secret file already written) if any later step fails, so a
+// --session-dir is only ever left holding a fully-initialized, listening session or no session
+// at all. `Run` (3-arg, what Program.cs's "c012-host start" arm calls) uses
 // C012NotImplementedRootProcessLauncher exclusively: no Job Object, no process, no
-// MT5/MetaEditor is ever started through it. The launcher-injecting overload exists only so
-// Windows-only tests can drive a real launcher (e.g. C012InnocuousRootProcessLauncher)
-// through this same host loop; Program.cs never calls it.
+// MT5/MetaEditor is ever started through it. The launcher-injecting `Run` overload (5-arg) lets
+// a caller supply any IC012RootProcessLauncher through this same host loop; besides Windows-only
+// tests, its only other caller anywhere is RunInnocuous below, which is itself reachable only
+// from Program.cs's separate "c012-host start-innocuous" arm and only ever constructs
+// C012InnocuousRootProcessLauncher pinned to this process re-invoking itself harmlessly (see
+// RunInnocuous's own header comment) -- "c012-host start" itself is untouched by any of this.
 public static class C012HostCli
 {
     public const int ExitTerminated = 0;
@@ -41,6 +46,110 @@ public static class C012HostCli
         TimeSpan? idleTimeout = null) =>
         RunAsync(args, output, error, launcher, idleTimeout ?? TimeSpan.FromSeconds(DefaultIdleTimeoutSeconds))
             .GetAwaiter().GetResult();
+
+    // Test-only/harmless smoke-testing verb (c012-host start-innocuous): a narrow, explicitly
+    // authorized exception to "c012-host start never gains real-launch capability" (see the
+    // class header comment and lab/mt5_direct_endpoint/AGENTS.md), added solely so a Windows
+    // smoke test can drive a real Job-Object-contained process end to end. Unlike every other
+    // entry point on this class, this one accepts no caller-supplied executable path or SHA-256
+    // at all: the only allowed --target resolves to this very process re-invoking itself with a
+    // fixed, harmless flag (see Program.cs's --innocent-lab-sleeper/--innocent-lab-exit-zero),
+    // so both the executable and its expected hash are always computed here from the real
+    // running binary, never trusted from a command line. C012InnocuousRootProcessLauncher's own
+    // constructor-time refusal of terminal(64)/metaeditor(64) names still applies underneath
+    // this as an independent second check. c012-host start's dispatch, behavior, and launcher
+    // (C012NotImplementedRootProcessLauncher) are completely unaffected by this method.
+    public const string InnocuousTargetSelfSleeper = "self-sleeper";
+
+    private static readonly TimeSpan InnocuousSubmitterWaitTimeout = TimeSpan.FromSeconds(10);
+
+    public static int RunInnocuous(string[] args, TextWriter output, TextWriter error)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(error);
+
+        string? sessionDir = ParseSessionDir(args);
+        string? target = ParseTarget(args);
+        if (sessionDir is null || target is null)
+        {
+            error.WriteLine("Usage: JobHarness c012-host start-innocuous --session-dir <path> --target <key>");
+            error.WriteLine($"Allowed --target values: {InnocuousTargetSelfSleeper}");
+            return ExitStartupFailure;
+        }
+
+        if (target != InnocuousTargetSelfSleeper)
+        {
+            error.WriteLine($"Unknown --target '{target}'. Allowed values: {InnocuousTargetSelfSleeper}.");
+            return ExitStartupFailure;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            error.WriteLine("c012-host requires Windows.");
+            return ExitStartupFailure;
+        }
+
+        string executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Current process path is unavailable.");
+
+        IC012RootProcessLauncher launcher;
+        try
+        {
+            launcher = new C012InnocuousRootProcessLauncher(
+                executable,
+                ComputeSha256(executable),
+                SelfInvocationArguments(executable, "--innocent-lab-sleeper"),
+                SelfInvocationArguments(executable, "--innocent-lab-exit-zero"),
+                InnocuousSubmitterWaitTimeout);
+        }
+        catch (InvalidOperationException exception)
+        {
+            // Structurally unreachable (this running process is never named
+            // terminal(64)/metaeditor(64)), but kept as an explicit fail-closed guard rather
+            // than trusting that invariant silently.
+            error.WriteLine($"Refusing to start: {exception.Message}");
+            return ExitStartupFailure;
+        }
+
+        return Run(["--session-dir", sessionDir], output, error, launcher);
+    }
+
+    private static string? ParseTarget(string[] args)
+    {
+        for (int index = 0; index < args.Length - 1; index++)
+        {
+            if (args[index] == "--target")
+            {
+                return args[index + 1];
+            }
+        }
+
+        return null;
+    }
+
+    // Mirrors the self-invocation convention already proven by
+    // JobHarness.Coordinator.Tests/Program.cs's SelfInvocationArguments: when the running
+    // process host is the "dotnet" muxer rather than a published apphost, the target assembly
+    // path must be prepended so the re-invoked process actually runs JobHarness again instead
+    // of just "dotnet" with no program to load.
+    private static IReadOnlyList<string> SelfInvocationArguments(string executable, params string[] trailingArguments)
+    {
+        var arguments = new List<string>();
+        if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+        {
+            arguments.Add(Assembly.GetExecutingAssembly().Location);
+        }
+
+        arguments.AddRange(trailingArguments);
+        return arguments;
+    }
+
+    private static string ComputeSha256(string path)
+    {
+        using FileStream stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
 
     private static async Task<int> RunAsync(
         string[] args, TextWriter output, TextWriter error, IC012RootProcessLauncher launcher, TimeSpan idleTimeout)

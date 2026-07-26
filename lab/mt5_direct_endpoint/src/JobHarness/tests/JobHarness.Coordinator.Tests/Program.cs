@@ -181,6 +181,10 @@ var tests = new (string Name, Action Body)[]
     ("host_cli_refuses_when_session_dir_missing", HostCliRefusesWhenSessionDirMissing),
     ("host_cli_refuses_when_session_already_exists", HostCliRefusesWhenSessionAlreadyExists),
 
+    // c012-host start-innocuous: narrow, explicitly authorized exception (see AGENTS.md)
+    ("host_cli_start_innocuous_requires_target_flag", HostCliStartInnocuousRequiresTargetFlag),
+    ("host_cli_start_innocuous_rejects_unknown_target", HostCliStartInnocuousRejectsUnknownTarget),
+
     // B4.2: real Named Pipe (Windows-only)
     ("host_and_client_real_named_pipe_round_trip_reaches_failed_closed_via_placeholder_launcher", HostAndClientRealNamedPipeRoundTripReachesFailedClosedViaPlaceholderLauncher),
     ("client_cli_fails_cleanly_when_no_pipe_is_listening", ClientCliFailsCleanlyWhenNoPipeIsListening),
@@ -190,6 +194,7 @@ var tests = new (string Name, Action Body)[]
     ("innocuous_launcher_end_to_end_over_real_named_pipe_reaches_terminated", InnocuousLauncherEndToEndOverRealNamedPipeReachesTerminated),
     ("innocuous_launcher_closing_last_job_handle_kills_root_via_kill_on_job_close", InnocuousLauncherClosingLastJobHandleKillsRootViaKillOnJobClose),
     ("innocuous_launcher_constructor_refuses_metatrader_like_executable_name", InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName),
+    ("host_cli_start_innocuous_with_self_sleeper_target_reaches_terminated_over_real_named_pipe", HostCliStartInnocuousWithSelfSleeperTargetReachesTerminatedOverRealNamedPipe),
 
     // B4.2 fix: session sequence cursor continuity across separate c012-client processes
     // (Windows-only)
@@ -1755,6 +1760,50 @@ static void HostCliRefusesWhenSessionAlreadyExists()
     }
 }
 
+// ---- c012-host start-innocuous: narrow, explicitly authorized exception (see
+// C012HostCli.RunInnocuous and lab/mt5_direct_endpoint/AGENTS.md). These two are
+// OS-independent: both are rejected during argument/target validation, before the
+// Windows-only pipe/session work ever begins. ----
+
+static void HostCliStartInnocuousRequiresTargetFlag()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012HostCli.RunInnocuous(["--session-dir", directory], stdout, stderr);
+
+        Assert(exitCode == C012HostCli.ExitStartupFailure, "a missing --target must be a startup failure");
+        Assert(stderr.ToString().Contains("Usage", StringComparison.Ordinal), "must print a usage message");
+        Assert(!File.Exists(C012SessionPaths.SessionIdPath(directory)), "no session may start without a --target");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static void HostCliStartInnocuousRejectsUnknownTarget()
+{
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+        int exitCode = C012HostCli.RunInnocuous(
+            ["--session-dir", directory, "--target", "not-an-allowlisted-target"], stdout, stderr);
+
+        Assert(exitCode == C012HostCli.ExitStartupFailure, "an unknown --target must be a startup failure");
+        Assert(stderr.ToString().Contains("Unknown --target", StringComparison.Ordinal), "must explain why the target was refused");
+        Assert(!File.Exists(C012SessionPaths.SessionIdPath(directory)), "no session may start for an unknown target");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
 // ---- B4.2: real Named Pipe (Windows-only; each test returns immediately elsewhere) ----
 
 static void HostAndClientRealNamedPipeRoundTripReachesFailedClosedViaPlaceholderLauncher()
@@ -1991,6 +2040,54 @@ static void InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName()
         }
 
         Assert(refused, "the constructor must refuse an executable named terminal64.exe regardless of its actual contents/hash");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+// The only test exercising the actual `start-innocuous` verb end to end (real named pipe,
+// real C012InnocuousRootProcessLauncher, real Job Object) rather than constructing the
+// launcher directly. Defense-in-depth against an MT5-named target is already proven
+// independently by InnocuousLauncherConstructorRefusesMetaTraderLikeExecutableName above --
+// not re-proven here, since RunInnocuous's allowlist can never select an MT5-named
+// executable in the first place (its one allowed target is this very process re-invoking
+// itself, never anything caller-supplied).
+static void HostCliStartInnocuousWithSelfSleeperTargetReachesTerminatedOverRealNamedPipe()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    string directory = CreateTemporaryDirectory();
+    try
+    {
+        using var hostOut = new StringWriter();
+        using var hostErr = new StringWriter();
+        Task<int> hostTask = Task.Run(() => C012HostCli.RunInnocuous(
+            ["--session-dir", directory, "--target", C012HostCli.InnocuousTargetSelfSleeper], hostOut, hostErr));
+
+        (int c0ExitCode, string c0Report) = RunClientWithRetries("c0-start", directory);
+        Assert(c0ExitCode == C012ClientCli.ExitAccepted, "c0-start against a real start-innocuous host must be accepted");
+        Assert(c0Report.Contains("resulting_state=C0Retained", StringComparison.Ordinal), "c0-start must reach C0Retained");
+
+        (int c1ExitCode, string c1Report) = RunClientWithRetries("c1-query", directory);
+        Assert(c1ExitCode == C012ClientCli.ExitAccepted, "c1-query must be accepted");
+        Assert(c1Report.Contains("resulting_state=C1Retained", StringComparison.Ordinal), "c1-query must reach C1Retained");
+
+        (int c2ExitCode, string c2Report) = RunClientWithRetries("c2-submit", directory);
+        Assert(c2ExitCode == C012ClientCli.ExitAccepted, "c2-submit must be accepted");
+        Assert(c2Report.Contains("resulting_state=Terminated", StringComparison.Ordinal), "c2-submit must reach Terminated");
+
+        int hostExitCode = hostTask.GetAwaiter().GetResult();
+        Assert(hostExitCode == C012HostCli.ExitTerminated, "the start-innocuous host must exit with the Terminated code");
+        Assert(
+            string.IsNullOrEmpty(hostErr.ToString()),
+            "a fully successful start-innocuous run must not report any error output");
+
+        AssertSessionFullyTornDown(directory, expectSecretDeleted: true);
     }
     finally
     {

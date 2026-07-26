@@ -333,6 +333,13 @@ python3 -m compileall -q lab/mt5_direct_endpoint
 Questi comandi non autorizzano test Windows runtime, rete, firewall, WFP,
 bootstrap o MT5.
 
+## Modello account/worker
+
+Onboarding del primo login, isolamento per account, lifecycle del worker
+persistente e supervisor con restart limitato sono descritti in
+[docs/ACCOUNT_WORKER_MODEL.md](docs/ACCOUNT_WORKER_MODEL.md). Nessun login
+MT5 reale è stato eseguito; `HARD_DISABLED` resta invariato per MT5 ovunque.
+
 ## Packaging
 
 Il pacchetto di revisione deve essere creato dalla root del repository e
