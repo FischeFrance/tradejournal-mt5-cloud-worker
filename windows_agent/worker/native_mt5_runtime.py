@@ -329,6 +329,39 @@ class NativeMt5Runtime:
         self._restrict_private_acl(path, "(R)")
 
     @staticmethod
+    def _grant_interactive_acl(
+        path: Path,
+        interactive_user: str,
+        access: str,
+    ) -> None:
+        completed = subprocess.run(
+            [
+                "icacls",
+                str(path),
+                "/grant:r",
+                f"{interactive_user}:{access}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise NativeMt5Error("interactive_runtime_acl_failed")
+
+    def _prepare_interactive_runtime_acl(self, interactive_user: str) -> None:
+        # The service publishes instances with a SYSTEM-only DACL. The dedicated desktop
+        # identity needs just enough access to traverse the instance, execute the one-shot
+        # launcher, and let MT5 mutate its own portable terminal tree. Deliberately do not grant
+        # access to instance\secrets, data, worker, or logs.
+        self._grant_interactive_acl(self.root, interactive_user, "(RX)")
+        self._grant_interactive_acl(self.state, interactive_user, "(RX)")
+        self._grant_interactive_acl(
+            self.terminal_root,
+            interactive_user,
+            "(OI)(CI)(M)",
+        )
+
+    @staticmethod
     def _secure_delete_config(path: Path | None) -> None:
         if path is None:
             return
@@ -550,6 +583,7 @@ class NativeMt5Runtime:
         if os.name == "nt" and not interactive_user:
             raise NativeMt5Error("dedicated_interactive_user_required")
         if interactive_user:
+            self._prepare_interactive_runtime_acl(interactive_user)
             launcher = self.state / "launch-terminal.cmd"
             launcher_content = (
                 "@echo off\r\n"
@@ -557,6 +591,11 @@ class NativeMt5Runtime:
                 f'/config:"{config}"\r\n'
             )
             launcher.write_text(launcher_content, encoding="utf-8")
+            self._grant_interactive_acl(
+                launcher,
+                interactive_user,
+                "(RX)",
+            )
             task = f"TradeJournalMT5-{self.connection_id}"
             command = str(launcher)
             create = [

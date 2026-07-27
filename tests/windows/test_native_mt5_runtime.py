@@ -405,7 +405,37 @@ def test_start_process_uses_limited_dedicated_interactive_session(
     with patch("subprocess.run", return_value=completed) as run:
         assert runtime._start_process(config, 42) is None
 
-    create = run.call_args_list[0].args[0]
+    calls = [entry.args[0] for entry in run.call_args_list]
+    expected_acl_calls = [
+        [
+            "icacls",
+            str(runtime.root),
+            "/grant:r",
+            "TradeJournalMT5:(RX)",
+        ],
+        [
+            "icacls",
+            str(runtime.state),
+            "/grant:r",
+            "TradeJournalMT5:(RX)",
+        ],
+        [
+            "icacls",
+            str(runtime.terminal_root),
+            "/grant:r",
+            "TradeJournalMT5:(OI)(CI)(M)",
+        ],
+        [
+            "icacls",
+            str(runtime.state / "launch-terminal.cmd"),
+            "/grant:r",
+            "TradeJournalMT5:(RX)",
+        ],
+    ]
+    assert calls[:4] == expected_acl_calls
+    assert not any("secrets" in argument for call_args in calls for argument in call_args)
+
+    create = calls[4]
     assert create[:3] == ["schtasks", "/Create", "/TN"]
     assert create[create.index("/RU") + 1] == "TradeJournalMT5"
     assert "/IT" in create
@@ -413,6 +443,15 @@ def test_start_process_uses_limited_dedicated_interactive_session(
     assert "HIGHEST" not in create
     run.assert_has_calls(
         [
+            *[
+                call(
+                    acl_call,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                for acl_call in expected_acl_calls
+            ],
             call(create, capture_output=True, text=True, check=False),
             call(
                 ["schtasks", "/Run", "/TN", runtime._interactive_task],
