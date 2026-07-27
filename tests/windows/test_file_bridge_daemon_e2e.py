@@ -105,7 +105,7 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
     expert.write_bytes(b"expert")
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     jobs = [
-        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "all_available", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo", "broker_label": "Demo Broker"}},
+        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "new_only", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo", "broker_label": "Demo Broker"}},
         {"job_id": "deprovision", "job_type": "deprovision", "connection_id": cid, "lease_id": "2", "history_mode": None, "payload": {}},
     ]
     api = QueueApi(jobs)
@@ -237,7 +237,7 @@ def test_live_sync_job_fails_fast_when_ingestion_url_not_configured(tmp_path: Pa
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     api = QueueApi([{
         "job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1",
-        "history_mode": "all_available",
+        "history_mode": "new_only",
         "payload": {
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
