@@ -5,6 +5,8 @@ tests/test_event_sender.py). Unlike test_real_handlers.py, this module has no py
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from windows_agent.worker.trading_ingestion_sink import TradingIngestionSink
 
 
@@ -47,14 +49,16 @@ def test_call_delivers_event_over_http(tmp_path):
 def test_call_always_writes_to_local_audit_log_first_even_if_delivery_fails(tmp_path):
     payload = {"event_id": "evt-1", "event_type": "trade_opened", "symbol": "EURUSD"}
     with patch("requests.post", return_value=_response(500)):
-        _sink(tmp_path)(payload)
+        with pytest.raises(RuntimeError, match="not acknowledged"):
+            _sink(tmp_path)(payload)
 
     lines = (tmp_path / "data" / "live.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["event_id"] == "evt-1"
 
 
-def test_call_does_not_raise_when_delivery_fails_permanently(tmp_path):
+def test_call_raises_when_delivery_fails_permanently(tmp_path):
     payload = {"event_id": "evt-1", "event_type": "trade_opened", "symbol": "EURUSD"}
     with patch("requests.post", return_value=_response(422)):
-        _sink(tmp_path)(payload)  # must not raise
+        with pytest.raises(RuntimeError, match="not acknowledged"):
+            _sink(tmp_path)(payload)

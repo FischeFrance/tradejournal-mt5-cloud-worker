@@ -87,7 +87,7 @@ class QueueApi:
 
     def transition(self, job_id: str, lease_id: str, status: str, result: dict[str, object] | None = None) -> dict[str, str]:
         self.transitions.append((job_id, status, result))
-        return {"status": status}
+        return {"status": "failed" if status == "fail" else status}
 
 
 def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Path, monkeypatch) -> None:
@@ -105,7 +105,7 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
     expert.write_bytes(b"expert")
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     jobs = [
-        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "all_available", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo"}},
+        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "all_available", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo", "broker_label": "Demo Broker"}},
         {"job_id": "deprovision", "job_type": "deprovision", "connection_id": cid, "lease_id": "2", "history_mode": None, "payload": {}},
     ]
     api = QueueApi(jobs)
@@ -137,6 +137,11 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    # Provision performs the first outbox delivery immediately. Keep this offline E2E entirely
+    # deterministic; individual live-sync tests may override the same call and inspect it.
+    monkeypatch.setattr(
+        "requests.post", MagicMock(return_value=MagicMock(status_code=200))
+    )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
     terminal = tmp_path / "template" / "terminal64.exe"
@@ -152,6 +157,7 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
             "expected_server": "Demo",
+            "broker_label": "Demo Broker",
             "bridge_token": "tjmt5_test-bridge-token",
         },
     }])
@@ -233,6 +239,7 @@ def test_live_sync_job_fails_fast_when_ingestion_url_not_configured(tmp_path: Pa
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
             "expected_server": "Demo",
+            "broker_label": "Demo Broker",
             "bridge_token": "tjmt5_test-bridge-token",
         },
     }])

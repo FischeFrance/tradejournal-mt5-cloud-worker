@@ -30,6 +30,7 @@ PATCH7_SCHEMA_FILES = (
     "direct-campaign-manifest.schema.json",
     "evidence.schema.json",
 )
+ONBOARDING_SCHEMA_FILES = ("broker-wizard-request.schema.json",)
 
 ARTIFACT_SCHEMAS = {
     "EXPERIMENT_MANIFEST": "experiment-manifest.schema.json",
@@ -64,7 +65,10 @@ class ContractFileTests(unittest.TestCase):
         )
 
     def test_patch7_json_contracts_parse_are_valid_and_closed(self) -> None:
-        paths = [SCHEMA_ROOT / name for name in PATCH7_SCHEMA_FILES]
+        paths = [
+            SCHEMA_ROOT / name
+            for name in PATCH7_SCHEMA_FILES + ONBOARDING_SCHEMA_FILES
+        ]
         paths.append(PROBE_SCHEMA_PATH)
         self.assertEqual(len(PATCH7_SCHEMA_FILES), 6)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -10,7 +11,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from worker.atomic_file import durable_replace
 
 from ..provisioning.secret_store import WindowsSecretStore
 
@@ -46,6 +49,14 @@ class NativeMt5Runtime:
         self._process: subprocess.Popen[bytes] | None = None
         self._interactive_task: str | None = None
         self._last_symbol: str | None = None
+        self._cancel_check: Callable[[], None] | None = None
+
+    def set_cancel_check(self, check: Callable[[], None] | None) -> None:
+        self._cancel_check = check
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_check is not None:
+            self._cancel_check()
 
     def install_expert(self, expert_binary: Path, history_mode: str = "new_only") -> Path:
         if not expert_binary.is_file() or expert_binary.suffix.casefold() != ".ex5":
@@ -60,7 +71,18 @@ class NativeMt5Runtime:
             / "TradeJournalBridge.ex5"
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(expert_binary, destination)
+        source_digest = self._sha256(expert_binary)
+        temporary_expert = destination.with_suffix(".ex5.tmp")
+        try:
+            shutil.copy2(expert_binary, temporary_expert)
+            # Windows os.fsync maps to _commit and therefore needs a writable descriptor.
+            with temporary_expert.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            if self._sha256(temporary_expert) != source_digest:
+                raise NativeMt5Error("expert_copy_integrity_failed")
+            durable_replace(temporary_expert, destination)
+        finally:
+            temporary_expert.unlink(missing_ok=True)
         loader = (
             self.terminal_root
             / "MQL5"
@@ -74,12 +96,27 @@ class NativeMt5Runtime:
             raise NativeMt5Error("discovery_script_missing")
         self.files.mkdir(parents=True, exist_ok=True)
         connection_tmp = self.files / "connection_id.tmp"
-        connection_tmp.write_text(self.connection_id, encoding="utf-8")
-        connection_tmp.replace(self.files / "connection_id")
+        self._write_text_durable(connection_tmp, self.connection_id, "utf-8")
+        durable_replace(connection_tmp, self.files / "connection_id")
         mode_tmp = self.files / "history_mode.tmp"
-        mode_tmp.write_text(history_mode, encoding="utf-8")
-        mode_tmp.replace(self.files / "history_mode")
+        self._write_text_durable(mode_tmp, history_mode, "utf-8")
+        durable_replace(mode_tmp, self.files / "history_mode")
         return destination
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _write_text_durable(path: Path, content: str, encoding: str) -> None:
+        with path.open("w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _install_bridge_template(self, symbol: str) -> Path:
         source = self.terminal_root / "Profiles" / "Templates" / "ADX.tpl"
@@ -123,7 +160,7 @@ class NativeMt5Runtime:
             handle.write("\r\n".join(lines) + "\r\n")
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.replace(destination)
+        durable_replace(temporary, destination)
         return destination
 
     def _write_startup_config(
@@ -251,24 +288,45 @@ class NativeMt5Runtime:
             and not interactive_user.replace("-", "").replace("_", "").replace(".", "").isalnum()
         ):
             raise NativeMt5Error("invalid_interactive_user")
+        # MT5 needs an interactive desktop for reliable chart/script initialization, but it must
+        # never share the operator's Administrator desktop: every terminal window would otherwise
+        # be visible during provisioning and live sync. Built-in service identities do not provide
+        # the required desktop either. A dedicated, least-privilege local account is mandatory
+        # whenever the scheduled-task launch path is configured.
+        if interactive_user.casefold() in {
+            "administrator",
+            "system",
+            "localsystem",
+            "localservice",
+            "networkservice",
+        }:
+            raise NativeMt5Error("interactive_user_not_dedicated")
         return interactive_user
 
-    def _restrict_startup_acl(self, path: Path) -> None:
+    def _restrict_private_acl(self, path: Path, interactive_access: str) -> None:
         # The worker normally runs as LocalSystem while MT5 must run in the active desktop
-        # session. Keep the config private to SYSTEM, but allow that one configured interactive
-        # identity to read it. The file is securely removed as soon as MT5 consumes it.
+        # session. Keep private artifacts restricted to SYSTEM plus that one configured identity.
         WindowsSecretStore.restrict_acl(path)
         interactive_user = self._interactive_user()
         if not interactive_user:
             return
         completed = subprocess.run(
-            ["icacls", str(path), "/grant", f"{interactive_user}:(R)"],
+            [
+                "icacls",
+                str(path),
+                "/grant",
+                f"{interactive_user}:{interactive_access}",
+            ],
             capture_output=True,
             text=True,
             check=False,
         )
         if completed.returncode != 0:
-            raise NativeMt5Error("startup_acl_failed")
+            raise NativeMt5Error("private_artifact_acl_failed")
+
+    def _restrict_startup_acl(self, path: Path) -> None:
+        # Startup configuration is read once, then securely removed.
+        self._restrict_private_acl(path, "(R)")
 
     @staticmethod
     def _secure_delete_config(path: Path | None) -> None:
@@ -371,6 +429,7 @@ class NativeMt5Runtime:
         expected_login = f"'{login}'"
         expected_server = server.casefold()
         while time.monotonic() < deadline:
+            self._check_cancelled()
             lines = self._journal_lines_since(checkpoint)
             for line in lines:
                 folded = line.casefold()
@@ -381,6 +440,7 @@ class NativeMt5Runtime:
                     and expected_server in folded
                     and expected_login in line
                 ):
+                    self._release_interactive_task()
                     return
 
             pids = self._running_terminal_pids()
@@ -400,8 +460,12 @@ class NativeMt5Runtime:
         accounts = self.terminal_root / "Config" / "accounts.dat"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._check_cancelled()
             try:
                 if accounts.is_file() and accounts.stat().st_size > 0:
+                    # accounts.dat contains MT5's encrypted account material. MT5 must retain
+                    # modify access, but no unrelated local identity should inherit access.
+                    self._restrict_private_acl(accounts, "(M)")
                     return
             except OSError:
                 pass
@@ -420,6 +484,7 @@ class NativeMt5Runtime:
         investor_only = False
         seen_process = False
         while time.monotonic() < deadline:
+            self._check_cancelled()
             for line in self._journal_lines_since(checkpoint):
                 if expected_login not in line:
                     continue
@@ -431,6 +496,7 @@ class NativeMt5Runtime:
                 if "trading has been disabled - investor mode" in folded:
                     investor_only = True
             if synchronized and investor_only:
+                self._release_interactive_task()
                 return
 
             pids = self._running_terminal_pids()
@@ -454,8 +520,8 @@ class NativeMt5Runtime:
         self.files.mkdir(parents=True, exist_ok=True)
         (self.files / "discovered-symbol.json").unlink(missing_ok=True)
         tmp = self.files / "symbol-preference.tmp"
-        tmp.write_text(preferred, encoding="ascii")
-        tmp.replace(self.files / "symbol-preference.txt")
+        self._write_text_durable(tmp, preferred, "ascii")
+        durable_replace(tmp, self.files / "symbol-preference.txt")
 
     def _probe_broker_symbol(self, preferred: str, timeout: float = 30.0) -> str:
         # Read the symbol resolved IN-TERMINAL by TradeJournalDiscovery (MQL5), published to the
@@ -465,6 +531,7 @@ class NativeMt5Runtime:
         output = self.files / "discovered-symbol.json"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not output.is_file():
+            self._check_cancelled()
             time.sleep(0.25)
         record = self._read_json(output) if output.is_file() else None
         symbol = str(record.get("symbol", "")) if record else ""
@@ -480,6 +547,8 @@ class NativeMt5Runtime:
     ) -> subprocess.Popen[bytes] | None:
         login_argument = f" /login:{login_hint}" if login_hint is not None else ""
         interactive_user = self._interactive_user()
+        if os.name == "nt" and not interactive_user:
+            raise NativeMt5Error("dedicated_interactive_user_required")
         if interactive_user:
             launcher = self.state / "launch-terminal.cmd"
             launcher_content = (
@@ -492,7 +561,7 @@ class NativeMt5Runtime:
             command = str(launcher)
             create = [
                 "schtasks", "/Create", "/TN", task, "/SC", "ONCE", "/ST", "23:59",
-                "/RU", interactive_user, "/IT", "/RL", "HIGHEST", "/TR", command, "/F",
+                "/RU", interactive_user, "/IT", "/RL", "LIMITED", "/TR", command, "/F",
             ]
             completed = subprocess.run(create, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
@@ -513,11 +582,32 @@ class NativeMt5Runtime:
         )
         return self._process
 
+    def _release_interactive_task(self) -> None:
+        """Delete a successful one-shot launcher without stopping its MT5 child."""
+        task = self._interactive_task
+        if not task:
+            return
+        completed = subprocess.run(
+            ["schtasks", "/Delete", "/TN", task, "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            # Keep the task name so stop() can still terminate/delete it on the failure path.
+            raise NativeMt5Error("interactive_task_cleanup_failed")
+        self._interactive_task = None
+        try:
+            (self.state / "launch-terminal.cmd").unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _wait_for_heartbeat(
         self, timeout: float, login: int | None = None, server: str | None = None
     ) -> NativeMt5Status:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._check_cancelled()
             pid = 0
             if self._process is not None:
                 pid = self._process.pid
@@ -540,6 +630,7 @@ class NativeMt5Runtime:
                 time.sleep(1)
                 continue
             if login is None:
+                self._release_interactive_task()
                 return NativeMt5Status(pid, account or {}, heartbeat, self.files)
             if account is None:
                 time.sleep(1)
@@ -557,6 +648,7 @@ class NativeMt5Runtime:
                 continue
             if bool(account.get("trade_allowed", True)):
                 raise NativeMt5Error("investor_readonly_not_verified")
+            self._release_interactive_task()
             return NativeMt5Status(pid, account, heartbeat, self.files)
         logger.error(
             "native MT5 runtime: heartbeat.json never appeared within %.0fs "
@@ -597,6 +689,7 @@ class NativeMt5Runtime:
         *,
         login: int,
         server: str,
+        connection_endpoint: str | None = None,
         investor_password: str,
         expert_binary: Path,
         history_mode: str = "new_only",
@@ -614,11 +707,12 @@ class NativeMt5Runtime:
         discovery: Path | None = None
         startup: Path | None = None
         try:
+            startup_server = connection_endpoint or server
             # Phase 1: authenticate with the supplied investor password and ask MT5 to persist it
             # in Config/accounts.dat.  No chart or EA is opened during this first-start window.
             bootstrap = self._write_startup_config(
                 login,
-                server,
+                startup_server,
                 investor_password,
                 symbol,
                 keep_private=True,

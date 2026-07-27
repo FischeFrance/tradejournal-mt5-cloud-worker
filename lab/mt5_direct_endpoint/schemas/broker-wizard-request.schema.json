@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tradejournal.local/schemas/broker-wizard-request.schema.json",
+  "title": "MT5 broker wizard suggestion-only request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "SearchText",
+    "SuggestedBrokerLabel",
+    "ExpectedServerName"
+  ],
+  "properties": {
+    "SearchText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "SuggestedBrokerLabel": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "ExpectedServerName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    }
+  }
+}

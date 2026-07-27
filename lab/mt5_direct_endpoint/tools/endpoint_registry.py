@@ -19,6 +19,7 @@ from typing import Any, Mapping
 REGISTRY_SCHEMA_VERSION = 1
 STATUSES = frozenset({"VERIFIED", "CANDIDATE", "METAQUOTES_CDN", "EXPIRED"})
 CONFIDENCES = frozenset({"LOW", "MEDIUM", "HIGH"})
+VERIFIED_DISCOVERY_METHODS = frozenset({"MT5_LOGIN_DIALOG_IP", "MT5_NONINTERACTIVE_CONFIG"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -212,6 +213,8 @@ def register_verified(
 ) -> dict[str, Any]:
     if not broker_label.strip():
         raise RegistryError("broker_label is required")
+    if discovery_method not in VERIFIED_DISCOVERY_METHODS:
+        raise RegistryError("VERIFIED endpoint requires an MT5 login verification method")
     _validate_manifest(Path(artifact_root), Path(artifact_manifest), artifact_relative_path, artifact_sha256)
     try:
         registry = load_registry(path, artifact_root=artifact_root, artifact_manifest=artifact_manifest) if Path(path).exists() else {"schema_version": 1, "updated_at_unix_ms": int(time.time() * 1000), "ttl_seconds": ttl_seconds, "brokers": {}}

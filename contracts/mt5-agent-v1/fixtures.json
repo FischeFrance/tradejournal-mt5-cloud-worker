@@ -12,7 +12,17 @@
     "created_at": "2026-07-15T12:00:00.000Z",
     "history_mode": "new_only",
     "from_date": null,
-    "payload": {}
+    "payload": {
+      "credential_envelope": {
+        "alg": "aes-256-gcm-v1",
+        "iv": "ZmFrZS1ub25jZQ==",
+        "ciphertext": "ZmFrZS1jaXBoZXJ0ZXh0"
+      },
+      "expected_login": "850000001",
+      "expected_server": "Fixture-Demo",
+      "broker_label": "Fixture Broker",
+      "bridge_token": "tjmt5_fixture_token_1234567890"
+    }
   },
   "claimResponseJob_historicalSync": {
     "api_version": "1",
@@ -25,6 +35,19 @@
     "created_at": "2026-07-15T12:10:00.000Z",
     "history_mode": "from_date",
     "from_date": "2026-01-01T00:00:00.000Z",
+    "payload": {}
+  },
+  "claimResponseJob_liveSync": {
+    "api_version": "1",
+    "job_id": "2f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c33",
+    "connection_id": "1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d",
+    "lease_id": "7d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6c",
+    "lease_expires_at": "2026-07-15T12:21:00.000Z",
+    "job_type": "live_sync",
+    "attempt": 1,
+    "created_at": "2026-07-15T12:20:00.000Z",
+    "history_mode": null,
+    "from_date": null,
     "payload": {}
   },
   "claimResponseNoJob": null,

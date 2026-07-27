@@ -30,6 +30,10 @@ class InstanceProvisionFailed(AgentError):
     error_code = "instance_provision_failed"
 
 
+class BrokerEndpointUnavailable(AgentError):
+    error_code = "broker_endpoint_unavailable"
+
+
 class TerminalStartFailed(AgentError):
     error_code = "terminal_start_failed"
 

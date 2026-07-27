@@ -21,7 +21,7 @@ from windows_agent.real_handlers import build_real_handlers
 build_real_handlers() factory -> a fake MT5 adapter, covering the full provision -> heartbeat ->
 historical_sync -> deprovision lifecycle. This goes through the exact same JobRunner and
 build_real_handlers() that agent_daemon.build_runner()/windows_service.py wire together in
-production -- unlike customer_flow.py's CLI path, no LocalControlPlane is involved anywhere here."""
+production; no local control-plane shortcut is involved anywhere here."""
 
 ENCRYPTION_KEY = base64.b64encode(b"7" * 32).decode("ascii")
 
@@ -94,10 +94,24 @@ class MockControlPlane:
 
     def transition(self, job_id: str, lease_id: str, status: str, result: dict | None = None) -> dict:
         self.transitions.append((job_id, status, result))
-        return {"api_version": "1", "status": status}
+        return {"api_version": "1", "status": "failed" if status == "fail" else status}
 
 
-def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp_path):
+def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(
+    tmp_path, monkeypatch
+):
+    # The lifecycle contract is independent from the logon token hosting pytest. Real DPAPI has
+    # its own focused Windows smoke; this E2E keeps its secret-store semantics deterministic even
+    # under service/SSH tokens for which CurrentUser DPAPI may be unavailable.
+    monkeypatch.setattr(
+        WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value)
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value)
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None)
+    )
     cid = str(uuid4())
     instances_root = tmp_path / "instances"
     secrets_root = tmp_path / "secrets"
@@ -121,6 +135,7 @@ def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp
                 "credential_envelope": _envelope({"investor_password": "investor-pw"}),
                 "expected_login": 555,
                 "expected_server": "Demo-Broker",
+                "broker_label": "Demo Broker",
             },
         },
         {

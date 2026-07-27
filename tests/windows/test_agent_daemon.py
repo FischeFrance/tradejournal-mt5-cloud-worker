@@ -20,7 +20,7 @@ class QueueApi:
 
     def transition(self, job_id, lease_id, status, result=None):
         self.transitions.append((status, result))
-        return {}
+        return {"status": "failed" if status == "fail" else status}
 
 
 def test_run_forever_polls_until_stop_event(tmp_path):

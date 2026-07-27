@@ -40,7 +40,11 @@ jobs:
 
       - name: Verify no blocked terminal/metaeditor processes are running
         run: |
-          $forbiddenProcesses = @('terminal', 'terminal64', 'metaeditor', 'metaeditor64')
+          $forbiddenProcesses = @(
+            'terminal', 'terminal64',
+            'metaeditor', 'metaeditor64',
+            'metatester', 'metatester64'
+          )
           $found = @()
           foreach ($name in $forbiddenProcesses) {
             $found += Get-Process -Name $name -ErrorAction SilentlyContinue
@@ -70,6 +74,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "JobHarness.Coordinator.Tests build failed with exit code $LASTEXITCODE." }
           dotnet run --project lab/mt5_direct_endpoint/src/JobHarness/tests/JobHarness.Coordinator.Tests/JobHarness.Coordinator.Tests.csproj --configuration Release --no-build
           if ($LASTEXITCODE -ne 0) { throw "JobHarness.Coordinator.Tests failed with exit code $LASTEXITCODE." }
+
+      - name: Build and run MT5 Wizard Automation tests
+        run: |
+          dotnet build lab/mt5_direct_endpoint/src/Mt5WizardAutomation/tests/Mt5WizardAutomation.Tests/Mt5WizardAutomation.Tests.csproj --configuration Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw "Mt5WizardAutomation.Tests build failed with exit code $LASTEXITCODE." }
+          dotnet run --project lab/mt5_direct_endpoint/src/Mt5WizardAutomation/tests/Mt5WizardAutomation.Tests/Mt5WizardAutomation.Tests.csproj --configuration Release --no-build
+          if ($LASTEXITCODE -ne 0) { throw "Mt5WizardAutomation.Tests failed with exit code $LASTEXITCODE." }
 
       - name: Run the real worker/supervisor Windows smoke test
         run: |
@@ -120,7 +131,11 @@ jobs:
       - name: Verify no blocked terminal/metaeditor processes remain
         if: always()
         run: |
-          $forbiddenProcesses = @('terminal', 'terminal64', 'metaeditor', 'metaeditor64')
+          $forbiddenProcesses = @(
+            'terminal', 'terminal64',
+            'metaeditor', 'metaeditor64',
+            'metatester', 'metatester64'
+          )
           $found = @()
           foreach ($name in $forbiddenProcesses) {
             $found += Get-Process -Name $name -ErrorAction SilentlyContinue

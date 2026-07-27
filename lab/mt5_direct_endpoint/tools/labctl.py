@@ -35,21 +35,11 @@ from lab_evidence_verifier import verify_captured_run
 # as bare top-level modules. `tools`' own parent directory must be on sys.path for that.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.account_worker import AccountWorker, WorkerError  # noqa: E402
-from tools.credential_provider import CredentialLeakError, FakeCredentialProvider, json_dumps_safe  # noqa: E402
-from tools.endpoint_registry import RegistryError, resolve_verified  # noqa: E402
-from tools.mt5_dry_run import DryRunError, mt5_config_dry_run  # noqa: E402
-from tools.worker_host import (  # noqa: E402
-    DEFAULT_HARMLESS_SLEEPER_SECONDS,
-    DEFAULT_MAX_RESTARTS,
-    DEFAULT_POLL_INTERVAL_SECONDS,
-    DEFAULT_STARTUP_TIMEOUT_SECONDS,
-    read_persistent_status,
-    request_stop_and_wait,
-    run_worker_host,
-    start_persistent_worker,
+from tools.onboarding_cli import (  # noqa: E402
+    OnboardingCliError,
+    dispatch_onboarding_command,
+    register_onboarding_commands,
 )
-from tools.worker_supervisor import SupervisorError  # noqa: E402
 
 
 def _load_json(path: str) -> object:
@@ -224,79 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     digest_parser = subparsers.add_parser("digest")
     digest_parser.add_argument("--evidence", required=True)
 
-    # ---- account/worker lifecycle (offline, credential-free, HARD_DISABLED for real launch) ----
-
-    create_account_parser = subparsers.add_parser(
-        "create-account",
-        help="create an isolated per-account worker directory and persistent state file",
-    )
-    create_account_parser.add_argument("--account-id", required=True)
-    create_account_parser.add_argument("--worker-root", required=True)
-    create_account_parser.add_argument("--registry", required=True)
-    create_account_parser.add_argument("--broker-label", required=True)
-    create_account_parser.add_argument("--output", default="-")
-
-    start_worker_parser = subparsers.add_parser(
-        "start-worker",
-        help="spawn (or confirm already-running) the persistent worker-host process for an account",
-    )
-    start_worker_parser.add_argument("--account-id", required=True)
-    start_worker_parser.add_argument("--worker-root", required=True)
-    start_worker_parser.add_argument("--poll-interval-seconds", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
-    start_worker_parser.add_argument("--max-restarts", type=int, default=DEFAULT_MAX_RESTARTS)
-    start_worker_parser.add_argument(
-        "--harmless-sleeper-seconds", type=float, default=DEFAULT_HARMLESS_SLEEPER_SECONDS,
-        help="lifetime of the harmless child process; lower this only to test crash/restart behavior",
-    )
-    start_worker_parser.add_argument("--startup-timeout-seconds", type=float, default=DEFAULT_STARTUP_TIMEOUT_SECONDS)
-    start_worker_parser.add_argument("--output", default="-")
-
-    stop_worker_parser = subparsers.add_parser(
-        "stop-worker",
-        help="ask the running worker-host process to stop in an ordered way and wait for it",
-    )
-    stop_worker_parser.add_argument("--account-id", required=True)
-    stop_worker_parser.add_argument("--worker-root", required=True)
-    stop_worker_parser.add_argument("--output", default="-")
-
-    worker_status_parser = subparsers.add_parser(
-        "worker-status",
-        help="report a worker's real status: persisted state plus a live OS-level process check",
-    )
-    worker_status_parser.add_argument("--account-id", required=True)
-    worker_status_parser.add_argument("--worker-root", required=True)
-    worker_status_parser.add_argument("--output", default="-")
-
-    worker_host_parser = subparsers.add_parser(
-        "worker-host",
-        help=(
-            "run the persistent worker-host process in the foreground; "
-            "harmless-only, never MT5 (spawned detached by start-worker; also directly runnable for testing)"
-        ),
-    )
-    worker_host_parser.add_argument("--account-id", required=True)
-    worker_host_parser.add_argument("--worker-root", required=True)
-    worker_host_parser.add_argument("--poll-interval-seconds", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
-    worker_host_parser.add_argument("--max-restarts", type=int, default=DEFAULT_MAX_RESTARTS)
-    worker_host_parser.add_argument("--harmless-sleeper-seconds", type=float, default=DEFAULT_HARMLESS_SLEEPER_SECONDS)
-
-    verify_endpoint_parser = subparsers.add_parser(
-        "verify-endpoint",
-        help="resolve exactly one current VERIFIED broker endpoint, failing closed on ambiguity",
-    )
-    verify_endpoint_parser.add_argument("--registry", required=True)
-    verify_endpoint_parser.add_argument("--broker-label", required=True)
-    verify_endpoint_parser.add_argument("--now-unix-ms", type=int)
-    verify_endpoint_parser.add_argument("--output", default="-")
-
-    generate_config_dry_run_parser = subparsers.add_parser(
-        "generate-config-dry-run",
-        help="generate a credential-free MT5 config plan; never launches MT5",
-    )
-    generate_config_dry_run_parser.add_argument("--registry", required=True)
-    generate_config_dry_run_parser.add_argument("--broker-label", required=True)
-    generate_config_dry_run_parser.add_argument("--now-unix-ms", type=int)
-    generate_config_dry_run_parser.add_argument("--output", default="-")
+    register_onboarding_commands(subparsers)
 
     return parser
 
@@ -519,84 +437,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 + "\n"
             )
             return 0
-        if args.command == "create-account":
-            worker = AccountWorker.create(
-                args.worker_root, args.account_id,
-                credential_provider=FakeCredentialProvider(),
-                registry_path=args.registry, broker_label=args.broker_label,
-            )
-            payload = read_persistent_status(worker)
-            json_dumps_safe(payload)
-            _emit(payload, args.output)
-            return 0
-        if args.command == "start-worker":
-            worker = AccountWorker.resume(
-                args.worker_root, args.account_id, credential_provider=FakeCredentialProvider()
-            )
-            payload = start_persistent_worker(
-                worker,
-                poll_interval_seconds=args.poll_interval_seconds,
-                max_restarts=args.max_restarts,
-                harmless_sleeper_seconds=args.harmless_sleeper_seconds,
-                startup_timeout_seconds=args.startup_timeout_seconds,
-            )
-            json_dumps_safe(payload)
-            _emit(payload, args.output)
-            return 0 if payload["process_alive"] else 64
-        if args.command == "stop-worker":
-            worker = AccountWorker.resume(
-                args.worker_root, args.account_id, credential_provider=FakeCredentialProvider()
-            )
-            payload = request_stop_and_wait(worker)
-            json_dumps_safe(payload)
-            _emit(payload, args.output)
-            return 0
-        if args.command == "worker-status":
-            worker = AccountWorker.resume(
-                args.worker_root, args.account_id, credential_provider=FakeCredentialProvider()
-            )
-            payload = read_persistent_status(worker)
-            json_dumps_safe(payload)
-            _emit(payload, args.output)
-            return 0
-        if args.command == "worker-host":
-            return run_worker_host(
-                args.worker_root, args.account_id,
-                poll_interval_seconds=args.poll_interval_seconds,
-                max_restarts=args.max_restarts,
-                harmless_sleeper_seconds=args.harmless_sleeper_seconds,
-            )
-        if args.command == "verify-endpoint":
-            records = resolve_verified(args.registry, broker_label=args.broker_label, now_unix_ms=args.now_unix_ms)
-            usable = len(records) == 1
-            payload = {
-                "broker_label": args.broker_label,
-                "verified_count": len(records),
-                "usable": usable,
-                "endpoint": f"{records[0]['host']}:{records[0]['port']}" if usable else None,
-            }
-            _emit(payload, args.output)
-            return 0 if usable else 2
-        if args.command == "generate-config-dry-run":
-            with mt5_config_dry_run(args.registry, args.broker_label, now_unix_ms=args.now_unix_ms) as plan:
-                payload = {
-                    "server": plan.server,
-                    "config_path": str(plan.config_path),
-                    "command": list(plan.command),
-                    "launched": False,
-                }
-                json_dumps_safe(payload)
-                _emit(payload, args.output)
-            return 0
+        onboarding_result = dispatch_onboarding_command(args, _emit)
+        if onboarding_result is not None:
+            return onboarding_result
     except (
         OSError,
         json.JSONDecodeError,
         LabValidationError,
-        WorkerError,
-        RegistryError,
-        DryRunError,
-        CredentialLeakError,
-        SupervisorError,
+        OnboardingCliError,
     ) as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 64

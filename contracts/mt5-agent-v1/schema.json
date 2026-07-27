@@ -11,8 +11,30 @@
     },
     "isoTimestamp": { "type": "string", "format": "date-time" },
     "errorCode": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
-    "jobType": { "enum": ["provision", "deprovision", "historical_sync"] },
+    "jobType": { "enum": ["provision", "deprovision", "historical_sync", "live_sync"] },
     "historyMode": { "enum": ["new_only", "from_date", "all_available"] },
+    "credentialEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "iv", "ciphertext"],
+      "properties": {
+        "alg": { "const": "aes-256-gcm-v1" },
+        "iv": { "type": "string", "minLength": 1 },
+        "ciphertext": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provisionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_envelope", "expected_login", "expected_server", "broker_label", "bridge_token"],
+      "properties": {
+        "credential_envelope": { "$ref": "#/$defs/credentialEnvelope" },
+        "expected_login": { "type": "string", "pattern": "^[0-9]{1,32}$" },
+        "expected_server": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "broker_label": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "bridge_token": { "type": "string", "pattern": "^tjmt5_[A-Za-z0-9_-]{16,128}$" }
+      }
+    },
 
     "claimRequest": {
       "type": "object",
@@ -41,7 +63,18 @@
         "history_mode": { "anyOf": [{ "$ref": "#/$defs/historyMode" }, { "type": "null" }] },
         "from_date": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
         "payload": { "type": "object" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "job_type": { "const": "provision" } },
+            "required": ["job_type"]
+          },
+          "then": {
+            "properties": { "payload": { "$ref": "#/$defs/provisionPayload" } }
+          }
+        }
+      ]
     },
     "claimResponseNoJob": { "const": null, "description": "HTTP 204 No Content body" },
 
@@ -114,7 +147,7 @@
             "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed",
             "invalid_identifier", "lease_lost", "route_not_found", "invalid_error_code",
             "method_not_allowed", "server_not_configured", "payload_too_large",
-            "rate_limited", "internal_error"
+            "rate_limited", "forbidden_scope", "internal_error"
           ]
         }
       }

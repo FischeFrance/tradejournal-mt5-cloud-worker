@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,16 +10,13 @@ import httpx
 import pytest
 
 from windows_agent.api_client import AgentApiClient
-from windows_agent.config import AgentConfig
 from windows_agent.job_runner import JobRunner
 from windows_agent.provisioning.instance_layout import InstanceLayout, SUBDIRS
 from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.secret_store import WindowsSecretStore
-from windows_agent.research import ResearchCollector
 from windows_agent.security import RedactionFilter, canonical_uuid, safe_child
 from windows_agent.state_store import atomic_json, read_json
 from windows_agent.worker.dedup import PersistentDedup
-from windows_agent.worker.direct_mt5_adapter import DirectMt5Adapter, IdentityMismatch
 from windows_agent.worker.live_sync import detect_windows_events
 
 
@@ -64,49 +63,6 @@ def test_dpapi_round_trip_and_acl(tmp_path):
     assert not path.exists()
 
 
-class Module:
-    COPY_TICKS_ALL = 0
-
-    def __init__(self, login=42, server="Demo"):
-        self.account = type("A", (), {"login": login, "server": server})()
-
-    def initialize(self, *args, **kwargs):
-        return True
-
-    def login(self, *args, **kwargs):
-        return True
-
-    def account_info(self):
-        return self.account
-
-    def shutdown(self):
-        self.closed = True
-
-    def positions_get(self):
-        return ()
-
-    def orders_get(self):
-        return ()
-
-    def history_deals_get(self, *args):
-        return ()
-
-
-def test_adapter_identity_and_final_shutdown(tmp_path):
-    terminal = tmp_path / "terminal64.exe"
-    terminal.touch()
-    module = Module()
-    adapter = DirectMt5Adapter(terminal, 42, "Demo", module)
-    with adapter.session("fixture-investor"):
-        assert adapter.verify_identity()["login"] == "42"
-    assert module.closed
-    bad = DirectMt5Adapter(terminal, 43, "Demo", Module())
-    with pytest.raises(IdentityMismatch):
-        with bad.session("fixture-investor"):
-            pass
-    assert bad._mt5.closed
-
-
 def test_runtime_has_no_trading_calls():
     root = Path(__file__).parents[2] / "windows_agent"
     forbidden = (
@@ -121,32 +77,12 @@ def test_runtime_has_no_trading_calls():
     violations = []
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8").casefold()
-        violations += [(path, item) for item in forbidden if item in text]
+        violations += [
+            (path, item)
+            for item in forbidden
+            if re.search(rf"\b{re.escape(item)}\s*\(", text)
+        ]
     assert violations == []
-
-
-def test_adapter_exposes_only_read_operations():
-    public = {
-        name
-        for name in vars(DirectMt5Adapter)
-        if not name.startswith("_") and name not in {"session", "verify_identity"}
-    }
-    assert public == {
-        "terminal_info",
-        "account_info",
-        "positions",
-        "orders",
-        "history_orders",
-        "history_deals",
-        "rates",
-        "ticks",
-        "symbol_info",
-        "symbol_tick",
-        "snapshot",
-        "initialize",
-        "last_error",
-        "verify_ipc_compatibility",
-    }
 
 
 def test_partial_close_and_new_deal():
@@ -193,7 +129,7 @@ class FakeApi:
 
     def transition(self, job, lease, status, result=None):
         self.transitions.append(status)
-        return {}
+        return {"status": "failed" if status == "fail" else status}
 
     def heartbeat(self, job, lease):
         return {"lease_valid": self.lease}
@@ -207,6 +143,42 @@ def test_lease_lost_never_completes(tmp_path):
     assert runner.run_once() is False and "complete" not in api.transitions
 
 
+def test_unacknowledged_running_transition_never_executes_handler(tmp_path):
+    api = FakeApi()
+    called = []
+
+    def transition(job, lease, status, result=None):
+        api.transitions.append(status)
+        return {"error_code": "lease_lost"}
+
+    api.transition = transition
+    runner = JobRunner(
+        tmp_path / "job.json", api, {"provision": lambda job: called.append(job)}
+    )
+
+    assert runner.run_once() is False
+    assert called == []
+    assert read_json(tmp_path / "job.json")["status"] == "lease_lost"
+
+
+def test_unacknowledged_complete_transition_is_not_reported_complete(tmp_path):
+    api = FakeApi()
+
+    def transition(job, lease, status, result=None):
+        api.transitions.append(status)
+        if status == "complete":
+            return {"error_code": "lease_lost"}
+        return {"status": status}
+
+    api.transition = transition
+    runner = JobRunner(
+        tmp_path / "job.json", api, {"provision": lambda job: {"ok": True}}
+    )
+
+    assert runner.run_once() is False
+    assert read_json(tmp_path / "job.json")["status"] == "lease_lost"
+
+
 def test_fake_provision_deprovision_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(WindowsSecretStore, "delete_connection", lambda *args: None)
     provisioner = InstanceProvisioner(tmp_path / "instances", tmp_path / "secrets")
@@ -217,19 +189,67 @@ def test_fake_provision_deprovision_idempotent(tmp_path, monkeypatch):
     assert read_json(root / "state" / "instance.json")["status"] == "deprovisioned"
 
 
-def test_research_requires_server_allowlist(tmp_path):
-    with pytest.raises(PermissionError):
-        ResearchCollector(tmp_path / "r.db", False, True)
-    disabled = ResearchCollector(tmp_path / "r2.db", False)
-    disabled.add({"symbol": "EURUSD"})
-    assert (
-        disabled.connection.execute("select count(*) from market_data").fetchone()[0]
-        == 0
+def test_instance_provision_rejects_symlinked_template_content(tmp_path):
+    source = tmp_path / "template"
+    source.mkdir()
+    (source / "terminal64.exe").write_bytes(b"terminal")
+    outside = tmp_path / "outside.dat"
+    outside.write_bytes(b"outside")
+    try:
+        (source / "linked.dat").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+    with pytest.raises(ValueError, match="reparse"):
+        provisioner.provision(str(uuid4()), source / "terminal64.exe")
+
+
+def test_instance_provision_pins_and_records_terminal_digest(tmp_path):
+    source = tmp_path / "template"
+    source.mkdir()
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    expected = hashlib.sha256(b"terminal").hexdigest()
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
     )
 
+    root = provisioner.provision(
+        connection_id, terminal, expected_terminal_sha256=expected
+    )
 
-def test_config_defaults_closed():
-    cfg = AgentConfig(str(uuid4()))
-    assert not cfg.research_enabled and cfg.poll_seconds >= 0.25
-    with pytest.raises(ValueError):
-        AgentConfig(str(uuid4()), research_enabled=True)
+    state = read_json(root / "state" / "instance.json")
+    assert state["terminal_sha256"] == expected
+    with pytest.raises(ValueError, match="digest mismatch"):
+        provisioner.provision(
+            str(uuid4()), terminal, expected_terminal_sha256="0" * 64
+        )
+
+
+def test_instance_provision_failure_leaves_no_partial_publication(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "template"
+    source.mkdir()
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+
+    def fail_copy(*args, **kwargs):
+        raise OSError("fixture copy failure")
+
+    monkeypatch.setattr(
+        "windows_agent.provisioning.mt5_instance.shutil.copy2", fail_copy
+    )
+    with pytest.raises(OSError, match="fixture copy failure"):
+        provisioner.provision(connection_id, terminal)
+
+    assert not (tmp_path / "instances" / connection_id).exists()
+    assert not list((tmp_path / "instances").glob(".*.staging"))

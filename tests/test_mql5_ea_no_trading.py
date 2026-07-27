@@ -99,6 +99,17 @@ def test_expert_declares_versioned_file_bridge_contract():
         assert required in text, f"contratto file bridge mancante: {required}"
 
 
+def test_event_sequence_is_persisted_before_event_publication():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    builder = text[text.index("string BuildEventJson"):text.index("void EmitDealAddEvent")]
+    writer = text[text.index("bool WriteEventAtomic"):text.index("long ExtractJsonLong")]
+
+    assert builder.index("g_event_seq++") < builder.index("SaveCursorState()")
+    assert 'return "";' in builder
+    assert 'if(payload == "")' in writer
+    assert writer.index('if(payload == "")') < writer.index("WriteJsonAtomic(")
+
+
 def test_new_only_defers_account_reads_until_after_on_init():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
     assert "if(!g_new_only)\n      WriteAllSnapshots();" in text

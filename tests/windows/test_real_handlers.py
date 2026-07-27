@@ -14,12 +14,16 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from windows_agent import real_handlers
 from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
+from windows_agent.broker_endpoint_resolver import (
+    BrokerEndpointResolutionError,
+    VerifiedBrokerEndpoint,
+)
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.real_handlers import build_real_handlers, sweep_stale_instances
 from windows_agent.state_store import read_json
-from windows_agent.worker.direct_mt5_adapter import (
+from windows_agent.worker.adapter_errors import (
     IdentityMismatch,
     Mt5Error,
     Mt5IpcError,
@@ -68,11 +72,11 @@ class FakeApi:
 
     def transition(self, job_id: str, lease_id: str, status: str, result: dict | None = None) -> dict:
         self.transitions.append((status, result))
-        return {}
+        return {"status": "failed" if status == "fail" else status}
 
 
 class ScriptedAdapter:
-    """Configurable fake standing in for DirectMt5Adapter -- lets tests exercise every branch of
+    """Configurable adapter double that lets tests exercise every branch of
     real_handlers.py (identity mismatch, investor-not-verified, IPC failure, history records)
     without a real MetaTrader5 terminal."""
 
@@ -144,7 +148,7 @@ def env(tmp_path):
     return SimpleNamespace(instances_root=instances_root, secrets_root=secrets_root, source_terminal=source_terminal)
 
 
-def _handlers(env, api, *, script: dict | None = None):
+def _handlers(env, api, *, script: dict | None = None, endpoint_resolver=None):
     def adapter_factory(terminal, login, server):
         return ScriptedAdapter(terminal, login, server, script=script or {})
 
@@ -155,14 +159,21 @@ def _handlers(env, api, *, script: dict | None = None):
         source_terminal=env.source_terminal,
         adapter_factory=adapter_factory,
         process_factory=FakeProcessManager,
+        endpoint_resolver=endpoint_resolver,
     )
 
 
-def _provision_payload(login=12345, server="Demo-Server", password="investor-pw") -> dict:
+def _provision_payload(
+    login=12345,
+    server="Demo-Server",
+    password="investor-pw",
+    broker_label="Demo Broker",
+) -> dict:
     return {
         "credential_envelope": _envelope({"investor_password": password}),
         "expected_login": login,
         "expected_server": server,
+        "broker_label": broker_label,
     }
 
 
@@ -192,6 +203,50 @@ def test_provision_full_success_persists_secrets_and_progress(env):
     assert "investor-pw" not in dump
 
 
+def test_provision_resolves_and_persists_verified_connection_endpoint(env):
+    cid = str(uuid4())
+    observed_labels: list[str] = []
+
+    def resolve(label: str) -> VerifiedBrokerEndpoint:
+        observed_labels.append(label)
+        return VerifiedBrokerEndpoint(
+            broker_label="Demo Broker",
+            host="203.0.113.10",
+            port=443,
+            protocol="TCP/TLS",
+            observed_at_unix_ms=1,
+            discovery_method="MT5_LOGIN_DIALOG_IP",
+            verification_pid=123,
+            verification_session_id="12345678-1234-4234-8234-123456789abc",
+            confidence="MEDIUM",
+            artifact_relative_path="events.jsonl",
+            artifact_sha256="1" * 64,
+        )
+
+    handlers = _handlers(env, FakeApi(), endpoint_resolver=resolve)
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+
+    store = WindowsSecretStore(env.secrets_root)
+    assert observed_labels == ["Demo Broker"]
+    assert store.read(cid, "mt5_server") == "Demo-Server"
+    assert store.read(cid, "mt5_broker_label") == "Demo Broker"
+    assert store.read(cid, "mt5_endpoint") == "203.0.113.10:443"
+
+
+def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(env):
+    cid = str(uuid4())
+
+    def reject(_label: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    handlers = _handlers(env, FakeApi(), endpoint_resolver=reject)
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+
+    assert exc_info.value.error_code == "broker_endpoint_unavailable"
+    assert not (env.secrets_root / cid).exists()
+
+
 def test_provision_is_idempotent_on_retry(env):
     cid = str(uuid4())
     api = FakeApi()
@@ -209,7 +264,15 @@ def test_provision_is_idempotent_on_retry(env):
 def test_provision_missing_envelope_is_credential_envelope_invalid(env):
     cid = str(uuid4())
     handlers = _handlers(env, FakeApi())
-    job = _job("provision", cid, payload={"expected_login": 1, "expected_server": "srv"})
+    job = _job(
+        "provision",
+        cid,
+        payload={
+            "expected_login": 1,
+            "expected_server": "srv",
+            "broker_label": "Demo Broker",
+        },
+    )
     with pytest.raises(Exception) as exc_info:
         handlers["provision"](job)
     assert exc_info.value.error_code == "credential_envelope_invalid"
@@ -226,6 +289,7 @@ def test_provision_wrong_key_is_credential_decryption_failed(env):
             "credential_envelope": _envelope({"investor_password": "x"}, key_b64=bad_key),
             "expected_login": 1,
             "expected_server": "srv",
+            "broker_label": "Demo Broker",
         },
     )
     with pytest.raises(Exception) as exc_info:
@@ -301,10 +365,19 @@ def test_provision_missing_terminal_template_is_terminal_start_failed(env):
 
 
 @pytest.mark.parametrize("bad_payload", [
-    {"expected_login": 0, "expected_server": "srv"},
-    {"expected_login": "not-a-number", "expected_server": "srv"},
-    {"expected_login": 1, "expected_server": ""},
-    {"expected_login": 1, "expected_server": "bad\nserver"},
+    {"expected_login": 0, "expected_server": "srv", "broker_label": "Demo Broker"},
+    {
+        "expected_login": "not-a-number",
+        "expected_server": "srv",
+        "broker_label": "Demo Broker",
+    },
+    {"expected_login": 1, "expected_server": "", "broker_label": "Demo Broker"},
+    {
+        "expected_login": 1,
+        "expected_server": "bad\nserver",
+        "broker_label": "Demo Broker",
+    },
+    {"expected_login": 1, "expected_server": "srv", "broker_label": ""},
 ])
 def test_provision_invalid_identity_is_credential_envelope_invalid(env, bad_payload):
     cid = str(uuid4())

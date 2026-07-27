@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+from .broker_endpoint_resolver import resolve_verified_broker_endpoint
 from .job_runner import JobRunner
 from .real_handlers import build_real_handlers, sweep_stale_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
@@ -58,7 +59,15 @@ def build_runner(
         secrets_root=config.secrets_root,
         source_terminal=config.source_terminal,
         expert_binary=config.expert_binary,
+        terminal_sha256=config.terminal_sha256,
+        expert_sha256=config.expert_sha256,
         trading_ingestion_url=config.trading_ingestion_url,
+        endpoint_resolver=lambda broker_label: resolve_verified_broker_endpoint(
+            config.broker_registry_path,
+            broker_label=broker_label,
+            artifact_root=config.broker_artifact_root,
+            artifact_manifest=config.broker_artifact_manifest,
+        ),
     )
     return JobRunner(state_path, api, real_handlers)
 

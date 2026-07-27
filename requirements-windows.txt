@@ -1,5 +1,4 @@
 -r requirements.txt
-MetaTrader5==5.0.5735
 httpx==0.28.1
 cryptography==49.0.0
 pywin32==311

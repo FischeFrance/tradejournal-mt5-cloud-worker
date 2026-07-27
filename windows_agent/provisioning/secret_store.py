@@ -4,6 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from worker.atomic_file import durable_replace
+
 from ..security import safe_child
 
 ALLOWED = frozenset(
@@ -11,6 +13,8 @@ ALLOWED = frozenset(
         "mt5_investor_password",
         "mt5_login",
         "mt5_server",
+        "mt5_endpoint",
+        "mt5_broker_label",
         "ingestion_token",
         "agent_token",
         "worker_token",
@@ -55,7 +59,7 @@ class WindowsSecretStore:
                 handle.write(blob)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            durable_replace(temporary, path)
         finally:
             try:
                 os.unlink(temporary)

@@ -7,7 +7,7 @@ import httpx
 import jsonschema
 import pytest
 
-from windows_agent.api_client import AgentApiClient
+from windows_agent.api_client import AgentApiClient, AgentContractError
 
 CONTRACT_DIR = Path(__file__).parents[2] / "contracts" / "mt5-agent-v1"
 SCHEMA = json.loads((CONTRACT_DIR / "schema.json").read_text(encoding="utf-8"))
@@ -26,6 +26,7 @@ def validate_against(def_name: str, value: object) -> None:
         ("claimRequest", "claimRequest"),
         ("claimResponseJob", "claimResponseJob_provision"),
         ("claimResponseJob", "claimResponseJob_historicalSync"),
+        ("claimResponseJob", "claimResponseJob_liveSync"),
         ("heartbeatRequest", "heartbeatRequest"),
         ("heartbeatResponseOk", "heartbeatResponseOk"),
         ("heartbeatResponseLeaseLost", "heartbeatResponseLeaseLost"),
@@ -66,6 +67,28 @@ def test_claim_returns_falsy_on_204_no_job() -> None:
         "https://agent.example/", "fixture", httpx.MockTransport(lambda r: httpx.Response(204))
     )
     assert not client.claim()
+
+
+def test_claim_rejects_unknown_job_type_before_dispatch() -> None:
+    body = {**FIXTURES["claimResponseJob_liveSync"], "job_type": "future_job"}
+    client = AgentApiClient(
+        "https://agent.example/",
+        "fixture",
+        httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
+    )
+    with pytest.raises(AgentContractError, match="job_type"):
+        client.claim()
+
+
+def test_claim_rejects_provision_without_typed_secret_envelope() -> None:
+    body = {**FIXTURES["claimResponseJob_provision"], "payload": {}}
+    client = AgentApiClient(
+        "https://agent.example/",
+        "fixture",
+        httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
+    )
+    with pytest.raises(AgentContractError, match="provision payload"):
+        client.claim()
 
 
 def test_heartbeat_lease_lost_returns_body_instead_of_raising() -> None:

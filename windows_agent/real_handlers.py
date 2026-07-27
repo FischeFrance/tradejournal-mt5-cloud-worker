@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .broker_endpoint_resolver import (
+    BrokerEndpointResolutionError,
+    VerifiedBrokerEndpoint,
+)
+from worker.event_normalizer import normalize_event
+from worker.event_outbox import EventOutbox
 from .agent_errors import (
     AccountIdentityMismatch,
     AgentError,
+    BrokerEndpointUnavailable,
     CredentialDecryptionFailed,
     CredentialEnvelopeInvalid,
     DeprovisionFailed,
@@ -32,7 +40,7 @@ from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
 from .state_store import atomic_json, read_json
 from .worker.dedup import PersistentDedup
-from .worker.direct_mt5_adapter import (
+from .worker.adapter_errors import (
     IdentityMismatch,
     Mt5Error,
     Mt5IpcError,
@@ -48,6 +56,7 @@ from .worker.trading_ingestion_sink import TradingIngestionSink
 logger = logging.getLogger(__name__)
 
 SERVER_PATTERN = re.compile(r"[A-Za-z0-9._ -]{1,128}")
+BROKER_PATTERN = re.compile(r"[A-Za-z0-9&'()._ -]{1,128}")
 DEFAULT_EXPERT_BINARY = Path(r"C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5")
 
 JobHandler = Callable[[dict], dict]
@@ -75,9 +84,26 @@ def _progress(root: Path, **fields: Any) -> None:
 
 
 def _require_lease(api: Any, job: dict) -> None:
+    guard = job.get("_lease_guard")
+    if callable(guard):
+        guard()
     heartbeat = api.heartbeat(job["job_id"], job["lease_id"])
     if not heartbeat.get("lease_valid", False):
         raise LeaseLost("lease lost")
+
+
+def _verify_binary_pin(path: Path, expected_sha256: str | None) -> None:
+    if expected_sha256 is None:
+        return
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TerminalStartFailed("pinned binary unavailable") from exc
+    if digest.hexdigest() != expected_sha256:
+        raise TerminalStartFailed("pinned binary digest mismatch")
 
 
 def _decrypt_envelope(payload: dict, secrets_root: Path) -> str:
@@ -98,7 +124,7 @@ def _decrypt_envelope(payload: dict, secrets_root: Path) -> str:
     return password
 
 
-def _expected_identity(payload: dict) -> tuple[int, str]:
+def _expected_identity(payload: dict) -> tuple[int, str, str]:
     raw_login = payload.get("expected_login")
     try:
         login = int(raw_login)  # type: ignore[arg-type]
@@ -109,7 +135,10 @@ def _expected_identity(payload: dict) -> tuple[int, str]:
     server = str(payload.get("expected_server") or "").strip()
     if not SERVER_PATTERN.fullmatch(server):
         raise CredentialEnvelopeInvalid("expected_server missing or invalid")
-    return login, server
+    broker_label = str(payload.get("broker_label") or "").strip()
+    if not BROKER_PATTERN.fullmatch(broker_label):
+        raise CredentialEnvelopeInvalid("broker_label missing or invalid")
+    return login, server, broker_label
 
 
 def _history_window(job: dict) -> tuple[HistoryMode, "datetime | None"]:
@@ -130,11 +159,9 @@ def _history_window(job: dict) -> tuple[HistoryMode, "datetime | None"]:
 
 def _map_mt5_error(exc: Mt5Error) -> AgentError:
     if isinstance(exc, IdentityMismatch):
-        # DirectMt5Adapter.verify_identity() does not distinguish which field mismatched (see
-        # worker/direct_mt5_adapter.py) -- account_identity_mismatch is used as the primary code;
-        # server_identity_mismatch remains reachable (mapped, tested) for callers/adapters that do
-        # distinguish (e.g. a future NativeMt5Runtime-backed handler already does, see
-        # worker/native_mt5_runtime.py's separate identity_mismatch/server_identity_mismatch codes).
+        # Some injected test adapters do not distinguish which identity field mismatched.
+        # account_identity_mismatch is the conservative primary code; the native runtime emits
+        # separate identity_mismatch/server_identity_mismatch codes.
         return AccountIdentityMismatch(str(exc))
     if isinstance(exc, (Mt5IpcError, Mt5ProcessCrashed)):
         return Mt5InitializeFailed(str(exc))
@@ -199,12 +226,16 @@ def build_real_handlers(
     expert_binary: Path = DEFAULT_EXPERT_BINARY,
     runtime_factory: Callable[[Path, str], NativeMt5Runtime] = NativeMt5Runtime,
     trading_ingestion_url: str = "",
+    terminal_sha256: str | None = None,
+    expert_sha256: str | None = None,
+    endpoint_resolver: Callable[[str], VerifiedBrokerEndpoint] | None = None,
 ) -> dict[str, JobHandler]:
-    """Real provision/historical_sync/deprovision handlers, reusing exactly the same building
-    blocks as customer_flow.py (InstanceProvisioner, WindowsSecretStore, HistorySync, LiveSync)
-    but driven by a job already claimed by the real JobRunner/control plane. With no explicit
-    ``adapter_factory`` the Windows-native MQL5 file path is used; DirectMt5Adapter is retained
-    only for explicitly injected legacy/testing fallback calls and is never the default."""
+    """Real provision/historical_sync/deprovision handlers.
+
+    Jobs are claimed by the managed JobRunner/control plane. Without an injected
+    ``adapter_factory`` the Windows-native MQL5 file path is always used; the injection point
+    exists only for isolated tests.
+    """
 
     store = WindowsSecretStore(secrets_root)
 
@@ -212,14 +243,29 @@ def build_real_handlers(
         cid = canonical_uuid(str(job["connection_id"]))
         payload = job.get("payload") or {}
         _require_lease(api, job)
-        password = _decrypt_envelope(payload, secrets_root)
-        login, server = _expected_identity(payload)
+        _verify_binary_pin(source_terminal, terminal_sha256)
+        _verify_binary_pin(expert_binary, expert_sha256)
+        login, server, broker_label = _expected_identity(payload)
         mode, from_date = _history_window(job)
+        if endpoint_resolver is None:
+            connection_endpoint = server
+        else:
+            try:
+                connection_endpoint = endpoint_resolver(
+                    broker_label
+                ).server_address
+            except BrokerEndpointResolutionError as exc:
+                raise BrokerEndpointUnavailable(
+                    "verified broker endpoint unavailable"
+                ) from exc
+        password = _decrypt_envelope(payload, secrets_root)
 
         bridge_token = payload.get("bridge_token")
         try:
             store.write(cid, "mt5_login", str(login))
             store.write(cid, "mt5_server", server)
+            store.write(cid, "mt5_broker_label", broker_label)
+            store.write(cid, "mt5_endpoint", connection_endpoint)
             store.write(cid, "mt5_investor_password", password)
             # Issued fresh per provision run by request_mt5_provisioning_job (mt5_managed only) --
             # the live_sync job reads this back to authenticate its HTTP delivery to
@@ -238,14 +284,14 @@ def build_real_handlers(
 
         layout = InstanceLayout(instances_root, cid)
         try:
-            if layout.path.exists():
-                root = layout.path
-            else:
-                if not source_terminal.is_file():
-                    raise TerminalStartFailed("golden MT5 terminal template missing")
-                root = InstanceProvisioner(instances_root, secrets_root).provision(
-                    cid, source_terminal
-                )
+            if not source_terminal.is_file():
+                raise TerminalStartFailed("golden MT5 terminal template missing")
+            # Provision is also the integrity gate for an already-published instance:
+            # retries may reuse it only after its pinned terminal and complete template
+            # manifest have been independently recomputed.
+            root = InstanceProvisioner(instances_root, secrets_root).provision(
+                cid, source_terminal, terminal_sha256
+            )
         except TerminalStartFailed:
             raise
         except Exception as exc:
@@ -254,12 +300,13 @@ def build_real_handlers(
 
         if adapter_factory is None:
             result = _start_file_bridge_and_sync(
-                job, api, root, cid, login, server, mode, from_date, store,
-                process_factory, expert_binary, runtime_factory,
+                job, api, root, cid, login, server, connection_endpoint, mode, from_date, store,
+                process_factory, expert_binary, runtime_factory, trading_ingestion_url,
             )
         else:
             result = _authenticate_and_sync(
-                job, api, root, cid, login, server, mode, from_date, store, adapter_factory, process_factory
+                job, api, root, cid, login, server, mode, from_date, store,
+                adapter_factory, process_factory, trading_ingestion_url,
             )
         _progress(root, status="connected")
         return result
@@ -267,10 +314,14 @@ def build_real_handlers(
     def historical_sync(job: dict) -> dict:
         cid = canonical_uuid(str(job["connection_id"]))
         mode, from_date = _history_window(job)
-        layout = InstanceLayout(instances_root, cid)
-        root = layout.path
-        if not root.exists():
-            raise InstanceProvisionFailed("no provisioned instance for connection")
+        try:
+            root = InstanceProvisioner(instances_root, secrets_root).validate(
+                cid, terminal_sha256
+            )
+        except Exception as exc:
+            raise InstanceProvisionFailed(
+                "provisioned instance integrity validation failed"
+            ) from exc
         try:
             login = int(store.read(cid, "mt5_login"))
             server = store.read(cid, "mt5_server")
@@ -278,7 +329,16 @@ def build_real_handlers(
             raise SecretStoreFailed("stored identity unavailable") from exc
 
         terminal = root / "terminal" / "terminal64.exe"
+        _verify_binary_pin(terminal, terminal_sha256)
         state_path = root / "state" / "terminal-process.json"
+        ingestion_sink = None
+        if trading_ingestion_url:
+            try:
+                ingestion_sink = TradingIngestionSink(
+                    root, trading_ingestion_url, store.read(cid, "bridge_token")
+                )
+            except Exception as exc:
+                raise SecretStoreFailed("history ingestion token unavailable") from exc
         if adapter_factory is None:
             # The default adapter consumes only the EA's files.  A later history job must
             # therefore not read, decrypt or retain the investor password at all.
@@ -286,7 +346,11 @@ def build_real_handlers(
             _progress(root, status="importing_history")
             adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
             _verify_investor_access(adapter)
+            # The native EA emits an authoritative event file for every backfilled transaction.
+            # Do not synthesize a second event stream from snapshots; consume the files below.
             counts = _run_history_sync(adapter, root, mode, from_date)
+            if ingestion_sink is not None:
+                _run_live_sync_once(adapter, root, ingestion_sink)
         else:
             _require_lease(api, job)
             _progress(root, status="authenticating")
@@ -308,7 +372,9 @@ def build_real_handlers(
                     _verify_investor_access(adapter)
                     _progress(root, status="importing_history")
                     _require_lease(api, job)
-                    counts = _run_history_sync(adapter, root, mode, from_date)
+                    counts = _run_history_sync(
+                        adapter, root, mode, from_date, ingestion_sink, str(login), server
+                    )
             except Mt5Error as exc:
                 raise _map_mt5_error(exc) from exc
         _progress(root, status="connected")
@@ -342,13 +408,18 @@ def build_real_handlers(
         any new trade was detected, so trading_connections.last_seen_at/status stay fresh in real
         time even on a perfectly quiet account."""
         cid = canonical_uuid(str(job["connection_id"]))
-        layout = InstanceLayout(instances_root, cid)
-        root = layout.path
-        if not root.exists():
-            raise InstanceProvisionFailed("no provisioned instance for connection")
+        try:
+            root = InstanceProvisioner(instances_root, secrets_root).validate(
+                cid, terminal_sha256, verify_code=False
+            )
+        except Exception as exc:
+            raise InstanceProvisionFailed(
+                "provisioned instance integrity validation failed"
+            ) from exc
         try:
             login = int(store.read(cid, "mt5_login"))
             server = store.read(cid, "mt5_server")
+            broker_label = store.read(cid, "mt5_broker_label")
             bridge_token = store.read(cid, "bridge_token")
         except Exception as exc:
             raise SecretStoreFailed("stored identity/bridge token unavailable") from exc
@@ -360,13 +431,41 @@ def build_real_handlers(
         state_path = root / "state" / "terminal-process.json"
         if not (terminal.is_file() and ProcessManager.find(terminal)):
             try:
+                InstanceProvisioner(instances_root, secrets_root).validate(
+                    cid, terminal_sha256
+                )
+            except Exception as exc:
+                raise InstanceProvisionFailed(
+                    "provisioned instance code integrity validation failed"
+                ) from exc
+            _verify_binary_pin(terminal, terminal_sha256)
+            _verify_binary_pin(expert_binary, expert_sha256)
+            try:
                 investor_password = store.read(cid, "mt5_investor_password")
             except Exception as exc:
                 raise SecretStoreFailed("stored credential unavailable") from exc
+            if endpoint_resolver is None:
+                connection_endpoint = server
+            else:
+                try:
+                    connection_endpoint = endpoint_resolver(
+                        broker_label
+                    ).server_address
+                except BrokerEndpointResolutionError as exc:
+                    raise BrokerEndpointUnavailable(
+                        "verified broker endpoint unavailable"
+                    ) from exc
             try:
                 runtime = runtime_factory(root, cid)
+                set_cancel_check = getattr(runtime, "set_cancel_check", None)
+                if callable(set_cancel_check):
+                    set_cancel_check(job.get("_lease_guard"))
                 runtime.start(
-                    login=login, server=server, investor_password=investor_password, expert_binary=expert_binary,
+                    login=login,
+                    server=server,
+                    connection_endpoint=connection_endpoint,
+                    investor_password=investor_password,
+                    expert_binary=expert_binary,
                 )
             except NativeMt5Error as exc:
                 code = str(exc)
@@ -387,7 +486,8 @@ def build_real_handlers(
         try:
             _verify_investor_access(adapter)
             sink = TradingIngestionSink(root, trading_ingestion_url, bridge_token)
-            sink.send_heartbeat()
+            if not sink.send_heartbeat():
+                raise LiveSyncFailed("live sync heartbeat was not acknowledged")
             delivered = _run_live_sync_once(adapter, root, sink)
         except AgentError:
             raise
@@ -419,12 +519,106 @@ def _verify_investor_access(adapter: Any) -> None:
         raise InvestorAccessNotVerified("account is not read-only/investor")
 
 
-def _run_history_sync(adapter: Any, root: Path, mode: HistoryMode, from_date: "datetime | None") -> dict:
+def _history_time(value: object) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _history_event(entry: dict, login: str, server: str) -> dict:
+    record = dict(entry.get("record") or {})
+    kind = entry.get("kind")
+    ticket = record.get("position_id") or record.get("position_ticket") or record.get("ticket")
+    event_time = _history_time(record.get("time", record.get("close_time")))
+    direction = record.get("direction")
+    if direction is None and isinstance(record.get("type"), int):
+        direction = "buy" if record["type"] in (0, 2, 4, 6) else "sell"
+    base = {
+        "ticket": str(ticket),
+        "symbol": record.get("symbol"),
+        "direction": direction,
+        "volume": record.get("volume", record.get("volume_current")),
+        "stop_loss": record.get("sl", record.get("stop_loss")),
+        "take_profit": record.get("tp", record.get("take_profit")),
+        "event_time": event_time,
+    }
+    if kind == "orders":
+        raw = {
+            **base,
+            "event_type": "pending_order_created",
+            "price": record.get("price", record.get("price_open")),
+        }
+    else:
+        entry_value = record.get("entry")
+        normalized_entry = str(entry_value).upper() if entry_value is not None else ""
+        if normalized_entry in ("0", "IN"):
+            raw = {
+                **base,
+                "event_type": "trade_opened",
+                "open_price": record.get("price", record.get("open_price")),
+                "open_time": event_time,
+            }
+        elif normalized_entry in ("1", "2", "3", "OUT", "INOUT", "OUT_BY"):
+            raw = {
+                **base,
+                "event_type": "trade_closed",
+                "close_price": record.get("price", record.get("close_price")),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
+                "close_time": event_time,
+            }
+        else:
+            raw = {
+                **base,
+                "event_type": "deal_recorded",
+                "close_price": record.get("price", record.get("close_price")),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
+                "close_time": event_time,
+            }
+    return normalize_event(raw, login, server)
+
+
+def _run_history_sync(
+    adapter: Any,
+    root: Path,
+    mode: HistoryMode,
+    from_date: "datetime | None",
+    ingestion_sink: TradingIngestionSink | None = None,
+    login: str | None = None,
+    server: str | None = None,
+) -> dict:
     dedup = PersistentDedup(root / "state" / "history-dedup.sqlite")
-    sink = _deduped_sink(dedup, LocalEventSink(root / "data" / "history.jsonl"))
+    local_sink = LocalEventSink(root / "data" / "history.jsonl")
+    outbox = EventOutbox(str(root / "state" / "history-outbox.json"))
+
+    def persist(entry: dict) -> None:
+        local_sink(entry)
+        if ingestion_sink is not None:
+            if login is None or server is None:
+                raise HistorySyncFailed("history ingestion identity missing")
+            outbox.enqueue_many([_history_event(entry, login, server)])
+
+    sink = _deduped_sink(dedup, persist)
     try:
-        return HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
+        counts = HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
+        if ingestion_sink is not None:
+            result = outbox.drain(ingestion_sink)
+            dead_lettered = outbox.dead_letter_count()
+            if result.pending or dead_lettered or result.dry_run:
+                raise HistorySyncFailed(
+                    "history delivery incomplete: "
+                    f"pending={result.pending}, dead_lettered={dead_lettered}, "
+                    f"dry_run={result.dry_run}"
+                )
+        return counts
     except Exception as exc:
+        if isinstance(exc, HistorySyncFailed):
+            raise
         raise HistorySyncFailed("history import failed") from exc
 
 
@@ -435,12 +629,14 @@ def _start_file_bridge_and_sync(
     cid: str,
     login: int,
     server: str,
+    connection_endpoint: str,
     mode: HistoryMode,
     from_date: "datetime | None",
     store: WindowsSecretStore,
     process_factory: Callable[[Path], Any],
     expert_binary: Path,
     runtime_factory: Callable[[Path, str], NativeMt5Runtime],
+    trading_ingestion_url: str,
 ) -> dict:
     """Launch MT5 once, then consume only EA-produced local files.
 
@@ -458,9 +654,13 @@ def _start_file_bridge_and_sync(
         raise SecretStoreFailed("stored credential unavailable") from exc
     try:
         runtime = runtime_factory(root, cid)
+        set_cancel_check = getattr(runtime, "set_cancel_check", None)
+        if callable(set_cancel_check):
+            set_cancel_check(job.get("_lease_guard"))
         status = runtime.start(
             login=login,
             server=server,
+            connection_endpoint=connection_endpoint,
             investor_password=investor_password,
             expert_binary=expert_binary,
             history_mode=mode,
@@ -485,14 +685,23 @@ def _start_file_bridge_and_sync(
         # deprovision/recovery; a test double may intentionally omit real OS process discovery.
         pass
     adapter = Mql5FileMt5Adapter(status.files_path, cid, login, server, root / "state")
+    ingestion_sink = None
+    if trading_ingestion_url:
+        try:
+            ingestion_sink = TradingIngestionSink(
+                root, trading_ingestion_url, store.read(cid, "bridge_token")
+            )
+        except Exception as exc:
+            raise SecretStoreFailed("provision ingestion token unavailable") from exc
     try:
         _verify_investor_access(adapter)
         _progress(root, status="importing_history")
         _require_lease(api, job)
+        # Native backfill is delivered by events/event-*.json in the following live poll.
         counts = _run_history_sync(adapter, root, mode, from_date)
         _progress(root, status="starting_live_sync")
         _require_lease(api, job)
-        delivered = _run_live_sync_once(adapter, root)
+        delivered = _run_live_sync_once(adapter, root, ingestion_sink)
     except AgentError:
         raise
     except Mt5Error as exc:
@@ -520,6 +729,7 @@ def _authenticate_and_sync(
     store: WindowsSecretStore,
     adapter_factory: Callable[..., Any],
     process_factory: Callable[[Path], Any],
+    trading_ingestion_url: str,
 ) -> dict:
     terminal = root / "terminal" / "terminal64.exe"
     state_path = root / "state" / "terminal-process.json"
@@ -533,6 +743,14 @@ def _authenticate_and_sync(
     _ensure_no_stale_process(terminal, state_path, process_factory)
     process = process_factory(state_path)
     adapter = adapter_factory(terminal, login, server)
+    ingestion_sink = None
+    if trading_ingestion_url:
+        try:
+            ingestion_sink = TradingIngestionSink(
+                root, trading_ingestion_url, store.read(cid, "bridge_token")
+            )
+        except Exception as exc:
+            raise SecretStoreFailed("provision ingestion token unavailable") from exc
     try:
         with adapter.session(investor_password):
             investor_password = ""
@@ -544,11 +762,13 @@ def _authenticate_and_sync(
             _verify_investor_access(adapter)
             _progress(root, status="importing_history")
             _require_lease(api, job)
-            counts = _run_history_sync(adapter, root, mode, from_date)
+            counts = _run_history_sync(
+                adapter, root, mode, from_date, ingestion_sink, str(login), server
+            )
             _progress(root, status="starting_live_sync")
             _require_lease(api, job)
             try:
-                delivered = _run_live_sync_once(adapter, root)
+                delivered = _run_live_sync_once(adapter, root, ingestion_sink)
             except Exception as exc:
                 raise LiveSyncFailed("live sync check failed") from exc
     except Mt5Error as exc:
@@ -573,5 +793,6 @@ def _run_live_sync_once(adapter: Any, root: Path, sink: Callable[[dict], None] |
         PersistentSnapshot(root / "state" / "live_snapshot.json"),
         PersistentDedup(root / "state" / "live-dedup.sqlite"),
         sink or LocalEventSink(root / "data" / "live.jsonl"),
+        outbox=EventOutbox(str(root / "state" / "live-outbox.json")),
     )
     return live.poll_once()

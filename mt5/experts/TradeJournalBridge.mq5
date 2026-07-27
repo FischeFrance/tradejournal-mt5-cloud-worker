@@ -128,9 +128,8 @@ string BuildEnvelope(const string payload, const long sequence)
    return json;
   }
 
-// datetime MQL5 e' gia' un timestamp Unix (secondi UTC dal 1970-01-01), esattamente come i
-// campi letti da worker/mt5_client.py e dal vecchio bridge/windows/mt5_bridge.py: nessuna
-// conversione di fuso orario e' necessaria, solo la formattazione ISO8601 con suffisso Z.
+// datetime MQL5 e' gia' un timestamp Unix (secondi UTC dal 1970-01-01): nessuna conversione
+// di fuso orario e' necessaria, solo la formattazione ISO8601 con suffisso Z.
 string Iso8601FromDatetime(const datetime value)
   {
    string s = TimeToString(value, TIME_DATE | TIME_SECONDS); // "yyyy.mm.dd hh:mi:ss"
@@ -151,13 +150,12 @@ string EntryToString(const long entry_raw)
 string DirectionFromType(const long mt5_type)
   {
    // Enum MT5: BUY/BUY_LIMIT/BUY_STOP/BUY_STOP_LIMIT sono pari, i corrispondenti SELL sono
-   // dispari (0/2/4/6 vs 1/3/5/7) — stesso mapping esplicito gia' usato in
-   // worker/mt5_client.py e bridge/windows/mt5_bridge.py:_order_direction.
+   // dispari (0/2/4/6 vs 1/3/5/7).
    return (mt5_type % 2 == 0) ? "buy" : "sell";
   }
 
-// Il file connection_id e' scritto dall'entrypoint (contenuto non sensibile: solo un UUID di
-// connessione) sotto BASE_DIR PRIMA che il terminale venga avviato, cosi' e' gia' presente al
+// Il file connection_id e' scritto dal runtime Windows (contenuto non sensibile: solo un UUID
+// di connessione) sotto BASE_DIR PRIMA che il terminale venga avviato, cosi' e' gia' presente al
 // primo OnInit. Un fallback esplicito ("unknown-connection", mai vuoto) evita che un file
 // mancante o illeggibile produca un event_id con un campo vuoto/ambiguo.
 string ReadConnectionId()
@@ -205,7 +203,7 @@ bool ReadNewOnlyMode()
 
 //+------------------------------------------------------------------------+
 //| Scrittura atomica: file.tmp poi rename sul nome finale. Nessuno dei    |
-//| lettori (bridge/files/file_bridge.py) puo' mai osservare un file a     |
+//| lettori Windows (Mql5FileMt5Adapter) puo' mai osservare un file a      |
 //| meta'.                                                                  |
 //+------------------------------------------------------------------------+
 bool WriteJsonAtomic(const string relative_name, const string json_text)
@@ -236,6 +234,8 @@ bool WriteJsonAtomic(const string relative_name, const string json_text)
 // riga parziale e il nome basato sulla sequenza resta stabile dopo il riavvio grazie a cursor.json.
 bool WriteEventAtomic(const string payload)
   {
+   if(payload == "")
+      return false; // la sequenza non e' stata riservata in modo durevole
    string relative_name = "events\\event-" + IntegerToString(g_event_seq) + ".json";
    return WriteJsonAtomic(relative_name, BuildEnvelope(payload, g_event_seq));
   }
@@ -296,11 +296,11 @@ void LoadCursorState()
    g_backfill_done = ExtractJsonBool(content, "backfill_done", false);
   }
 
-void SaveCursorState()
+bool SaveCursorState()
   {
    string json = "{\"event_seq\":" + IntegerToString(g_event_seq) +
                  ",\"backfill_done\":" + (g_backfill_done ? "true" : "false") + "}";
-   WriteJsonAtomic("cursor.json", json);
+   return WriteJsonAtomic("cursor.json", json);
   }
 
 //+------------------------------------------------------------------------+
@@ -326,10 +326,9 @@ string BuildAccountJson()
    string currency = AccountInfoString(ACCOUNT_CURRENCY);
    long   leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
 
-   // NB: login/server qui NON sono mascherati (a differenza dei log/Print e di /health): questo
-   // file viaggia solo sulla rete Docker interna verso il worker, che richiede questi due campi
-   // non vuoti per attribuire correttamente le operazioni (stesso comportamento del vecchio
-   // bridge/windows/mt5_bridge.py:_fetch_account, che restituiva il valore reale nel payload).
+   // NB: login/server qui NON sono mascherati: il file rimane nella directory portable privata
+   // dell'istanza ed e' letto localmente dall'Agent, che richiede entrambi i campi per verificare
+   // l'identita' dell'account prima di attribuire eventi.
    string json = "{";
    json += "\"login\":" + JsonString(IntegerToString(login)) + ",";
    json += "\"server\":" + JsonString(server) + ",";
@@ -521,7 +520,16 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
                        const string comment, const string entry, const datetime event_time,
                        long timestamp_msc)
   {
-   g_event_seq++; // coda di unicita' entro lo stesso millisecondo, mai riusato
+   // Riserva la sequenza su disco PRIMA di pubblicare event-N.json. In caso di crash fra le due
+   // operazioni resta al massimo un gap (accettato dal consumer), mai il riuso di N con
+   // sovrascrittura di un evento non ancora acquisito.
+   g_event_seq++;
+   if(!SaveCursorState())
+     {
+      g_event_seq--;
+      Print("TradeJournalBridge: prenotazione durevole sequenza evento fallita.");
+      return "";
+     }
    if(timestamp_msc <= 0)
       timestamp_msc = (long)event_time * 1000; // fallback se la proprieta' _MSC non e' disponibile
 
@@ -531,9 +539,8 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
    // Composito e deterministico: connection_id + login + server + tipo + ticket + timestamp_msc.
    // Due connessioni/account diversi non possono mai produrre lo stesso event_id anche con
    // ticket numericamente coincidenti (broker/demo differenti): questo e' il requisito che
-   // sostituisce la vecchia deduplica "solo per deal_ticket" (vedi
-   // bridge/files/file_bridge.py:_EventsCursor, che usa (connection_id, login, server, ticket)
-   // come chiave, non il solo ticket).
+   // sostituisce la vecchia deduplica "solo per deal_ticket": l'adapter Windows usa
+   // (connection_id, login, server, ticket) come identita', non il solo ticket.
    string event_id = g_connection_id + "|" + IntegerToString(login) + "|" + server + "|" +
                       event_type + "|" + IntegerToString(ticket) + "|" +
                       IntegerToString(timestamp_msc) + "|" + IntegerToString(g_event_seq);

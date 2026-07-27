@@ -9,12 +9,10 @@ from typing import Any
 class LocalEventSink:
     """Durable append-only JSONL sink for detected/imported events.
 
-    No route exists yet (server- or agent-side) to forward these to the trading-mt5-events
-    ingestion endpoint for managed connections (that requires issuing a per-connection bridge
-    token during provisioning, which is not part of the control-plane contract today -- see
-    CONTROL-PLANE-NEXT-STEPS.txt). Persisting locally, durably, and losslessly is strictly better
-    than the previous placeholder (a bare no-op lambda in customer_flow.py) while that gap remains
-    open: nothing detected is ever silently discarded.
+    The managed path also forwards through the persistent EventOutbox to
+    ``trading-mt5-events``. This local stream is the independent, durable attempt audit: it is not
+    used as delivery acknowledgement and may therefore contain repeated attempts with the same
+    event_id.
     """
 
     def __init__(self, path: Path) -> None:

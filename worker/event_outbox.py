@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from event_sender import EventSender
+try:
+    from .atomic_file import durable_replace
+    from .event_sender import EventSender
+except ImportError:  # pragma: no cover - direct worker/main.py execution
+    from atomic_file import durable_replace
+    from event_sender import EventSender
 
 logger = logging.getLogger("mt5_worker.event_outbox")
 
@@ -29,6 +34,43 @@ _SECURE_FILE_MODE = 0o600
 
 class OutboxError(RuntimeError):
     """Errore di consistenza o persistenza dell'outbox."""
+
+
+def _restrict_file_access(path: str, descriptor: int) -> None:
+    """Apply the platform's private-file primitive without weakening Windows ACLs."""
+    if os.name != "nt":
+        os.fchmod(descriptor, _SECURE_FILE_MODE)
+        return
+
+    try:
+        import win32api
+        import win32con
+        import win32security
+
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+        )
+        try:
+            sid = win32security.GetTokenInformation(
+                token, win32security.TokenUser
+            )[0]
+        finally:
+            token.Close()
+        descriptor_value = win32security.SECURITY_DESCRIPTOR()
+        acl = win32security.ACL()
+        acl.AddAccessAllowedAce(
+            win32security.ACL_REVISION, win32con.GENERIC_ALL, sid
+        )
+        descriptor_value.SetSecurityDescriptorDacl(1, acl, 0)
+        win32security.SetFileSecurity(
+            path,
+            win32security.DACL_SECURITY_INFORMATION,
+            descriptor_value,
+        )
+    except Exception as exc:
+        raise OutboxError(
+            "Impossibile applicare l'ACL privata all'outbox persistente."
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -208,8 +250,10 @@ class EventOutbox:
                 raise OutboxError("Outbox persistente non valida: atteso un file regolare.")
             if (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino):
                 raise OutboxError("Outbox cambiata durante l'apertura; caricamento rifiutato.")
-            if stat.S_IMODE(file_stat.st_mode) != _SECURE_FILE_MODE:
-                os.fchmod(fd, _SECURE_FILE_MODE)
+            if os.name == "nt":
+                _restrict_file_access(self.file_path, fd)
+            elif stat.S_IMODE(file_stat.st_mode) != _SECURE_FILE_MODE:
+                _restrict_file_access(self.file_path, fd)
                 os.fsync(fd)
 
             with os.fdopen(fd, "r", encoding="utf-8") as handle:
@@ -287,16 +331,15 @@ class EventOutbox:
             prefix=f".{os.path.basename(self.file_path)}.", suffix=".tmp", dir=directory
         )
         try:
-            os.fchmod(fd, _SECURE_FILE_MODE)
+            _restrict_file_access(tmp_path, fd)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 fd = -1
                 json.dump(state, handle, sort_keys=True, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
             self._reject_symlink_target()
-            os.replace(tmp_path, self.file_path)
+            durable_replace(tmp_path, self.file_path)
             tmp_path = ""
-            self._fsync_directory(directory)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
@@ -315,12 +358,3 @@ class EventOutbox:
             return
         if stat.S_ISLNK(mode):
             raise OutboxError("Outbox persistente non sicura: i symlink non sono ammessi.")
-
-    @staticmethod
-    def _fsync_directory(directory: str) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(directory, flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)

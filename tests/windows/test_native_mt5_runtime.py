@@ -96,6 +96,7 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         result = runtime.start(
             login=42,
             server="Demo",
+            connection_endpoint="203.0.113.10:443",
             investor_password="not-a-real-secret",
             expert_binary=expert,
             history_mode="new_only",
@@ -104,7 +105,7 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert write_config.call_args_list == [
         call(
             42,
-            "Demo",
+            "203.0.113.10:443",
             "not-a-real-secret",
             "EURUSD",
             keep_private=True,
@@ -229,18 +230,13 @@ def test_start_uses_loader_to_attach_bridge_after_account_sync(tmp_path: Path) -
     assert not startup.exists()
 
 
-def test_start_process_uses_portable_config(tmp_path: Path) -> None:
+def test_start_process_requires_dedicated_interactive_user(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     config = runtime.state / "startup.ini"
     config.parent.mkdir()
     config.write_text("temporary")
-    process = Mock(pid=123)
-    with patch("subprocess.Popen", return_value=process) as popen:
-        assert runtime._start_process(config, 42) is process
-    args = popen.call_args.args[0]
-    assert "/portable" in args
-    assert "/login:42" in args
-    assert any(value.startswith("/config:") for value in args)
+    with pytest.raises(NativeMt5Error, match="dedicated_interactive_user_required"):
+        runtime._start_process(config, 42)
 
 
 def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
@@ -305,7 +301,7 @@ def test_startup_config_allows_configured_interactive_user_to_read(
         NativeMt5Runtime,
         "_setting",
         staticmethod(
-            lambda name: "Administrator"
+            lambda name: "TradeJournalMT5"
             if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
             else ""
         ),
@@ -324,11 +320,155 @@ def test_startup_config_allows_configured_interactive_user_to_read(
 
     assert restricted == [config]
     run.assert_called_once_with(
-        ["icacls", str(config), "/grant", "Administrator:(R)"],
+        ["icacls", str(config), "/grant", "TradeJournalMT5:(R)"],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def test_account_database_acl_allows_only_service_and_interactive_user(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    accounts = runtime.terminal_root / "Config" / "accounts.dat"
+    accounts.parent.mkdir()
+    accounts.write_bytes(b"encrypted-account-material")
+    restricted: list[Path] = []
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda path: restricted.append(Path(path))),
+    )
+    monkeypatch.setattr(
+        NativeMt5Runtime,
+        "_setting",
+        staticmethod(
+            lambda name: "TradeJournalMT5"
+            if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
+            else ""
+        ),
+    )
+    completed = Mock(returncode=0)
+    with patch("subprocess.run", return_value=completed) as run:
+        runtime._wait_for_account_database(1.0)
+
+    assert restricted == [accounts]
+    run.assert_called_once_with(
+        ["icacls", str(accounts), "/grant", "TradeJournalMT5:(M)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "account",
+    ["Administrator", "ADMINISTRATOR", "SYSTEM", "LocalSystem", "LocalService", "NetworkService"],
+)
+def test_interactive_user_rejects_operator_and_service_identities(
+    tmp_path: Path, monkeypatch, account: str
+) -> None:
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(
+        NativeMt5Runtime,
+        "_setting",
+        staticmethod(
+            lambda name: account
+            if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
+            else ""
+        ),
+    )
+
+    with pytest.raises(NativeMt5Error, match="interactive_user_not_dedicated"):
+        runtime._interactive_user()
+
+
+def test_start_process_uses_limited_dedicated_interactive_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.state.mkdir()
+    config = runtime.state / "startup.ini"
+    config.write_text("[Common]\n", encoding="utf-8")
+    monkeypatch.setattr(
+        NativeMt5Runtime,
+        "_setting",
+        staticmethod(
+            lambda name: "TradeJournalMT5"
+            if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
+            else ""
+        ),
+    )
+    completed = Mock(returncode=0)
+
+    with patch("subprocess.run", return_value=completed) as run:
+        assert runtime._start_process(config, 42) is None
+
+    create = run.call_args_list[0].args[0]
+    assert create[:3] == ["schtasks", "/Create", "/TN"]
+    assert create[create.index("/RU") + 1] == "TradeJournalMT5"
+    assert "/IT" in create
+    assert create[create.index("/RL") + 1] == "LIMITED"
+    assert "HIGHEST" not in create
+    run.assert_has_calls(
+        [
+            call(create, capture_output=True, text=True, check=False),
+            call(
+                ["schtasks", "/Run", "/TN", runtime._interactive_task],
+                capture_output=True,
+                text=True,
+                check=False,
+            ),
+        ]
+    )
+    launcher = (runtime.state / "launch-terminal.cmd").read_text(encoding="utf-8")
+    assert "/portable" in launcher
+    assert "/login:42" in launcher
+    assert str(config) in launcher
+
+
+def test_successful_interactive_launch_deletes_one_shot_task(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.state.mkdir()
+    launcher = runtime.state / "launch-terminal.cmd"
+    launcher.write_text("@echo off\r\n", encoding="utf-8")
+    runtime._interactive_task = "TradeJournalMT5-fixture"
+
+    with patch("subprocess.run", return_value=Mock(returncode=0)) as run:
+        runtime._release_interactive_task()
+
+    run.assert_called_once_with(
+        [
+            "schtasks",
+            "/Delete",
+            "/TN",
+            "TradeJournalMT5-fixture",
+            "/F",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert runtime._interactive_task is None
+    assert not launcher.exists()
+
+
+def test_failed_interactive_task_delete_remains_cleanup_eligible(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._interactive_task = "TradeJournalMT5-fixture"
+
+    with (
+        patch("subprocess.run", return_value=Mock(returncode=1)),
+        pytest.raises(NativeMt5Error, match="interactive_task_cleanup_failed"),
+    ):
+        runtime._release_interactive_task()
+
+    assert runtime._interactive_task == "TradeJournalMT5-fixture"
 
 
 def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> None:

@@ -168,10 +168,14 @@ credenziali: solo `host:port` risolto (valore pubblico, non segreto).
 
 ## 7. Limiti attuali
 
-- **Nessun login MT5 reale è stato eseguito o automatizzato.** Questo lavoro
-  costruisce l'impalcatura (FSM di onboarding, worker, supervisor, registry,
-  dry-run) ma non collega un provider di credenziali reale né un client MT5
-  reale — resta un punto di integrazione esplicito, non implementato.
+- Il percorso pubblico del laboratorio non automatizza un login MT5 e non
+  collega un provider reale di credenziali. Registry, dry-run e worker
+  costruiscono l'impalcatura, ma actual launch resta un punto di integrazione
+  esplicito e non implementato.
+- Il resolver AI server → broker è suggestion-only. Il nuovo orchestratore UI
+  seleziona esclusivamente un unico risultato contenente l'esatto server
+  richiesto; la label suggerita non è autorevole. Il driver reale resta
+  `HARD_DISABLED` e non esiste ancora un profilo UI acquisito/versionato.
 - `HARD_DISABLED` resta invariato, ovunque, per MT5: nessuna modifica lo
   indebolisce.
 - Il worker-host persistente (`labctl.py worker-host`, spawnato da
@@ -186,8 +190,8 @@ credenziali: solo `host:port` risolto (valore pubblico, non segreto).
   generale di `labctl.py`.
 - Il ponte tra il tracciato di produzione esistente (`windows_agent/`, con
   provisioning DPAPI per-account già maturo) e questo tracciato lab
-  (credential-free, C012-based) non è stato costruito: sono rimasti
-  intenzionalmente disgiunti in questa patch.
+  (credential-free, C012-based) non è stato costruito. La separazione è
+  intenzionale finché non esiste un contratto di integrazione approvato.
 
 ## 8. Eccezione autorizzata: `c012-host start-innocuous`
 

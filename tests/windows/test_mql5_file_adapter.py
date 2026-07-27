@@ -73,6 +73,53 @@ def test_reads_versioned_snapshots_and_preserves_sync_interface(tmp_path: Path) 
     assert len(adapter.history_deals(datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc))) == 1
 
 
+def test_rejects_snapshot_composed_from_different_publish_sequences(tmp_path: Path) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(
+        adapter.files_dir,
+        "positions.json",
+        [{"ticket": "1", "symbol": "EURUSD", "direction": "buy"}],
+        sequence=2,
+    )
+
+    with pytest.raises(Mql5FileAdapterError, match="snapshot_sequence_mismatch"):
+        adapter.snapshot()
+
+
+def test_event_files_are_read_in_sequence_and_acknowledged_separately(tmp_path: Path) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(
+        adapter.files_dir,
+        "events/event-12.json",
+        {
+            "event_type": "DEAL_ADD",
+            "position_id": "100",
+            "ticket": "200",
+            "entry": "OUT",
+            "time": "2026-07-17T10:00:00Z",
+        },
+        sequence=12,
+    )
+    _write(
+        adapter.files_dir,
+        "events/event-10.json",
+        {
+            "event_type": "DEAL_ADD",
+            "position_id": "100",
+            "ticket": "199",
+            "entry": "IN",
+            "time": "2026-07-17T09:00:00Z",
+        },
+        sequence=10,
+    )
+
+    assert [event["sequence"] for event in adapter.pending_events()] == [10, 12]
+    adapter.acknowledge_events(12)
+    assert adapter.pending_events() == ()
+    assert not (adapter.files_dir / "events" / "event-10.json").exists()
+    assert not (adapter.files_dir / "events" / "event-12.json").exists()
+
+
 def test_rejects_stale_heartbeat_and_corrupt_json_without_leaking_content(tmp_path: Path) -> None:
     adapter = _ready_adapter(tmp_path)
     old = datetime.now(timezone.utc) - timedelta(seconds=60)
@@ -98,7 +145,16 @@ def test_rejects_identity_mismatch_and_keeps_checkpoint_bounded(tmp_path: Path) 
         adapter.files_dir,
         "account.json",
         {"login": "42", "server": "Demo-Server", "trade_allowed": False},
+        sequence=44,
     )
+    _write(
+        adapter.files_dir,
+        "heartbeat.json",
+        {"terminal_connected": True, "account_trade_allowed": False},
+        sequence=44,
+    )
+    _write(adapter.files_dir, "positions.json", [], sequence=44)
+    _write(adapter.files_dir, "orders.json", [], sequence=44)
     _write(
         adapter.files_dir,
         "deals.json",

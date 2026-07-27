@@ -38,7 +38,7 @@ class QueueApi:
     def transition(self, job_id, lease_id, status, result=None):
         if status == "complete":
             self.completed.append(job_id)
-        return {}
+        return {"status": "failed" if status == "fail" else status}
 
 
 def test_full_mock_agent_smoke(tmp_path, monkeypatch):

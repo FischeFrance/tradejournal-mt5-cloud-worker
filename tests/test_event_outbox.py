@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from event_outbox import EventOutbox, OutboxError
+from event_outbox import EventOutbox, OutboxError, durable_replace
 from event_sender import SendResult
 
 
@@ -34,13 +34,42 @@ class _Sender:
         return self.results.pop(0)
 
 
+def _assert_private_file(path):
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        return
+
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+    )
+    try:
+        current_sid = win32security.GetTokenInformation(
+            token, win32security.TokenUser
+        )[0]
+    finally:
+        token.Close()
+    descriptor = win32security.GetFileSecurity(
+        str(path), win32security.DACL_SECURITY_INFORMATION
+    )
+    acl = descriptor.GetSecurityDescriptorDacl()
+    assert acl is not None
+    assert acl.GetAceCount() == 1
+    ace = acl.GetAce(0)
+    assert ace[2] == current_sid
+
+
 def test_enqueue_is_atomic_and_deduplicated_by_event_id(tmp_path):
     path = tmp_path / "event_outbox.json"
     outbox = EventOutbox(str(path))
     first = _payload()
 
-    real_replace = os.replace
-    with patch("event_outbox.os.replace", wraps=real_replace) as replace:
+    with patch(
+        "event_outbox.durable_replace", wraps=durable_replace
+    ) as replace:
         assert outbox.enqueue_many([first]) == 1
 
     replace.assert_called_once()
@@ -48,7 +77,7 @@ def test_enqueue_is_atomic_and_deduplicated_by_event_id(tmp_path):
     assert os.path.dirname(source) == str(tmp_path)
     assert destination == str(path)
     assert not list(tmp_path.glob("*.tmp"))
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    _assert_private_file(path)
 
     # Dopo un crash tra enqueue e snapshot lo stesso evento viene normalizzato di nuovo. Il
     # timestamp puo' cambiare, ma event_id e' autorevole e la prima versione resta persistita.
@@ -131,7 +160,7 @@ def test_v1_file_is_migrated_without_loss_and_recovers_order_from_event_time(tmp
         "z-event-opened",
         "a-event-closed",
     ]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    _assert_private_file(path)
 
 
 def test_transient_failure_stays_pending_and_is_delivered_after_restart(tmp_path):

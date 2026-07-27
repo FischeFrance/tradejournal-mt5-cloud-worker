@@ -92,6 +92,8 @@ class EndpointRegistryTests(unittest.TestCase):
             register_verified(**self.kwargs(port=0))
         with self.assertRaises(RegistryError):
             register_verified(**self.kwargs(verification_session_id="not-a-uuid"))
+        with self.assertRaises(RegistryError):
+            register_verified(**self.kwargs(discovery_method="PUBLIC_SOURCE_DISCOVERY"))
 
 
 if __name__ == "__main__":

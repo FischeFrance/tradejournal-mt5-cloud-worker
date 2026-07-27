@@ -6,36 +6,31 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 *.egg-info/
+**/bin/
+**/obj/
 
-# Stato locale del worker
+# Stato locale del Windows Agent
 data/
 *.log
 
-# Runtime MT5 fornito manualmente (installer, terminale installato, WINEPREFIX host-side):
-# mai versionato, vedi README "Preparazione runtime MT5".
+# Runtime MT5, istanze e materiale privato non entrano mai nel repository.
 runtime/
-
-# Provisioning host-side: istanze, queue, lock, state, secret e golden template sono sempre
-# esterni al repository. Il template contiene binari proprietari e non deve mai entrare in Git.
 provisioning-data/
 instances/
 secrets/
-queue/
 state/
-locks/
-mt5-prefix*.tar.zst
-mt5-prefix*.tar.zst.sha256
-*.tar.zst
-*.tar.zst.sha256
 *.exe
 *.dll
 *.msi
 *.cab
 *.pyd
-wine-prefix*/
 *.processing.json
 
 # Editor / OS
@@ -43,4 +38,5 @@ wine-prefix*/
 .vscode/
 .idea/
 .vercel
-.env*
+.env.*
+!.env.example

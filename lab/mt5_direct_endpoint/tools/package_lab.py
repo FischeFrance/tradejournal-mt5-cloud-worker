@@ -55,6 +55,7 @@ REQUIRED_ARCHIVE_MEMBERS = frozenset(
         "lab/mt5_direct_endpoint/schemas/evidence.schema.json",
         "lab/mt5_direct_endpoint/schemas/direct-campaign-manifest.schema.json",
         "lab/mt5_direct_endpoint/schemas/candidate-handoff.schema.json",
+        "lab/mt5_direct_endpoint/schemas/broker-wizard-request.schema.json",
     }
 )
 WINDOWS_RESERVED_NAMES = frozenset(
