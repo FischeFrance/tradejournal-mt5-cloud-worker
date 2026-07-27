@@ -9,6 +9,7 @@ from windows_agent.broker_identity import (
     BrokerIdentitySuggestion,
     CachedBrokerIdentityResolver,
     FakeBrokerIdentityProvider,
+    OpenAIBrokerIdentityProvider,
 )
 
 
@@ -116,3 +117,48 @@ def test_cache_is_sanitized_and_contains_no_credentials(tmp_path) -> None:
     assert "password" not in serialized
     assert "credential" not in serialized
     assert "account" not in serialized
+
+
+def test_openai_provider_derives_search_text_from_validated_broker_label(
+    monkeypatch,
+) -> None:
+    class Response:
+        output_text = json.dumps(
+            {
+                "broker_label": "FPM Trading",
+                "search_text": None,
+                "confidence": "HIGH",
+                "source_urls": ["https://fpm.example/mt5"],
+                "ambiguous": False,
+            }
+        )
+
+        @staticmethod
+        def model_dump():
+            return {
+                "output": [
+                    {
+                        "annotations": [
+                            {"url": "https://fpm.example/mt5"},
+                        ]
+                    }
+                ]
+            }
+
+    class Responses:
+        @staticmethod
+        def create(**_kwargs):
+            return Response()
+
+    class Client:
+        responses = Responses()
+
+    provider = object.__new__(OpenAIBrokerIdentityProvider)
+    provider._client = Client()
+    provider._model = "fixture-model"
+    monkeypatch.setattr("windows_agent.broker_identity.time.time", lambda: 1.0)
+
+    suggestion = provider.resolve("FPMTrading-Live")
+
+    assert suggestion.broker_label == "FPM Trading"
+    assert suggestion.search_text == "FPM Trading"

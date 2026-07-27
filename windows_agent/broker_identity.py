@@ -340,10 +340,14 @@ class OpenAIBrokerIdentityProvider:
         observed = {_source_url(url) for url in _observed_urls(dumped)}
         if not claimed or any(url not in observed for url in claimed):
             raise BrokerIdentityError("broker identity provenance is unverified")
+        broker_label = _label(payload.get("broker_label"), "broker label")
         return _validated_suggestion(
             BrokerIdentitySuggestion(
-                broker_label=_label(payload.get("broker_label"), "broker label"),
-                search_text=_label(payload.get("search_text"), "search text"),
+                broker_label=broker_label,
+                # The GUI search value is not an independent model claim. Deriving it from the
+                # already validated identity makes the cache deterministic and avoids accepting
+                # arbitrary display text that has no bearing on endpoint verification.
+                search_text=broker_label,
                 confidence=str(payload.get("confidence") or ""),
                 source_urls=claimed,
                 generated_at_unix_ms=int(time.time() * 1000),
