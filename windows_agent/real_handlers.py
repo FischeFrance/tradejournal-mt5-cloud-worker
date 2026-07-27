@@ -6,7 +6,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from worker.event_normalizer import normalize_event
 from worker.event_outbox import EventOutbox
@@ -14,6 +14,7 @@ from worker.event_outbox import EventOutbox
 from .agent_errors import (
     AccountIdentityMismatch,
     AgentError,
+    BrokerDiscoveryFailed,
     BrokerEndpointUnavailable,
     BrokerIdentityUnavailable,
     CredentialDecryptionFailed,
@@ -36,6 +37,11 @@ from .broker_endpoint_resolver import (
 from .broker_identity import (
     BrokerIdentityError,
     BrokerIdentitySuggestion,
+)
+from .broker_wizard import (
+    BrokerWizardError,
+    BrokerWizardEvidence,
+    write_login_verification_artifact,
 )
 from .credential_envelope import decrypt_credential_envelope
 from .job_runner import LeaseLost
@@ -66,6 +72,10 @@ BROKER_PATTERN = re.compile(r"[A-Za-z0-9 .,&'()+_/-]{1,128}")
 DEFAULT_EXPERT_BINARY = Path(r"C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5")
 
 JobHandler = Callable[[dict], dict]
+BrokerWizard = Callable[
+    [Path, str, str, str, Optional[Callable[[], None]]],
+    BrokerWizardEvidence,
+]
 
 
 class PersistentSnapshot:
@@ -150,6 +160,10 @@ def _expected_identity(payload: dict) -> tuple[int, str, str | None]:
     if broker_label is not None and not BROKER_PATTERN.fullmatch(broker_label):
         raise CredentialEnvelopeInvalid("broker_label missing or invalid")
     return login, server, broker_label
+
+
+def _broker_key(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
 
 
 def _history_window(job: dict) -> tuple[HistoryMode, "datetime | None"]:
@@ -241,6 +255,7 @@ def build_real_handlers(
     expert_sha256: str | None = None,
     endpoint_resolver: Callable[[str], VerifiedBrokerEndpoint] | None = None,
     broker_identity_resolver: Callable[[str], BrokerIdentitySuggestion] | None = None,
+    broker_wizard: BrokerWizard | None = None,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers.
 
@@ -258,14 +273,18 @@ def build_real_handlers(
         _verify_binary_pin(source_terminal, terminal_sha256)
         _verify_binary_pin(expert_binary, expert_sha256)
         login, server, broker_label = _expected_identity(payload)
+        payload_broker_label = broker_label
         mode, from_date = _history_window(job)
+        broker_search_text = broker_label
         if broker_label is None:
             if broker_identity_resolver is None:
                 raise BrokerIdentityUnavailable(
                     "broker identity resolver is not configured"
                 )
             try:
-                broker_label = broker_identity_resolver(server).broker_label
+                identity = broker_identity_resolver(server)
+                broker_label = identity.broker_label
+                broker_search_text = identity.search_text
             except BrokerIdentityError as exc:
                 raise BrokerIdentityUnavailable(
                     "broker identity suggestion is unavailable"
@@ -275,6 +294,7 @@ def build_real_handlers(
                     "broker identity suggestion is invalid"
                 )
         verified_endpoint: VerifiedBrokerEndpoint | None = None
+        wizard_evidence: BrokerWizardEvidence | None = None
         if endpoint_resolver is None:
             connection_endpoint = server
         else:
@@ -282,9 +302,50 @@ def build_real_handlers(
                 verified_endpoint = endpoint_resolver(broker_label)
                 connection_endpoint = verified_endpoint.server_address
             except BrokerEndpointResolutionError as exc:
-                raise BrokerEndpointUnavailable(
-                    "verified broker endpoint unavailable"
-                ) from exc
+                if broker_wizard is None:
+                    raise BrokerEndpointUnavailable(
+                        "verified broker endpoint unavailable"
+                    ) from exc
+                try:
+                    root = InstanceProvisioner(
+                        instances_root, secrets_root
+                    ).provision(cid, source_terminal, terminal_sha256)
+                except Exception as provision_exc:
+                    raise InstanceProvisionFailed(
+                        "broker census instance provisioning failed"
+                    ) from provision_exc
+                _progress(
+                    root,
+                    status="censusing_broker",
+                    connection_id=cid,
+                )
+                try:
+                    wizard_evidence = broker_wizard(
+                        root,
+                        broker_search_text or broker_label,
+                        broker_label,
+                        server,
+                        job.get("_lease_guard"),
+                    )
+                except BrokerWizardError as wizard_exc:
+                    raise BrokerDiscoveryFailed(
+                        "broker wizard failed closed"
+                    ) from wizard_exc
+                selected_broker = wizard_evidence.selected_broker_label
+                if (
+                    not BROKER_PATTERN.fullmatch(selected_broker)
+                    or (
+                        payload_broker_label is not None
+                        and _broker_key(payload_broker_label)
+                        != _broker_key(selected_broker)
+                    )
+                ):
+                    raise BrokerIdentityUnavailable(
+                        "broker wizard identity conflicts with the request"
+                    )
+                broker_label = selected_broker
+                connection_endpoint = server
+                _require_lease(api, job)
         password = _decrypt_envelope(payload, secrets_root)
 
         bridge_token = payload.get("bridge_token")
@@ -334,7 +395,7 @@ def build_real_handlers(
                 job, api, root, cid, login, server, mode, from_date, store,
                 adapter_factory, process_factory, trading_ingestion_url,
             )
-        _progress(root, status="connected")
+        verification_pid = result.pop("_verification_pid", None)
         if verified_endpoint is not None:
             result.update(
                 {
@@ -348,6 +409,35 @@ def build_real_handlers(
                     ),
                 }
             )
+        elif wizard_evidence is not None:
+            try:
+                _, artifact_digest = write_login_verification_artifact(
+                    root / "state",
+                    evidence=wizard_evidence,
+                    verification_pid=(
+                        verification_pid
+                        if isinstance(verification_pid, int)
+                        else wizard_evidence.terminal_pid
+                    ),
+                )
+            except BrokerWizardError as exc:
+                process_factory(
+                    root / "state" / "terminal-process.json"
+                ).stop()
+                raise BrokerDiscoveryFailed(
+                    "login verification evidence publication failed"
+                ) from exc
+            result.update(
+                {
+                    "verified_server_name": server,
+                    "verified_broker_label": broker_label,
+                    "verification_method": "managed_investor_login",
+                    "endpoint_protocol": "TCP/TLS",
+                    "endpoint_artifact_sha256": artifact_digest,
+                    "endpoint_verification_session_id": wizard_evidence.run_id,
+                }
+            )
+        _progress(root, status="connected")
         return result
 
     def historical_sync(job: dict) -> dict:
@@ -459,6 +549,7 @@ def build_real_handlers(
             login = int(store.read(cid, "mt5_login"))
             server = store.read(cid, "mt5_server")
             broker_label = store.read(cid, "mt5_broker_label")
+            stored_endpoint = store.read(cid, "mt5_endpoint")
             bridge_token = store.read(cid, "bridge_token")
         except Exception as exc:
             raise SecretStoreFailed("stored identity/bridge token unavailable") from exc
@@ -483,7 +574,11 @@ def build_real_handlers(
                 investor_password = store.read(cid, "mt5_investor_password")
             except Exception as exc:
                 raise SecretStoreFailed("stored credential unavailable") from exc
-            if endpoint_resolver is None:
+            if stored_endpoint.casefold() == server.casefold():
+                # A wizard-censused server is persisted only after a successful investor login.
+                # Reuse that verified server name after a host reboot without repeating UI work.
+                connection_endpoint = stored_endpoint
+            elif endpoint_resolver is None:
                 connection_endpoint = server
             else:
                 try:
@@ -753,6 +848,7 @@ def _start_file_bridge_and_sync(
         "live_sync_started": True,
         "live_sync_events_delivered": delivered,
         "file_bridge": "mql5-local-json",
+        "_verification_pid": status.pid,
     }
 
 

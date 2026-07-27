@@ -39,6 +39,7 @@ amministrativi, per esempio `TradeJournalMT5`, quindi impostare:
 
 ```text
 TRADEJOURNAL_MT5_INTERACTIVE_USER=TradeJournalMT5
+TRADEJOURNAL_MT5_WIZARD_ENABLED=0
 ```
 
 L'account deve avere una sessione Windows interattiva attiva; la sessione può
@@ -54,6 +55,13 @@ esclusivamente all'account runtime. Dopo un riavvio della VPS la sessione
 dedicata deve essere ricreata prima che l'agente accetti nuovi provisioning;
 la futura automazione del bootstrap della sessione deve restare separata dalle
 credenziali MT5.
+
+`TRADEJOURNAL_MT5_WIZARD_ENABLED=1` abilita esplicitamente il censimento
+credential-free tramite il wizard ufficiale soltanto quando il registry non
+contiene già un endpoint `VERIFIED`. Il helper usa la sessione dedicata,
+richiede la presenza esatta del server atteso e chiude il terminale di
+censimento prima che l'agente decifri la password investor. La promozione
+server/broker avviene soltanto dopo il successivo login read-only verificato.
 
 Il percorso corrente usa il file bridge MQL5 e non installa né importa il
 wheel Python `MetaTrader5`.

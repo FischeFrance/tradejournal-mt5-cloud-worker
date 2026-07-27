@@ -33,6 +33,8 @@ def test_load_runtime_config_defaults(tmp_path):
     assert config.broker_identity_cache.name == "broker-identity-cache.json"
     assert config.broker_identity_cache_ttl_seconds == 86_400
     assert config.broker_identity_model == "gpt-5.6"
+    assert config.broker_wizard_enabled is False
+    assert config.mt5_interactive_user == ""
 
 
 def test_load_runtime_config_overrides(tmp_path):
@@ -51,6 +53,8 @@ def test_load_runtime_config_overrides(tmp_path):
             "TRADEJOURNAL_BROKER_IDENTITY_CACHE": str(identity_cache),
             "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS": "600",
             "TRADEJOURNAL_BROKER_IDENTITY_MODEL": "gpt-5.6-test",
+            "TRADEJOURNAL_MT5_WIZARD_ENABLED": "1",
+            "TRADEJOURNAL_MT5_INTERACTIVE_USER": "TradeJournalMT5",
             **PIN_ENV,
         }
     )
@@ -62,6 +66,8 @@ def test_load_runtime_config_overrides(tmp_path):
     assert config.broker_identity_cache == identity_cache
     assert config.broker_identity_cache_ttl_seconds == 600
     assert config.broker_identity_model == "gpt-5.6-test"
+    assert config.broker_wizard_enabled is True
+    assert config.mt5_interactive_user == "TradeJournalMT5"
 
 
 @pytest.mark.parametrize("value", ["0", "59", "2592001", "not-an-int"])
@@ -71,6 +77,29 @@ def test_runtime_config_rejects_invalid_broker_identity_ttl(value):
             env={
                 "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
                 "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS": value,
+                **PIN_ENV,
+            }
+        )
+
+
+@pytest.mark.parametrize("value", ["yes", "true", "2", "-1"])
+def test_runtime_config_rejects_invalid_broker_wizard_gate(value):
+    with pytest.raises(ValueError, match="TRADEJOURNAL_MT5_WIZARD_ENABLED"):
+        load_runtime_config(
+            env={
+                "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+                "TRADEJOURNAL_MT5_WIZARD_ENABLED": value,
+                **PIN_ENV,
+            }
+        )
+
+
+def test_runtime_config_requires_dedicated_user_when_wizard_is_enabled():
+    with pytest.raises(ValueError, match="TRADEJOURNAL_MT5_INTERACTIVE_USER"):
+        load_runtime_config(
+            env={
+                "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+                "TRADEJOURNAL_MT5_WIZARD_ENABLED": "1",
                 **PIN_ENV,
             }
         )

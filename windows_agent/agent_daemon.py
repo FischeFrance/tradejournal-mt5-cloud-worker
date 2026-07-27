@@ -11,6 +11,7 @@ from .broker_identity import (
     CachedBrokerIdentityResolver,
     OpenAIBrokerIdentityProvider,
 )
+from .broker_wizard import HiddenSessionBrokerWizard
 from .job_runner import JobRunner
 from .real_handlers import build_real_handlers, sweep_stale_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
@@ -58,6 +59,13 @@ def build_runner(
         if swept:
             logger.warning("terminated orphaned MT5 processes at startup: %s", swept)
     identity_resolver: CachedBrokerIdentityResolver | None = None
+    broker_wizard = (
+        HiddenSessionBrokerWizard(
+            interactive_user=config.mt5_interactive_user,
+        )
+        if config.broker_wizard_enabled
+        else None
+    )
 
     def resolve_broker_identity(server_identifier: str):
         nonlocal identity_resolver
@@ -85,6 +93,7 @@ def build_runner(
             artifact_manifest=config.broker_artifact_manifest,
         ),
         broker_identity_resolver=resolve_broker_identity,
+        broker_wizard=broker_wizard,
     )
     return JobRunner(state_path, api, real_handlers)
 

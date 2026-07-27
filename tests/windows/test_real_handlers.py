@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from windows_agent.broker_endpoint_resolver import (
     VerifiedBrokerEndpoint,
 )
 from windows_agent.broker_identity import BrokerIdentitySuggestion
+from windows_agent.broker_wizard import BrokerWizardError, BrokerWizardEvidence
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
@@ -156,6 +158,7 @@ def _handlers(
     script: dict | None = None,
     endpoint_resolver=None,
     broker_identity_resolver=None,
+    broker_wizard=None,
 ):
     def adapter_factory(terminal, login, server):
         return ScriptedAdapter(terminal, login, server, script=script or {})
@@ -169,6 +172,7 @@ def _handlers(
         process_factory=FakeProcessManager,
         endpoint_resolver=endpoint_resolver,
         broker_identity_resolver=broker_identity_resolver,
+        broker_wizard=broker_wizard,
     )
 
 
@@ -328,6 +332,112 @@ def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(
         handlers["provision"](_job("provision", cid, payload=_provision_payload()))
 
     assert exc_info.value.error_code == "broker_endpoint_unavailable"
+    assert not (env.secrets_root / cid).exists()
+
+
+def test_provision_censuses_unknown_server_before_login_and_promotes_after_success(env):
+    cid = str(uuid4())
+    wizard_calls: list[tuple[str, str, str]] = []
+
+    def reject_endpoint(_label: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def resolve_identity(server: str) -> BrokerIdentitySuggestion:
+        return BrokerIdentitySuggestion(
+            broker_label="Goat Funded Trader",
+            search_text="Goat Funded Trader",
+            confidence="HIGH",
+            source_urls=("https://broker.example/servers",),
+            generated_at_unix_ms=1_000,
+        )
+
+    def run_wizard(
+        root,
+        search_text,
+        suggested_broker_label,
+        expected_server,
+        cancel_check,
+    ):
+        cancel_check()
+        wizard_calls.append((search_text, suggested_broker_label, expected_server))
+        assert not (env.secrets_root / cid).exists()
+        artifact = root / "state" / "broker-wizard-result.json"
+        artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
+        return BrokerWizardEvidence(
+            run_id="12345678-1234-4234-8234-123456789abc",
+            expected_server_name=expected_server,
+            selected_broker_label="Goat Funded Trader",
+            censused_server_names=(expected_server,),
+            terminal_pid=4321,
+            completed_at_unix_ms=1_785_190_000_000,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        )
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=reject_endpoint,
+        broker_identity_resolver=resolve_identity,
+        broker_wizard=run_wizard,
+    )
+    result = handlers["provision"](
+        _job(
+            "provision",
+            cid,
+            payload=_provision_payload(
+                server="GoatFunded-Server3",
+                broker_label=None,
+            ),
+        )
+    )
+
+    store = WindowsSecretStore(env.secrets_root)
+    assert wizard_calls == [
+        ("Goat Funded Trader", "Goat Funded Trader", "GoatFunded-Server3")
+    ]
+    assert store.read(cid, "mt5_endpoint") == "GoatFunded-Server3"
+    assert store.read(cid, "mt5_broker_label") == "Goat Funded Trader"
+    assert result["verified_server_name"] == "GoatFunded-Server3"
+    assert result["verified_broker_label"] == "Goat Funded Trader"
+    assert result["verification_method"] == "managed_investor_login"
+    assert result["endpoint_protocol"] == "TCP/TLS"
+    assert len(result["endpoint_artifact_sha256"]) == 64
+    assert (
+        result["endpoint_verification_session_id"]
+        == "12345678-1234-4234-8234-123456789abc"
+    )
+    assert "_verification_pid" not in result
+    verification_artifacts = list(
+        (env.instances_root / cid / "state").glob("endpoint-verification-*.json")
+    )
+    assert len(verification_artifacts) == 1
+    assert "investor-pw" not in verification_artifacts[0].read_text(encoding="utf-8")
+
+
+def test_provision_wizard_failure_keeps_credential_envelope_unopened(env):
+    cid = str(uuid4())
+
+    def reject_endpoint(_label: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def fail_wizard(*_args):
+        assert not (env.secrets_root / cid).exists()
+        raise BrokerWizardError("sanitized fixture failure")
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=reject_endpoint,
+        broker_wizard=fail_wizard,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
+
+    assert exc_info.value.error_code == "broker_discovery_failed"
     assert not (env.secrets_root / cid).exists()
 
 

@@ -24,6 +24,7 @@ DEFAULT_BROKER_IDENTITY_CACHE = (
 )
 DEFAULT_BROKER_IDENTITY_CACHE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_BROKER_IDENTITY_MODEL = "gpt-5.6"
+DEFAULT_BROKER_WIZARD_ENABLED = False
 DEFAULT_POLL_SECONDS = 5.0
 
 
@@ -44,6 +45,8 @@ class AgentRuntimeConfig:
     broker_identity_cache: Path = DEFAULT_BROKER_IDENTITY_CACHE
     broker_identity_cache_ttl_seconds: int = DEFAULT_BROKER_IDENTITY_CACHE_TTL_SECONDS
     broker_identity_model: str = DEFAULT_BROKER_IDENTITY_MODEL
+    broker_wizard_enabled: bool = DEFAULT_BROKER_WIZARD_ENABLED
+    mt5_interactive_user: str = ""
 
 
 def _required_sha256(source: Mapping[str, str], name: str) -> str:
@@ -130,6 +133,34 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
     broker_identity_model = source.get(
         "TRADEJOURNAL_BROKER_IDENTITY_MODEL", ""
     ).strip() or DEFAULT_BROKER_IDENTITY_MODEL
+    wizard_enabled_raw = source.get(
+        "TRADEJOURNAL_MT5_WIZARD_ENABLED", ""
+    ).strip()
+    if wizard_enabled_raw not in ("", "0", "1"):
+        raise ValueError("TRADEJOURNAL_MT5_WIZARD_ENABLED must be 0 or 1")
+    broker_wizard_enabled = wizard_enabled_raw == "1"
+    mt5_interactive_user = source.get(
+        "TRADEJOURNAL_MT5_INTERACTIVE_USER", ""
+    ).strip()
+    if broker_wizard_enabled:
+        if (
+            not mt5_interactive_user
+            or not mt5_interactive_user.replace("-", "")
+            .replace("_", "")
+            .replace(".", "")
+            .isalnum()
+            or mt5_interactive_user.casefold()
+            in {
+                "administrator",
+                "system",
+                "localsystem",
+                "localservice",
+                "networkservice",
+            }
+        ):
+            raise ValueError(
+                "TRADEJOURNAL_MT5_INTERACTIVE_USER must be a dedicated local user"
+            )
     terminal_sha256 = _required_sha256(
         source, "TRADEJOURNAL_MT5_TEMPLATE_SHA256"
     )
@@ -158,6 +189,8 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         broker_identity_cache=broker_identity_cache,
         broker_identity_cache_ttl_seconds=broker_identity_cache_ttl_seconds,
         broker_identity_model=broker_identity_model,
+        broker_wizard_enabled=broker_wizard_enabled,
+        mt5_interactive_user=mt5_interactive_user,
     )
 
 

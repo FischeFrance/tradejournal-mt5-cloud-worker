@@ -34,6 +34,10 @@ class BrokerEndpointUnavailable(AgentError):
     error_code = "broker_endpoint_unavailable"
 
 
+class BrokerDiscoveryFailed(AgentError):
+    error_code = "broker_discovery_failed"
+
+
 class BrokerIdentityUnavailable(AgentError):
     error_code = "broker_identity_unavailable"
 
