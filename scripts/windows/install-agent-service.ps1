@@ -1,11 +1,19 @@
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 Push-Location $repo
 try {
+  $existingService = Get-Service -Name TradeJournalMT5Agent -ErrorAction SilentlyContinue
+  if ($existingService -and $existingService.Status -ne 'Stopped') {
+    throw 'TradeJournal Agent service must be stopped before update.'
+  }
+  $serviceCommand = if ($existingService) { 'update' } else { 'install' }
+
   # `windows_agent` is a repository package, not a separately installed wheel. Running the
   # module from the repository root keeps the installer and the resulting pywin32 service on
   # the same import path as the manually verified agent commands.
-  & ".\.venv\Scripts\python.exe" -m windows_agent.service.windows_service --startup auto install
-  if ($LASTEXITCODE -ne 0) { throw "TradeJournal Agent service installation failed (exit $LASTEXITCODE)." }
+  & ".\.venv\Scripts\python.exe" -m windows_agent.service.windows_service --startup auto $serviceCommand
+  if ($LASTEXITCODE -ne 0) {
+    throw "TradeJournal Agent service $serviceCommand failed (exit $LASTEXITCODE)."
+  }
 
   # pythonservice.exe embeds Python before importing the registered service class. In a venv it
   # does not reliably process pywin32.pth, so servicemanager.pyd and the other win32 modules can
@@ -39,4 +47,4 @@ try {
 } finally {
   Pop-Location
 }
-Write-Host 'Service installed but not started. Use start-agent.ps1 explicitly.'
+Write-Host "Service $serviceCommand but not started. Use start-agent.ps1 explicitly."
