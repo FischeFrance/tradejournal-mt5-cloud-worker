@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import urlparse
 
 from .agent_secrets import AGENT_SCOPE_ID, AGENT_TOKEN_SECRET_NAME
@@ -18,6 +19,11 @@ DEFAULT_BROKER_REGISTRY = DEFAULT_BROKER_REGISTRY_ROOT / "endpoint-registry.json
 DEFAULT_BROKER_ARTIFACT_MANIFEST = (
     DEFAULT_BROKER_REGISTRY_ROOT / "artifact-manifest.json"
 )
+DEFAULT_BROKER_IDENTITY_CACHE = (
+    DEFAULT_BROKER_REGISTRY_ROOT / "broker-identity-cache.json"
+)
+DEFAULT_BROKER_IDENTITY_CACHE_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_BROKER_IDENTITY_MODEL = "gpt-5.6"
 DEFAULT_POLL_SECONDS = 5.0
 
 
@@ -35,9 +41,12 @@ class AgentRuntimeConfig:
     broker_registry_path: Path = DEFAULT_BROKER_REGISTRY
     broker_artifact_root: Path = DEFAULT_BROKER_REGISTRY_ROOT
     broker_artifact_manifest: Path = DEFAULT_BROKER_ARTIFACT_MANIFEST
+    broker_identity_cache: Path = DEFAULT_BROKER_IDENTITY_CACHE
+    broker_identity_cache_ttl_seconds: int = DEFAULT_BROKER_IDENTITY_CACHE_TTL_SECONDS
+    broker_identity_model: str = DEFAULT_BROKER_IDENTITY_MODEL
 
 
-def _required_sha256(source: dict[str, str], name: str) -> str:
+def _required_sha256(source: Mapping[str, str], name: str) -> str:
     value = source.get(name, "").strip().lower()
     if (
         len(value) != 64
@@ -47,7 +56,7 @@ def _required_sha256(source: dict[str, str], name: str) -> str:
     return value
 
 
-def _required_endpoint(source: dict[str, str], name: str) -> str:
+def _required_endpoint(source: Mapping[str, str], name: str) -> str:
     value = source.get(name, "").strip()
     if not value:
         raise ValueError(f"{name} is required")
@@ -97,6 +106,30 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         source.get("TRADEJOURNAL_BROKER_ARTIFACT_MANIFEST", "").strip()
         or DEFAULT_BROKER_ARTIFACT_MANIFEST
     )
+    broker_identity_cache = Path(
+        source.get("TRADEJOURNAL_BROKER_IDENTITY_CACHE", "").strip()
+        or DEFAULT_BROKER_IDENTITY_CACHE
+    )
+    identity_ttl_raw = source.get(
+        "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS", ""
+    ).strip()
+    try:
+        broker_identity_cache_ttl_seconds = (
+            int(identity_ttl_raw)
+            if identity_ttl_raw
+            else DEFAULT_BROKER_IDENTITY_CACHE_TTL_SECONDS
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS is invalid"
+        ) from exc
+    if not 60 <= broker_identity_cache_ttl_seconds <= 30 * 24 * 60 * 60:
+        raise ValueError(
+            "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS is invalid"
+        )
+    broker_identity_model = source.get(
+        "TRADEJOURNAL_BROKER_IDENTITY_MODEL", ""
+    ).strip() or DEFAULT_BROKER_IDENTITY_MODEL
     terminal_sha256 = _required_sha256(
         source, "TRADEJOURNAL_MT5_TEMPLATE_SHA256"
     )
@@ -122,6 +155,9 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         broker_registry_path=broker_registry_path,
         broker_artifact_root=broker_artifact_root,
         broker_artifact_manifest=broker_artifact_manifest,
+        broker_identity_cache=broker_identity_cache,
+        broker_identity_cache_ttl_seconds=broker_identity_cache_ttl_seconds,
+        broker_identity_model=broker_identity_model,
     )
 
 

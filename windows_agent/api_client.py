@@ -81,8 +81,13 @@ def _validate_claim(job: dict) -> dict:
             or not payload["expected_login"].isdigit()
             or not isinstance(payload.get("expected_server"), str)
             or not payload["expected_server"]
-            or not isinstance(payload.get("broker_label"), str)
-            or not payload["broker_label"]
+            or (
+                payload.get("broker_label") is not None
+                and (
+                    not isinstance(payload.get("broker_label"), str)
+                    or not payload["broker_label"]
+                )
+            )
             or not isinstance(payload.get("bridge_token"), str)
             or not payload["bridge_token"].startswith("tjmt5_")
         ):

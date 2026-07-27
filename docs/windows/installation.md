@@ -87,3 +87,22 @@ Ogni riuso dell'istanza ricalcola il digest di `terminal64.exe` e il manifest
 dei binari eseguibili del template; una differenza blocca il job prima di
 avviare o riavviare il processo. File runtime mutabili come log, cache e
 configurazioni non fanno parte del manifest dei binari.
+
+## Risoluzione identità broker
+
+Per server non ancora presenti nel catalogo globale, il servizio può chiedere
+una sola identificazione suggestion-only a OpenAI e conservarla in una cache
+atomica con TTL. Configurare `OPENAI_API_KEY` esclusivamente nell'ambiente
+protetto del servizio o nel secret manager Windows, mai nel repository o nei
+metadata del job. Il provider riceve soltanto il server MT5:
+
+```text
+TRADEJOURNAL_BROKER_IDENTITY_CACHE=C:\TradeJournal\broker-registry\broker-identity-cache.json
+TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS=86400
+TRADEJOURNAL_BROKER_IDENTITY_MODEL=gpt-5.6
+```
+
+La risposta AI non abilita MT5 e non verifica un endpoint. Il job prosegue solo
+se il registry locale contiene già un endpoint `VERIFIED` per il broker
+suggerito; la coppia server/broker entra nel catalogo globale esclusivamente
+dopo un login investor completato e verificato.

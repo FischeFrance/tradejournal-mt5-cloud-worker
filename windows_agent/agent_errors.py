@@ -34,6 +34,10 @@ class BrokerEndpointUnavailable(AgentError):
     error_code = "broker_endpoint_unavailable"
 
 
+class BrokerIdentityUnavailable(AgentError):
+    error_code = "broker_identity_unavailable"
+
+
 class TerminalStartFailed(AgentError):
     error_code = "terminal_start_failed"
 

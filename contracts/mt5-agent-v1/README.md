@@ -39,7 +39,10 @@ the control plane -- see `mt5_provisioning_jobs.payload jsonb`). By convention, 
 producer/consumer (`request-mt5-connection/index.ts` and `windows_agent/real_handlers.py`) agree
 on this shape:
 
-- `provision`: `{ credential_envelope: {alg, iv, ciphertext}, expected_login: string, expected_server: string, broker_label: string }`.
+- `provision`: `{ credential_envelope: {alg, iv, ciphertext}, expected_login: string, expected_server: string, broker_label: string | null }`.
+  `broker_label=null` requests fail-closed broker identity resolution on the
+  Windows Agent. A suggestion never verifies an endpoint and promotion remains
+  conditional on a successful investor login with complete provenance.
   `credential_envelope` decrypts (via `MT5_PROVISIONING_ENCRYPTION_KEY`, shared out-of-band with
   the Agent) to `{ investor_password: string }`. `expected_login`/`expected_server` travel
   unencrypted -- they are not secrets, already plaintext on `trading_connections`, and the Agent

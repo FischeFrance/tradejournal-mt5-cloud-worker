@@ -91,6 +91,24 @@ def test_claim_rejects_provision_without_typed_secret_envelope() -> None:
         client.claim()
 
 
+def test_claim_accepts_null_broker_for_backend_identity_resolution() -> None:
+    fixture = FIXTURES["claimResponseJob_provision"]
+    body = {
+        **fixture,
+        "payload": {**fixture["payload"], "broker_label": None},
+    }
+    client = AgentApiClient(
+        "https://agent.example/",
+        "fixture",
+        httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
+    )
+
+    result = client.claim()
+
+    assert result["payload"]["broker_label"] is None
+    validate_against("claimResponseJob", result)
+
+
 def test_heartbeat_lease_lost_returns_body_instead_of_raising() -> None:
     """Regression test: a 409 lease_lost response used to hit raise_for_status()
     and raise HTTPStatusError, bypassing JobRunner's lease_valid check entirely."""

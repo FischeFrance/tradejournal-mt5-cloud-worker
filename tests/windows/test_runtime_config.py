@@ -30,12 +30,16 @@ def test_load_runtime_config_defaults(tmp_path):
     assert config.broker_registry_path.name == "endpoint-registry.json"
     assert config.broker_artifact_manifest.name == "artifact-manifest.json"
     assert config.broker_artifact_root == config.broker_registry_path.parent
+    assert config.broker_identity_cache.name == "broker-identity-cache.json"
+    assert config.broker_identity_cache_ttl_seconds == 86_400
+    assert config.broker_identity_model == "gpt-5.6"
 
 
 def test_load_runtime_config_overrides(tmp_path):
     registry = tmp_path / "registry.json"
     artifact_root = tmp_path / "artifacts"
     manifest = tmp_path / "manifest.json"
+    identity_cache = tmp_path / "identity-cache.json"
     config = load_runtime_config(
         env={
             "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
@@ -44,6 +48,9 @@ def test_load_runtime_config_overrides(tmp_path):
             "TRADEJOURNAL_BROKER_REGISTRY": str(registry),
             "TRADEJOURNAL_BROKER_ARTIFACT_ROOT": str(artifact_root),
             "TRADEJOURNAL_BROKER_ARTIFACT_MANIFEST": str(manifest),
+            "TRADEJOURNAL_BROKER_IDENTITY_CACHE": str(identity_cache),
+            "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS": "600",
+            "TRADEJOURNAL_BROKER_IDENTITY_MODEL": "gpt-5.6-test",
             **PIN_ENV,
         }
     )
@@ -52,6 +59,21 @@ def test_load_runtime_config_overrides(tmp_path):
     assert config.broker_registry_path == registry
     assert config.broker_artifact_root == artifact_root
     assert config.broker_artifact_manifest == manifest
+    assert config.broker_identity_cache == identity_cache
+    assert config.broker_identity_cache_ttl_seconds == 600
+    assert config.broker_identity_model == "gpt-5.6-test"
+
+
+@pytest.mark.parametrize("value", ["0", "59", "2592001", "not-an-int"])
+def test_runtime_config_rejects_invalid_broker_identity_ttl(value):
+    with pytest.raises(ValueError, match="BROKER_IDENTITY_CACHE_TTL_SECONDS"):
+        load_runtime_config(
+            env={
+                "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+                "TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS": value,
+                **PIN_ENV,
+            }
+        )
 
 
 def test_build_api_client_reads_token_from_dpapi(tmp_path):

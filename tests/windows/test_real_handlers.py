@@ -18,6 +18,7 @@ from windows_agent.broker_endpoint_resolver import (
     BrokerEndpointResolutionError,
     VerifiedBrokerEndpoint,
 )
+from windows_agent.broker_identity import BrokerIdentitySuggestion
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
@@ -148,7 +149,14 @@ def env(tmp_path):
     return SimpleNamespace(instances_root=instances_root, secrets_root=secrets_root, source_terminal=source_terminal)
 
 
-def _handlers(env, api, *, script: dict | None = None, endpoint_resolver=None):
+def _handlers(
+    env,
+    api,
+    *,
+    script: dict | None = None,
+    endpoint_resolver=None,
+    broker_identity_resolver=None,
+):
     def adapter_factory(terminal, login, server):
         return ScriptedAdapter(terminal, login, server, script=script or {})
 
@@ -160,6 +168,7 @@ def _handlers(env, api, *, script: dict | None = None, endpoint_resolver=None):
         adapter_factory=adapter_factory,
         process_factory=FakeProcessManager,
         endpoint_resolver=endpoint_resolver,
+        broker_identity_resolver=broker_identity_resolver,
     )
 
 
@@ -224,13 +233,88 @@ def test_provision_resolves_and_persists_verified_connection_endpoint(env):
         )
 
     handlers = _handlers(env, FakeApi(), endpoint_resolver=resolve)
-    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    result = handlers["provision"](
+        _job("provision", cid, payload=_provision_payload())
+    )
 
     store = WindowsSecretStore(env.secrets_root)
     assert observed_labels == ["Demo Broker"]
     assert store.read(cid, "mt5_server") == "Demo-Server"
     assert store.read(cid, "mt5_broker_label") == "Demo Broker"
     assert store.read(cid, "mt5_endpoint") == "203.0.113.10:443"
+    assert result["verified_server_name"] == "Demo-Server"
+    assert result["verified_broker_label"] == "Demo Broker"
+    assert result["verification_method"] == "managed_investor_login"
+    assert result["endpoint_protocol"] == "TCP/TLS"
+    assert result["endpoint_artifact_sha256"] == "1" * 64
+    assert (
+        result["endpoint_verification_session_id"]
+        == "12345678-1234-4234-8234-123456789abc"
+    )
+
+
+def test_provision_resolves_missing_broker_once_before_verified_endpoint_lookup(env):
+    cid = str(uuid4())
+    identity_calls: list[str] = []
+    endpoint_calls: list[str] = []
+
+    def resolve_identity(server: str) -> BrokerIdentitySuggestion:
+        identity_calls.append(server)
+        return BrokerIdentitySuggestion(
+            broker_label="Demo Broker",
+            search_text="Demo Broker",
+            confidence="HIGH",
+            source_urls=("https://broker.example/servers",),
+            generated_at_unix_ms=1_000,
+        )
+
+    def resolve_endpoint(label: str) -> VerifiedBrokerEndpoint:
+        endpoint_calls.append(label)
+        return VerifiedBrokerEndpoint(
+            broker_label="Demo Broker",
+            host="203.0.113.10",
+            port=443,
+            protocol="TCP/TLS",
+            observed_at_unix_ms=1,
+            discovery_method="MT5_LOGIN_DIALOG_IP",
+            verification_pid=123,
+            verification_session_id="12345678-1234-4234-8234-123456789abc",
+            confidence="MEDIUM",
+            artifact_relative_path="events.jsonl",
+            artifact_sha256="1" * 64,
+        )
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=resolve_endpoint,
+        broker_identity_resolver=resolve_identity,
+    )
+    payload = _provision_payload(broker_label=None)
+
+    result = handlers["provision"](_job("provision", cid, payload=payload))
+
+    assert identity_calls == ["Demo-Server"]
+    assert endpoint_calls == ["Demo Broker"]
+    assert result["verified_broker_label"] == "Demo Broker"
+    assert WindowsSecretStore(env.secrets_root).read(cid, "mt5_broker_label") == "Demo Broker"
+
+
+def test_provision_missing_broker_fails_closed_without_identity_resolver(env):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi(), endpoint_resolver=lambda _label: None)
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job(
+                "provision",
+                cid,
+                payload=_provision_payload(broker_label=None),
+            )
+        )
+
+    assert exc_info.value.error_code == "broker_identity_unavailable"
+    assert not (env.secrets_root / cid).exists()
 
 
 def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(env):

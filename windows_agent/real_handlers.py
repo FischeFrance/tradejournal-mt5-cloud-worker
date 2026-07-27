@@ -8,16 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .broker_endpoint_resolver import (
-    BrokerEndpointResolutionError,
-    VerifiedBrokerEndpoint,
-)
 from worker.event_normalizer import normalize_event
 from worker.event_outbox import EventOutbox
+
 from .agent_errors import (
     AccountIdentityMismatch,
     AgentError,
     BrokerEndpointUnavailable,
+    BrokerIdentityUnavailable,
     CredentialDecryptionFailed,
     CredentialEnvelopeInvalid,
     DeprovisionFailed,
@@ -31,6 +29,14 @@ from .agent_errors import (
     TerminalStartFailed,
 )
 from .agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
+from .broker_endpoint_resolver import (
+    BrokerEndpointResolutionError,
+    VerifiedBrokerEndpoint,
+)
+from .broker_identity import (
+    BrokerIdentityError,
+    BrokerIdentitySuggestion,
+)
 from .credential_envelope import decrypt_credential_envelope
 from .job_runner import LeaseLost
 from .provisioning.instance_layout import InstanceLayout
@@ -39,13 +45,13 @@ from .provisioning.process_manager import ProcessManager
 from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
 from .state_store import atomic_json, read_json
-from .worker.dedup import PersistentDedup
 from .worker.adapter_errors import (
     IdentityMismatch,
     Mt5Error,
     Mt5IpcError,
     Mt5ProcessCrashed,
 )
+from .worker.dedup import PersistentDedup
 from .worker.history_sync import HistoryMode, HistorySync
 from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
@@ -56,7 +62,7 @@ from .worker.trading_ingestion_sink import TradingIngestionSink
 logger = logging.getLogger(__name__)
 
 SERVER_PATTERN = re.compile(r"[A-Za-z0-9._ -]{1,128}")
-BROKER_PATTERN = re.compile(r"[A-Za-z0-9&'()._ -]{1,128}")
+BROKER_PATTERN = re.compile(r"[A-Za-z0-9 .,&'()+_/-]{1,128}")
 DEFAULT_EXPERT_BINARY = Path(r"C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5")
 
 JobHandler = Callable[[dict], dict]
@@ -124,7 +130,7 @@ def _decrypt_envelope(payload: dict, secrets_root: Path) -> str:
     return password
 
 
-def _expected_identity(payload: dict) -> tuple[int, str, str]:
+def _expected_identity(payload: dict) -> tuple[int, str, str | None]:
     raw_login = payload.get("expected_login")
     try:
         login = int(raw_login)  # type: ignore[arg-type]
@@ -135,8 +141,13 @@ def _expected_identity(payload: dict) -> tuple[int, str, str]:
     server = str(payload.get("expected_server") or "").strip()
     if not SERVER_PATTERN.fullmatch(server):
         raise CredentialEnvelopeInvalid("expected_server missing or invalid")
-    broker_label = str(payload.get("broker_label") or "").strip()
-    if not BROKER_PATTERN.fullmatch(broker_label):
+    raw_broker_label = payload.get("broker_label")
+    broker_label = (
+        raw_broker_label.strip()
+        if isinstance(raw_broker_label, str)
+        else None
+    )
+    if broker_label is not None and not BROKER_PATTERN.fullmatch(broker_label):
         raise CredentialEnvelopeInvalid("broker_label missing or invalid")
     return login, server, broker_label
 
@@ -229,6 +240,7 @@ def build_real_handlers(
     terminal_sha256: str | None = None,
     expert_sha256: str | None = None,
     endpoint_resolver: Callable[[str], VerifiedBrokerEndpoint] | None = None,
+    broker_identity_resolver: Callable[[str], BrokerIdentitySuggestion] | None = None,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers.
 
@@ -247,13 +259,28 @@ def build_real_handlers(
         _verify_binary_pin(expert_binary, expert_sha256)
         login, server, broker_label = _expected_identity(payload)
         mode, from_date = _history_window(job)
+        if broker_label is None:
+            if broker_identity_resolver is None:
+                raise BrokerIdentityUnavailable(
+                    "broker identity resolver is not configured"
+                )
+            try:
+                broker_label = broker_identity_resolver(server).broker_label
+            except BrokerIdentityError as exc:
+                raise BrokerIdentityUnavailable(
+                    "broker identity suggestion is unavailable"
+                ) from exc
+            if not BROKER_PATTERN.fullmatch(broker_label):
+                raise BrokerIdentityUnavailable(
+                    "broker identity suggestion is invalid"
+                )
+        verified_endpoint: VerifiedBrokerEndpoint | None = None
         if endpoint_resolver is None:
             connection_endpoint = server
         else:
             try:
-                connection_endpoint = endpoint_resolver(
-                    broker_label
-                ).server_address
+                verified_endpoint = endpoint_resolver(broker_label)
+                connection_endpoint = verified_endpoint.server_address
             except BrokerEndpointResolutionError as exc:
                 raise BrokerEndpointUnavailable(
                     "verified broker endpoint unavailable"
@@ -282,7 +309,6 @@ def build_real_handlers(
             bridge_token = None
             gc.collect()
 
-        layout = InstanceLayout(instances_root, cid)
         try:
             if not source_terminal.is_file():
                 raise TerminalStartFailed("golden MT5 terminal template missing")
@@ -309,6 +335,19 @@ def build_real_handlers(
                 adapter_factory, process_factory, trading_ingestion_url,
             )
         _progress(root, status="connected")
+        if verified_endpoint is not None:
+            result.update(
+                {
+                    "verified_server_name": server,
+                    "verified_broker_label": broker_label,
+                    "verification_method": "managed_investor_login",
+                    "endpoint_protocol": verified_endpoint.protocol,
+                    "endpoint_artifact_sha256": verified_endpoint.artifact_sha256,
+                    "endpoint_verification_session_id": (
+                        verified_endpoint.verification_session_id
+                    ),
+                }
+            )
         return result
 
     def historical_sync(job: dict) -> dict:

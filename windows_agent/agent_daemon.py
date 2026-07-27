@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Callable
 
 from .broker_endpoint_resolver import resolve_verified_broker_endpoint
+from .broker_identity import (
+    CachedBrokerIdentityResolver,
+    OpenAIBrokerIdentityProvider,
+)
 from .job_runner import JobRunner
 from .real_handlers import build_real_handlers, sweep_stale_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
@@ -53,6 +57,18 @@ def build_runner(
         swept = sweep_stale_instances(config.instances_root)
         if swept:
             logger.warning("terminated orphaned MT5 processes at startup: %s", swept)
+    identity_resolver: CachedBrokerIdentityResolver | None = None
+
+    def resolve_broker_identity(server_identifier: str):
+        nonlocal identity_resolver
+        if identity_resolver is None:
+            identity_resolver = CachedBrokerIdentityResolver(
+                config.broker_identity_cache,
+                OpenAIBrokerIdentityProvider(model=config.broker_identity_model),
+                ttl_seconds=config.broker_identity_cache_ttl_seconds,
+            )
+        return identity_resolver.resolve(server_identifier)
+
     real_handlers = handlers or build_real_handlers(
         api,
         instances_root=config.instances_root,
@@ -68,6 +84,7 @@ def build_runner(
             artifact_root=config.broker_artifact_root,
             artifact_manifest=config.broker_artifact_manifest,
         ),
+        broker_identity_resolver=resolve_broker_identity,
     )
     return JobRunner(state_path, api, real_handlers)
 

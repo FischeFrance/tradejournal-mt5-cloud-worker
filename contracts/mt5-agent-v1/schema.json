@@ -31,7 +31,12 @@
         "credential_envelope": { "$ref": "#/$defs/credentialEnvelope" },
         "expected_login": { "type": "string", "pattern": "^[0-9]{1,32}$" },
         "expected_server": { "type": "string", "minLength": 1, "maxLength": 255 },
-        "broker_label": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "broker_label": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "null" }
+          ]
+        },
         "bridge_token": { "type": "string", "pattern": "^tjmt5_[A-Za-z0-9_-]{16,128}$" }
       }
     },

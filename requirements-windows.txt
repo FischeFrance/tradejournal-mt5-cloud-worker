@@ -1,4 +1,5 @@
 -r requirements.txt
+-r requirements-ai.txt
 httpx==0.28.1
 pywin32==311
 psutil==7.0.0

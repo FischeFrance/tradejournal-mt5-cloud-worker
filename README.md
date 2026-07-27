@@ -53,17 +53,20 @@ Il flusso previsto è:
 
 ```text
 server MT4/MT5 fornito dal cliente
-  -> resolver AI suggestion-only
-  -> ricerca controllata nella GUI "Find your broker"
-  -> selezione solo se un unico risultato MT5 contiene l'esatto server
-  -> login DEMO/investor separatamente autorizzato
-  -> registrazione endpoint verificato con provenance
+  -> catalogo globale: broker già VERIFIED, oppure nessuna identità
+  -> resolver AI suggestion-only sul Windows Agent, una sola volta entro il TTL
+  -> lookup separato di un endpoint locale già VERIFIED per quel broker
+  -> login investor gestito e controllo dell'identità account/server
+  -> promozione atomica della coppia server/broker nel catalogo globale
 ```
 
-Il nome restituito dall'AI è soltanto un suggerimento di ricerca. Il server
-mostrato da MT5 è il dato autorevole. L'automazione GUI reale resta
-hard-disabled finché non viene approvato e versionato un profilo UI acquisito
-da una build MT5 controllata.
+Il nome restituito dall'AI è soltanto un suggerimento e non viene esposto nel
+catalogo pubblico. Il provisioning fallisce in sicurezza se manca un endpoint
+locale verificato, se la risposta è ambigua o se il login non conferma
+l'identità prevista. Soltanto l'esito positivo del login investor produce i
+metadata di provenance che il control plane accetta per la promozione. La GUI
+reale resta hard-disabled: un broker totalmente nuovo, privo di endpoint
+verificato, non viene avviato automaticamente.
 
 ## Avvio sviluppo
 
