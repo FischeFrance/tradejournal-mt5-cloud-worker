@@ -3089,7 +3089,9 @@ static bool WaitUntilProcessIdIsGone(uint processId, TimeSpan timeout)
 static (int ExitCode, string Report) RunClientWithRetries(string verb, string directory)
 {
     Exception? lastFailure = null;
-    for (int attempt = 0; attempt < 50; attempt++)
+    TimeSpan readinessTimeout = TimeSpan.FromSeconds(10);
+    Stopwatch timer = Stopwatch.StartNew();
+    while (timer.Elapsed < readinessTimeout)
     {
         using var stdout = new StringWriter();
         using var stderr = new StringWriter();

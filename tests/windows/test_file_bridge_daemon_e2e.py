@@ -152,7 +152,10 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     api = QueueApi([{
         "job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1",
-        "history_mode": "all_available",
+        # This fixture verifies recurring live-sync recovery, not a 1970-to-now backfill.
+        # Keeping it at new_only avoids thousands of empty seven-day checkpoint writes whose
+        # duration can outlive the intentionally static fake heartbeat on a busy CI runner.
+        "history_mode": "new_only",
         "payload": {
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
