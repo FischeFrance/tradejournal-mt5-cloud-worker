@@ -563,8 +563,6 @@ def build_real_handlers(
         try:
             login = int(store.read(cid, "mt5_login"))
             server = store.read(cid, "mt5_server")
-            broker_label = store.read(cid, "mt5_broker_label")
-            stored_endpoint = store.read(cid, "mt5_endpoint")
             bridge_token = store.read(cid, "bridge_token")
         except Exception as exc:
             raise SecretStoreFailed("stored identity/bridge token unavailable") from exc
@@ -586,34 +584,13 @@ def build_real_handlers(
             _verify_binary_pin(terminal, terminal_sha256)
             _verify_binary_pin(expert_binary, expert_sha256)
             try:
-                investor_password = store.read(cid, "mt5_investor_password")
-            except Exception as exc:
-                raise SecretStoreFailed("stored credential unavailable") from exc
-            if stored_endpoint.casefold() == server.casefold():
-                # A wizard-censused server is persisted only after a successful investor login.
-                # Reuse that verified server name after a host reboot without repeating UI work.
-                connection_endpoint = stored_endpoint
-            elif endpoint_resolver is None:
-                connection_endpoint = server
-            else:
-                try:
-                    connection_endpoint = endpoint_resolver(
-                        broker_label
-                    ).server_address
-                except BrokerEndpointResolutionError as exc:
-                    raise BrokerEndpointUnavailable(
-                        "verified broker endpoint unavailable"
-                    ) from exc
-            try:
                 runtime = runtime_factory(root, cid)
                 set_cancel_check = getattr(runtime, "set_cancel_check", None)
                 if callable(set_cancel_check):
                     set_cancel_check(job.get("_lease_guard"))
-                runtime.start(
+                runtime.resume(
                     login=login,
                     server=server,
-                    connection_endpoint=connection_endpoint,
-                    investor_password=investor_password,
                     expert_binary=expert_binary,
                 )
             except NativeMt5Error as exc:
@@ -623,9 +600,6 @@ def build_real_handlers(
                 if code == "terminal_start_failed":
                     raise TerminalStartFailed(code) from exc
                 raise Mt5InitializeFailed(code) from exc
-            finally:
-                investor_password = ""
-                gc.collect()
             try:
                 process_factory(state_path).adopt(terminal)
             except (AttributeError, RuntimeError):

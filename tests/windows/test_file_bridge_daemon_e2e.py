@@ -59,6 +59,10 @@ class FakeNativeRuntime:
             (files / name).write_text(json.dumps(_bridge_envelope(payload)), encoding="utf-8")
         return NativeMt5Status(999, records["account.json"], records["heartbeat.json"], files)
 
+    def resume(self, **kwargs: Any) -> NativeMt5Status:
+        assert "investor_password" not in kwargs
+        return self.start(**kwargs)
+
 
 class FakeProcessManager:
     def __init__(self, state_path: Path) -> None:
@@ -204,13 +208,13 @@ def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monk
     runtime_factory) rather than fail, exactly like a genuine crash/reboot recovery would."""
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
     relaunched = []
-    original_start = FakeNativeRuntime.start
+    original_resume = FakeNativeRuntime.resume
 
-    def _tracking_start(self, **kwargs):
+    def _tracking_resume(self, **kwargs):
         relaunched.append(self.connection_id)
-        return original_start(self, **kwargs)
+        return original_resume(self, **kwargs)
 
-    monkeypatch.setattr(FakeNativeRuntime, "start", _tracking_start)
+    monkeypatch.setattr(FakeNativeRuntime, "resume", _tracking_resume)
     api.jobs.append({
         "job_id": "live-sync-1", "job_type": "live_sync", "connection_id": cid, "lease_id": "2",
         "history_mode": None, "payload": {},

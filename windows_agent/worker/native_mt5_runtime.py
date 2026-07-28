@@ -5,10 +5,12 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import shutil
 import subprocess
 import sys
 import time
+from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -162,6 +164,150 @@ class NativeMt5Runtime:
             os.fsync(handle.fileno())
         durable_replace(temporary, destination)
         return destination
+
+    @staticmethod
+    def _assistant_mcp_ports(path: Path) -> tuple[int, int] | None:
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            return None
+        ports: dict[str, int] = {}
+        section = ""
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line.casefold()
+                continue
+            if not line.casefold().startswith("endpoint="):
+                continue
+            if section not in ("[mcp.metaeditor]", "[mcp.metatrader]"):
+                continue
+            prefix = "endpoint=http://127.0.0.1:"
+            suffix = "/mcp"
+            if not line.casefold().startswith(prefix) or not line.casefold().endswith(suffix):
+                return None
+            raw_port = line[len(prefix) : -len(suffix)]
+            if not raw_port.isdigit():
+                return None
+            port = int(raw_port)
+            if not 1 <= port <= 65535:
+                return None
+            ports[section] = port
+        if set(ports) != {"[mcp.metaeditor]", "[mcp.metatrader]"}:
+            return None
+        return ports["[mcp.metaeditor]"], ports["[mcp.metatrader]"]
+
+    @staticmethod
+    def _ports_are_bindable(ports: tuple[int, int]) -> bool:
+        sockets: list[socket.socket] = []
+        try:
+            for port in ports:
+                candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sockets.append(candidate)
+                candidate.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            for candidate in sockets:
+                candidate.close()
+
+    def _reserved_mcp_ports(self) -> set[int]:
+        reserved: set[int] = set()
+        instances_root = self.root.parent
+        try:
+            children = tuple(instances_root.iterdir())
+        except OSError as exc:
+            raise NativeMt5Error("mcp_port_inventory_failed") from exc
+        for child in children:
+            if child == self.root:
+                continue
+            try:
+                UUID(child.name)
+            except ValueError:
+                continue
+            if child.is_symlink() or not child.is_dir():
+                raise NativeMt5Error("mcp_port_inventory_invalid")
+            ports = self._assistant_mcp_ports(
+                child / "terminal" / "Config" / "assistant.ini"
+            )
+            if ports is not None:
+                reserved.update(ports)
+        return reserved
+
+    def _allocate_mcp_ports(self, reserved: set[int]) -> tuple[int, int]:
+        pair_count = 15_000
+        offset = int(UUID(self.connection_id)) % pair_count
+        for step in range(pair_count):
+            pair_index = (offset + step) % pair_count
+            ports = (30_000 + pair_index * 2, 30_001 + pair_index * 2)
+            if any(port in reserved for port in ports):
+                continue
+            if self._ports_are_bindable(ports):
+                return ports
+        raise NativeMt5Error("mcp_port_allocation_failed")
+
+    def _ensure_mcp_endpoint_isolation(self) -> tuple[int, int]:
+        path = self.terminal_root / "Config" / "assistant.ini"
+        if path.is_symlink() or not path.is_file():
+            raise NativeMt5Error("assistant_config_invalid")
+        reserved = self._reserved_mcp_ports()
+        current = self._assistant_mcp_ports(path)
+        if (
+            current is not None
+            and 30_000 <= current[0] <= 59_998
+            and current[1] == current[0] + 1
+            and not any(port in reserved for port in current)
+            and self._ports_are_bindable(current)
+        ):
+            return current
+        ports = self._allocate_mcp_ports(reserved)
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise NativeMt5Error("assistant_config_invalid") from exc
+        updated: list[str] = []
+        section = ""
+        replacements: set[str] = set()
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line.casefold()
+            if line.casefold().startswith("endpoint="):
+                if section == "[mcp.metaeditor]":
+                    raw_line = f"Endpoint=http://127.0.0.1:{ports[0]}/mcp"
+                    replacements.add(section)
+                elif section == "[mcp.metatrader]":
+                    raw_line = f"Endpoint=http://127.0.0.1:{ports[1]}/mcp"
+                    replacements.add(section)
+            updated.append(raw_line)
+        if replacements != {"[mcp.metaeditor]", "[mcp.metatrader]"}:
+            raise NativeMt5Error("assistant_config_invalid")
+        temporary = path.with_suffix(".ini.tmp")
+        try:
+            self._write_text_durable(temporary, "\n".join(updated) + "\n", "utf-8")
+            durable_replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return ports
+
+    def _bridge_template_symbol(self) -> str:
+        path = self.files / "TradeJournalBridge.tpl"
+        try:
+            raw = path.read_bytes()
+            encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+            lines = raw.decode(encoding).splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise NativeMt5Error("bridge_template_invalid") from exc
+        symbols = [line[len("symbol=") :] for line in lines if line.startswith("symbol=")]
+        if (
+            len(symbols) != 1
+            or not symbols[0]
+            or len(symbols[0]) > 64
+            or any(character in symbols[0] for character in "\r\n")
+        ):
+            raise NativeMt5Error("bridge_template_invalid")
+        return symbols[0]
 
     def _write_startup_config(
         self,
@@ -743,6 +889,7 @@ class NativeMt5Runtime:
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
+        self._ensure_mcp_endpoint_isolation()
         symbol = self._startup_symbol(symbol)
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
@@ -832,6 +979,44 @@ class NativeMt5Runtime:
             self._secure_delete_config(bootstrap)
             self._secure_delete_config(discovery)
             self._secure_delete_config(startup)
+
+    def resume(
+        self,
+        *,
+        login: int,
+        server: str,
+        expert_binary: Path,
+        history_mode: str = "new_only",
+        timeout: float = 120.0,
+    ) -> NativeMt5Status:
+        """Resume a previously provisioned account without reusing a plaintext password."""
+        if not self.terminal.is_file():
+            raise NativeMt5Error("terminal_start_failed")
+        self._ensure_mcp_endpoint_isolation()
+        symbol = self._bridge_template_symbol()
+        self._last_symbol = symbol
+        self.install_expert(expert_binary, history_mode)
+        self._remove_readiness_files()
+        config = self._write_startup_config(
+            login,
+            server,
+            None,
+            symbol,
+            keep_private=True,
+            start_expert=True,
+            filename="resume.ini",
+        )
+        try:
+            checkpoint = self._journal_checkpoint()
+            self._start_process(config)
+            self._wait_for_authorization(checkpoint, login, server, min(timeout, 90.0))
+            self._wait_for_investor_sync(checkpoint, login, min(timeout, 90.0))
+            return self._wait_for_heartbeat(min(timeout, 60.0), login, server)
+        except Exception:
+            self.stop()
+            raise
+        finally:
+            self._secure_delete_config(config)
 
     def start_no_login(
         self,

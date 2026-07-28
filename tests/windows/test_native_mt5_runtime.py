@@ -29,10 +29,21 @@ def _no_machine_overrides(monkeypatch):
     monkeypatch.setattr(NativeMt5Runtime, "_setting", staticmethod(lambda name: ""))
 
 
-def _runtime(tmp_path: Path) -> NativeMt5Runtime:
+def _runtime(
+    tmp_path: Path,
+    connection_id: str = "00000000-0000-4000-8000-000000000001",
+) -> NativeMt5Runtime:
     terminal = tmp_path / "terminal" / "terminal64.exe"
-    terminal.parent.mkdir()
+    terminal.parent.mkdir(parents=True)
     terminal.write_bytes(b"terminal")
+    config = terminal.parent / "Config"
+    config.mkdir()
+    (config / "assistant.ini").write_text(
+        "[MCP.MetaEditor]\nEndpoint=http://127.0.0.1:22345/mcp\n"
+        "[MCP.MetaTrader]\nEndpoint=http://127.0.0.1:22346/mcp\n"
+        "[MCP.Custom]\n",
+        encoding="utf-8",
+    )
     loader = terminal.parent / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalLoader.ex5"
     loader.parent.mkdir(parents=True)
     loader.write_bytes(b"loader")
@@ -43,7 +54,7 @@ def _runtime(tmp_path: Path) -> NativeMt5Runtime:
         "<chart>\nsymbol=GBPUSD\n<window>\n</window>\n</chart>\n",
         encoding="utf-16",
     )
-    return NativeMt5Runtime(tmp_path, "00000000-0000-4000-8000-000000000001")
+    return NativeMt5Runtime(tmp_path, connection_id)
 
 
 def _envelope(payload: dict[str, object]) -> str:
@@ -165,6 +176,86 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert "InpBackfillHours=168" in template
     assert "InpSnapshotHistoryHours=87600" in template
     assert "InpCandleBars=200\n</inputs>" in template
+
+
+def test_mcp_endpoint_isolation_assigns_distinct_loopback_ports(
+    tmp_path: Path,
+) -> None:
+    instances = tmp_path / "instances"
+    first_id = "00000000-0000-4000-8000-000000000001"
+    second_id = "00000000-0000-4000-8000-000000000002"
+    first = _runtime(instances / first_id, first_id)
+    second = _runtime(instances / second_id, second_id)
+
+    with patch.object(
+        NativeMt5Runtime, "_ports_are_bindable", return_value=True
+    ):
+        first_ports = first._ensure_mcp_endpoint_isolation()
+        second_ports = second._ensure_mcp_endpoint_isolation()
+
+    assert first_ports != second_ports
+    assert first_ports[1] == first_ports[0] + 1
+    assert second_ports[1] == second_ports[0] + 1
+    assert 30_000 <= first_ports[0] <= 59_998
+    assert 30_000 <= second_ports[0] <= 59_998
+    assert NativeMt5Runtime._assistant_mcp_ports(
+        first.terminal_root / "Config" / "assistant.ini"
+    ) == first_ports
+    assert NativeMt5Runtime._assistant_mcp_ports(
+        second.terminal_root / "Config" / "assistant.ini"
+    ) == second_ports
+
+
+def test_resume_uses_cached_account_and_direct_readonly_expert(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "TradeJournalBridge.tpl").write_text(
+        "<chart>\nsymbol=EURUSD.raw\n<window>\n</window>\n</chart>\n",
+        encoding="utf-16",
+    )
+    runtime.state.mkdir()
+    config = runtime.state / "resume.ini"
+    config.write_text("temporary", encoding="utf-8")
+    expected = NativeMt5Status(
+        pid=123,
+        account={"login": "42", "server": "Demo", "trade_allowed": False},
+        heartbeat={"terminal_connected": True},
+        files_path=runtime.files,
+    )
+
+    with (
+        patch.object(runtime, "_ensure_mcp_endpoint_isolation"),
+        patch.object(
+            runtime, "_write_startup_config", return_value=config
+        ) as write_config,
+        patch.object(runtime, "_journal_checkpoint", return_value={}),
+        patch.object(runtime, "_start_process") as start_process,
+        patch.object(runtime, "_wait_for_authorization"),
+        patch.object(runtime, "_wait_for_investor_sync"),
+        patch.object(runtime, "_wait_for_heartbeat", return_value=expected),
+    ):
+        result = runtime.resume(
+            login=42,
+            server="Demo",
+            expert_binary=expert,
+        )
+
+    assert result == expected
+    write_config.assert_called_once_with(
+        42,
+        "Demo",
+        None,
+        "EURUSD.raw",
+        keep_private=True,
+        start_expert=True,
+        filename="resume.ini",
+    )
+    start_process.assert_called_once_with(config)
+    assert not config.exists()
 
 
 def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path, monkeypatch) -> None:
