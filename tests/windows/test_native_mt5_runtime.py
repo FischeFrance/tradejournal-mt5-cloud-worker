@@ -54,6 +54,11 @@ def _runtime(
         "<chart>\nsymbol=GBPUSD\n<window>\n</window>\n</chart>\n",
         encoding="utf-16",
     )
+    profile = terminal.parent / "Profiles" / "Charts" / "Default"
+    profile.mkdir(parents=True)
+    for name in ("chart01.chr", "chart02.chr", "chart03.chr", "chart04.chr"):
+        (profile / name).write_text("generated chart", encoding="utf-8")
+    (profile / "order.wnd").write_bytes(b"generated layout")
     return NativeMt5Runtime(tmp_path, connection_id)
 
 
@@ -221,6 +226,33 @@ def test_mcp_endpoint_isolation_preserves_mt5_utf16_config(
 
     assert assistant.read_bytes().startswith(b"\xff\xfe")
     assert NativeMt5Runtime._assistant_mcp_ports(assistant) == ports
+
+
+def test_reset_default_chart_profile_removes_only_generated_chart_state(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    profile = runtime.terminal_root / "Profiles" / "Charts" / "Default"
+    retained = profile / "profile-note.txt"
+    retained.write_text("keep", encoding="utf-8")
+
+    assert runtime._reset_default_chart_profile() == 5
+
+    assert not tuple(profile.glob("*.chr"))
+    assert not (profile / "order.wnd").exists()
+    assert retained.read_text(encoding="utf-8") == "keep"
+
+
+def test_reset_default_chart_profile_refuses_running_terminal(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+
+    with (
+        patch.object(runtime, "_running_terminal_pids", return_value=[123]),
+        pytest.raises(NativeMt5Error, match="chart_profile_in_use"),
+    ):
+        runtime._reset_default_chart_profile()
 
 
 def test_resume_uses_cached_account_and_direct_readonly_expert(

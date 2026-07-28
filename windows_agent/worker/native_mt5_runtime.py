@@ -322,6 +322,50 @@ class NativeMt5Runtime:
             raise NativeMt5Error("bridge_template_invalid")
         return symbols[0]
 
+    def _reset_default_chart_profile(self) -> int:
+        """Remove generated chart state while the isolated terminal is stopped."""
+        if self._running_terminal_pids():
+            raise NativeMt5Error("chart_profile_in_use")
+        profile = self.terminal_root / "Profiles" / "Charts" / "Default"
+        try:
+            profile_stat = os.lstat(profile)
+            if (
+                profile.is_symlink()
+                or not profile.is_dir()
+                or bool(getattr(profile_stat, "st_file_attributes", 0) & 0x400)
+            ):
+                raise NativeMt5Error("chart_profile_invalid")
+            entries = tuple(profile.iterdir())
+        except NativeMt5Error:
+            raise
+        except OSError as exc:
+            raise NativeMt5Error("chart_profile_invalid") from exc
+
+        removable: list[Path] = []
+        for entry in entries:
+            if entry.name.casefold() != "order.wnd" and entry.suffix.casefold() != ".chr":
+                continue
+            try:
+                entry_stat = os.lstat(entry)
+                if (
+                    entry.is_symlink()
+                    or not entry.is_file()
+                    or bool(getattr(entry_stat, "st_file_attributes", 0) & 0x400)
+                ):
+                    raise NativeMt5Error("chart_profile_invalid")
+            except NativeMt5Error:
+                raise
+            except OSError as exc:
+                raise NativeMt5Error("chart_profile_invalid") from exc
+            removable.append(entry)
+
+        try:
+            for entry in removable:
+                entry.unlink()
+        except OSError as exc:
+            raise NativeMt5Error("chart_profile_cleanup_failed") from exc
+        return len(removable)
+
     def _write_startup_config(
         self,
         login: int | None,
@@ -932,6 +976,7 @@ class NativeMt5Runtime:
             bootstrap = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
+            self._reset_default_chart_profile()
 
             # Phase 2: open a credential-free discovery chart so MT5 hydrates the broker symbol
             # catalogue. Once investor synchronization is proven, the in-terminal MQL5 script
@@ -959,6 +1004,7 @@ class NativeMt5Runtime:
             discovery = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
+            self._reset_default_chart_profile()
 
             # Phase 3: start passwordlessly on the persisted account. A read-only script receives
             # OnStart immediately, waits for the account to be synchronized, then applies the
@@ -1010,6 +1056,7 @@ class NativeMt5Runtime:
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
         self._remove_readiness_files()
+        self._reset_default_chart_profile()
         config = self._write_startup_config(
             login,
             server,
@@ -1045,6 +1092,7 @@ class NativeMt5Runtime:
         self._last_symbol = symbol
         self.install_expert(expert_binary, "new_only")
         self._install_bridge_template(symbol)
+        self._reset_default_chart_profile()
         config = self._write_startup_config(None, None, None, symbol)
         try:
             self._start_process(config)
