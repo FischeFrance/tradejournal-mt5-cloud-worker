@@ -358,7 +358,8 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         expected_server,
         cancel_check,
     ):
-        cancel_check()
+        if cancel_check is not None:
+            cancel_check()
         wizard_calls.append((search_text, suggested_broker_label, expected_server))
         assert not (env.secrets_root / cid).exists()
         artifact = root / "state" / "broker-wizard-result.json"
