@@ -338,6 +338,15 @@ def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(
 def test_provision_censuses_unknown_server_before_login_and_promotes_after_success(env):
     cid = str(uuid4())
     wizard_calls: list[tuple[str, str, str]] = []
+    generated_example = (
+        env.instances_root
+        / cid
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "Advisors"
+        / "ExpertMACD.ex5"
+    )
 
     def reject_endpoint(_label: str):
         raise BrokerEndpointResolutionError("fixture unavailable")
@@ -362,6 +371,8 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
             cancel_check()
         wizard_calls.append((search_text, suggested_broker_label, expected_server))
         assert not (env.secrets_root / cid).exists()
+        generated_example.parent.mkdir(parents=True)
+        generated_example.write_bytes(b"mt5 default example")
         artifact = root / "state" / "broker-wizard-result.json"
         artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
         return BrokerWizardEvidence(
@@ -397,6 +408,7 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
     assert wizard_calls == [
         ("Goat Funded Trader", "Goat Funded Trader", "GoatFunded-Server3")
     ]
+    assert not generated_example.exists()
     assert store.read(cid, "mt5_endpoint") == "GoatFunded-Server3"
     assert store.read(cid, "mt5_broker_label") == "Goat Funded Trader"
     assert result["verified_server_name"] == "GoatFunded-Server3"

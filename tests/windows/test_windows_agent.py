@@ -230,6 +230,54 @@ def test_instance_provision_pins_and_records_terminal_digest(tmp_path):
         )
 
 
+def test_instance_removes_only_known_mt5_generated_example_code(tmp_path):
+    source = tmp_path / "template"
+    source.mkdir()
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+    root = provisioner.provision(connection_id, terminal)
+    generated = (
+        root
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "Advisors"
+        / "ExpertMACD.ex5"
+    )
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"mt5 default example")
+
+    removed = provisioner.remove_generated_example_code(connection_id)
+
+    assert removed == ("MQL5/Experts/Advisors",)
+    assert not generated.exists()
+    assert provisioner.validate(connection_id) == root
+
+
+def test_instance_keeps_unknown_executable_for_fail_closed_validation(tmp_path):
+    source = tmp_path / "template"
+    source.mkdir()
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+    root = provisioner.provision(connection_id, terminal)
+    unknown = root / "terminal" / "MQL5" / "Experts" / "Unknown" / "foreign.ex5"
+    unknown.parent.mkdir(parents=True)
+    unknown.write_bytes(b"unknown executable")
+
+    assert provisioner.remove_generated_example_code(connection_id) == ()
+    assert unknown.exists()
+    with pytest.raises(ValueError, match="code manifest"):
+        provisioner.validate(connection_id)
+
+
 def test_instance_provision_failure_leaves_no_partial_publication(
     tmp_path, monkeypatch
 ):

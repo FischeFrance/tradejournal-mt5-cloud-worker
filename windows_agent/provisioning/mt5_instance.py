@@ -13,6 +13,16 @@ from .instance_layout import SUBDIRS, InstanceLayout
 from .secret_store import WindowsSecretStore
 
 
+_MT5_GENERATED_EXAMPLE_DIRS = (
+    Path("MQL5/Experts/Advisors"),
+    Path("MQL5/Experts/Examples"),
+    Path("MQL5/Experts/Free Robots"),
+    Path("MQL5/Indicators/Examples"),
+    Path("MQL5/Indicators/Free Indicators"),
+    Path("MQL5/Scripts/Examples"),
+)
+
+
 class InstanceProvisioner:
     def __init__(self, instances_root: Path, secrets_root: Path) -> None:
         self.instances_root = instances_root
@@ -136,6 +146,35 @@ class InstanceProvisioner:
             verify_code=verify_code,
         )
         return root
+
+    def remove_generated_example_code(
+        self,
+        connection_id: str,
+    ) -> tuple[str, ...]:
+        """Remove only MT5's known bundled examples from an isolated instance.
+
+        MT5 can materialize these signed/default EX5 folders during the
+        credential-free broker wizard. They are not part of TradeJournal's
+        pinned template and must not survive the subsequent code-manifest gate.
+        Unknown executable paths remain untouched so validation still fails
+        closed.
+        """
+
+        root = self.validate(connection_id, verify_code=False)
+        terminal_root = root / "terminal"
+        if self._is_reparse_point(terminal_root) or not terminal_root.is_dir():
+            raise ValueError("published terminal root invalid")
+        removed: list[str] = []
+        for relative in _MT5_GENERATED_EXAMPLE_DIRS:
+            target = terminal_root / relative
+            if not target.exists():
+                continue
+            if self._is_reparse_point(target) or not target.is_dir():
+                raise ValueError("generated example path invalid")
+            self._validate_source_tree(target)
+            shutil.rmtree(target)
+            removed.append(relative.as_posix())
+        return tuple(removed)
 
     @staticmethod
     def _sha256(path: Path) -> str:

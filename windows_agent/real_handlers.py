@@ -345,6 +345,14 @@ def build_real_handlers(
                     )
                 broker_label = selected_broker
                 connection_endpoint = server
+                try:
+                    InstanceProvisioner(
+                        instances_root, secrets_root
+                    ).remove_generated_example_code(cid)
+                except Exception as cleanup_exc:
+                    raise InstanceProvisionFailed(
+                        "broker census executable cleanup failed"
+                    ) from cleanup_exc
                 _require_lease(api, job)
         password = _decrypt_envelope(payload, secrets_root)
 
