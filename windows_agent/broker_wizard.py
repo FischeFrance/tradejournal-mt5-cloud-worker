@@ -57,6 +57,25 @@ class BrokerWizardError(RuntimeError):
     """Sanitized wizard failure; messages never contain UI text or credentials."""
 
 
+def _default_python_executable() -> Path:
+    """Resolve the venv interpreter from both CLI and pywin32 service hosts."""
+
+    executable = Path(sys.executable)
+    candidates = (
+        executable.parent / "Scripts" / "python.exe",
+        executable.with_name("python.exe"),
+        Path(sys.prefix) / "Scripts" / "python.exe",
+        Path(__file__).resolve().parent.parent
+        / ".venv"
+        / "Scripts"
+        / "python.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
 def _broker_key(value: str) -> str:
     return "".join(
         character for character in value.casefold() if character.isalnum()
@@ -270,8 +289,9 @@ class HiddenSessionBrokerWizard:
             raise BrokerWizardError("interactive user must be dedicated")
         if not 30 <= timeout_seconds <= 300:
             raise BrokerWizardError("wizard timeout is invalid")
-        default_python = Path(sys.prefix) / "Scripts" / "python.exe"
-        self._python = Path(python_executable or default_python)
+        self._python = Path(
+            python_executable or _default_python_executable()
+        )
         self._helper = Path(
             helper_script or Path(__file__).with_name("broker_wizard_ui.py")
         )

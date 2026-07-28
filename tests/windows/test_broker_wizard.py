@@ -10,6 +10,7 @@ import pytest
 from windows_agent.broker_wizard import (
     BrokerWizardError,
     BrokerWizardEvidence,
+    _default_python_executable,
     load_wizard_evidence,
     write_login_verification_artifact,
 )
@@ -126,3 +127,22 @@ def test_write_login_verification_artifact_is_atomic_and_contains_no_secret(tmp_
     assert "password" not in serialized
     assert "credential" not in serialized
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_default_python_executable_supports_pywin32_service_host(
+    tmp_path, monkeypatch
+):
+    venv = tmp_path / ".venv"
+    interpreter = venv / "Scripts" / "python.exe"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"test interpreter")
+    monkeypatch.setattr(
+        "windows_agent.broker_wizard.sys.executable",
+        str(venv / "pythonservice.exe"),
+    )
+    monkeypatch.setattr(
+        "windows_agent.broker_wizard.sys.prefix",
+        str(tmp_path / "base-python"),
+    )
+
+    assert _default_python_executable() == interpreter
