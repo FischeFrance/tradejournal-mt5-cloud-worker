@@ -650,7 +650,11 @@ class NativeMt5Runtime:
             pid = 0
             if self._process is not None:
                 pid = self._process.pid
-            elif self._interactive_task:
+            else:
+                # The one-shot scheduled task is deleted immediately after MT5
+                # authorizes, while its terminal child intentionally remains alive.
+                # Evidence must bind that exact running child rather than returning
+                # PID 0 after the task handle has been released.
                 pids = self._running_terminal_pids()
                 pid = pids[0] if pids else 0
             if self._process is not None and self._process.poll() is not None:

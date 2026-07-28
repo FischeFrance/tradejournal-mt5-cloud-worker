@@ -418,15 +418,22 @@ def build_real_handlers(
                 }
             )
         elif wizard_evidence is not None:
+            if (
+                not isinstance(verification_pid, int)
+                or isinstance(verification_pid, bool)
+                or verification_pid <= 0
+            ):
+                process_factory(
+                    root / "state" / "terminal-process.json"
+                ).stop()
+                raise BrokerDiscoveryFailed(
+                    "login verification process identity is unavailable"
+                )
             try:
                 _, artifact_digest = write_login_verification_artifact(
                     root / "state",
                     evidence=wizard_evidence,
-                    verification_pid=(
-                        verification_pid
-                        if isinstance(verification_pid, int)
-                        else wizard_evidence.terminal_pid
-                    ),
+                    verification_pid=verification_pid,
                 )
             except BrokerWizardError as exc:
                 process_factory(
@@ -922,6 +929,7 @@ def _authenticate_and_sync(
         "imported_orders": counts["orders"],
         "live_sync_started": True,
         "live_sync_events_delivered": delivered,
+        "_verification_pid": getattr(process, "pid", 0),
     }
 
 

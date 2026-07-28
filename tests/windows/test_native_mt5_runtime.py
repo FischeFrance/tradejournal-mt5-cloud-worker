@@ -528,6 +528,26 @@ def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> 
         runtime._wait_for_authorization(checkpoint, 42, "Demo", 1.0)
 
 
+def test_wait_for_heartbeat_binds_pid_after_interactive_task_release(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "account.json").write_text(
+        _envelope({"login": "42", "server": "Demo", "trade_allowed": False})
+    )
+    (runtime.files / "heartbeat.json").write_text(
+        _envelope({"terminal_connected": True})
+    )
+    runtime._interactive_task = None
+    runtime._process = None
+
+    with patch.object(runtime, "_running_terminal_pids", return_value=[456]):
+        status = runtime._wait_for_heartbeat(1.0, 42, "Demo")
+
+    assert status.pid == 456
+
+
 def test_wait_for_investor_sync_requires_sync_and_readonly_lines(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     logs = runtime.terminal_root / "logs"

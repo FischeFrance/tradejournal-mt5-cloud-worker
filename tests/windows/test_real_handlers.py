@@ -127,6 +127,8 @@ class ScriptedAdapter:
 
 
 class FakeProcessManager:
+    pid = 123
+
     def __init__(self, state_path) -> None:
         self.state_path = state_path
 
@@ -425,6 +427,12 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         (env.instances_root / cid / "state").glob("endpoint-verification-*.json")
     )
     assert len(verification_artifacts) == 1
+    assert (
+        json.loads(verification_artifacts[0].read_text(encoding="utf-8"))[
+            "verification_pid"
+        ]
+        == 123
+    )
     assert "investor-pw" not in verification_artifacts[0].read_text(encoding="utf-8")
 
 
