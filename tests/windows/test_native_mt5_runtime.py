@@ -423,7 +423,7 @@ def test_account_database_acl_allows_only_service_and_interactive_user(
 ) -> None:
     runtime = _runtime(tmp_path)
     accounts = runtime.terminal_root / "Config" / "accounts.dat"
-    accounts.parent.mkdir()
+    accounts.parent.mkdir(exist_ok=True)
     accounts.write_bytes(b"encrypted-account-material")
     restricted: list[Path] = []
     monkeypatch.setattr(
