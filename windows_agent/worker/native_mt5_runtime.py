@@ -166,9 +166,20 @@ class NativeMt5Runtime:
         return destination
 
     @staticmethod
-    def _assistant_mcp_ports(path: Path) -> tuple[int, int] | None:
+    def _read_assistant_config(path: Path) -> tuple[str, str]:
+        raw = path.read_bytes()
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            encoding = "utf-16"
+        elif raw.startswith(b"\xef\xbb\xbf"):
+            encoding = "utf-8-sig"
+        else:
+            encoding = "utf-8"
+        return raw.decode(encoding), encoding
+
+    @classmethod
+    def _assistant_mcp_ports(cls, path: Path) -> tuple[int, int] | None:
         try:
-            content = path.read_text(encoding="utf-8-sig")
+            content, _ = cls._read_assistant_config(path)
         except (OSError, UnicodeDecodeError):
             return None
         ports: dict[str, int] = {}
@@ -263,7 +274,7 @@ class NativeMt5Runtime:
             return current
         ports = self._allocate_mcp_ports(reserved)
         try:
-            content = path.read_text(encoding="utf-8-sig")
+            content, encoding = self._read_assistant_config(path)
         except (OSError, UnicodeDecodeError) as exc:
             raise NativeMt5Error("assistant_config_invalid") from exc
         updated: list[str] = []
@@ -285,7 +296,9 @@ class NativeMt5Runtime:
             raise NativeMt5Error("assistant_config_invalid")
         temporary = path.with_suffix(".ini.tmp")
         try:
-            self._write_text_durable(temporary, "\n".join(updated) + "\n", "utf-8")
+            self._write_text_durable(
+                temporary, "\n".join(updated) + "\n", encoding
+            )
             durable_replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)

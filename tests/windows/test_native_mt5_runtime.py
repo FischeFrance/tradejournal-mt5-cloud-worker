@@ -206,6 +206,23 @@ def test_mcp_endpoint_isolation_assigns_distinct_loopback_ports(
     ) == second_ports
 
 
+def test_mcp_endpoint_isolation_preserves_mt5_utf16_config(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    assistant = runtime.terminal_root / "Config" / "assistant.ini"
+    content = assistant.read_text(encoding="utf-8")
+    assistant.write_text(content, encoding="utf-16")
+
+    with patch.object(
+        NativeMt5Runtime, "_ports_are_bindable", return_value=True
+    ):
+        ports = runtime._ensure_mcp_endpoint_isolation()
+
+    assert assistant.read_bytes().startswith(b"\xff\xfe")
+    assert NativeMt5Runtime._assistant_mcp_ports(assistant) == ports
+
+
 def test_resume_uses_cached_account_and_direct_readonly_expert(
     tmp_path: Path,
 ) -> None:
