@@ -49,7 +49,15 @@ class FakeNativeRuntime:
         files.mkdir(parents=True, exist_ok=True)
         records = {
             "heartbeat.json": {"terminal_connected": True, "account_trade_allowed": False},
-            "account.json": {"login": "42", "server": "Demo", "trade_allowed": False},
+            "account.json": {
+                "login": "42",
+                "server": "Demo",
+                "balance": 100.0,
+                "equity": 100.0,
+                "currency": "USD",
+                "leverage": 100,
+                "trade_allowed": False,
+            },
             "positions.json": [],
             "orders.json": [],
             "history_orders.json": [{"ticket": "1", "time": "2026-07-01T00:00:00Z"}],
@@ -62,6 +70,31 @@ class FakeNativeRuntime:
     def resume(self, **kwargs: Any) -> NativeMt5Status:
         assert "investor_password" not in kwargs
         return self.start(**kwargs)
+
+
+class RedirectingFakeNativeRuntime(FakeNativeRuntime):
+    def start(self, **kwargs: Any) -> NativeMt5Status:
+        status = super().start(**kwargs)
+        effective_server = "PepperstoneEU-Live"
+        for path in status.files_path.glob("*.json"):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["account_identity"]["server"] = effective_server
+            record["server_identity"] = effective_server
+            if path.name == "account.json":
+                record["payload"]["server"] = effective_server
+            path.write_text(json.dumps(record), encoding="utf-8")
+        account = {
+            **status.account,
+            "server": effective_server,
+        }
+        return NativeMt5Status(
+            status.pid,
+            account,
+            status.heartbeat,
+            status.files_path,
+            requested_server="PepperstoneUK-Live",
+            effective_server=effective_server,
+        )
 
 
 class FakeProcessManager:
@@ -92,6 +125,16 @@ class QueueApi:
     def transition(self, job_id: str, lease_id: str, status: str, result: dict[str, object] | None = None) -> dict[str, str]:
         self.transitions.append((job_id, status, result))
         return {"status": "failed" if status == "fail" else status}
+
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict[str, bool]:
+        return {"event_recorded": True}
 
 
 def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Path, monkeypatch) -> None:
@@ -131,6 +174,85 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
     assert result is not None and result["result"]["file_bridge"] == "mql5-local-json"
     assert not (instances / cid / "terminal").exists()
     assert not (secrets / cid).exists()
+
+
+def test_redirected_server_completes_and_persists_effective_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_protect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_unprotect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda path: None),
+    )
+    cid = str(uuid4())
+    instances, secrets = tmp_path / "instances", tmp_path / "secrets"
+    terminal = tmp_path / "template" / "terminal64.exe"
+    expert = tmp_path / "template" / "TradeJournalBridge.ex5"
+    terminal.parent.mkdir(parents=True)
+    terminal.write_bytes(b"terminal")
+    expert.write_bytes(b"expert")
+    WindowsSecretStore(secrets).write(
+        AGENT_SCOPE_ID,
+        PROVISIONING_KEY_SECRET_NAME,
+        KEY,
+    )
+    api = QueueApi(
+        [
+            {
+                "job_id": "redirect-provision",
+                "job_type": "provision",
+                "connection_id": cid,
+                "lease_id": "1",
+                "history_mode": "new_only",
+                "payload": {
+                    "credential_envelope": _envelope(
+                        {"investor_password": "read-only"}
+                    ),
+                    "expected_login": 42,
+                    "expected_server": "PepperstoneUK-Live",
+                    "broker_label": "Pepperstone",
+                },
+            }
+        ]
+    )
+    handlers = build_real_handlers(
+        api,
+        instances_root=instances,
+        secrets_root=secrets,
+        source_terminal=terminal,
+        expert_binary=expert,
+        process_factory=FakeProcessManager,
+        runtime_factory=RedirectingFakeNativeRuntime,
+    )
+
+    completed = JobRunner(
+        tmp_path / "redirect-agent-state.json",
+        api,
+        handlers,
+    ).run_once()
+    assert completed, api.transitions
+
+    _, status, transition = api.transitions[-1]
+    assert status == "complete"
+    assert transition is not None
+    result = transition["result"]
+    assert result["requested_server_name"] == "PepperstoneUK-Live"
+    assert result["effective_server_name"] == "PepperstoneEU-Live"
+    assert result["server_redirected"] is True
+    assert result["server_redirect_code"] == "SERVER_REDIRECT_DETECTED"
+    store = WindowsSecretStore(secrets)
+    assert store.read(cid, "mt5_server") == "PepperstoneEU-Live"
 
 
 def _provisioned_env(tmp_path: Path, monkeypatch):

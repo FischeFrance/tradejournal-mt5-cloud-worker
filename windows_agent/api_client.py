@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from datetime import datetime
 from typing import Callable
@@ -14,6 +15,25 @@ BACKOFF_BASE_SECONDS = 0.5
 BACKOFF_MAX_SECONDS = 5.0
 JOB_TYPES = frozenset(("provision", "deprovision", "historical_sync", "live_sync"))
 HISTORY_MODES = frozenset(("new_only", "from_date", "all_available"))
+PROGRESS_EVENT_CODES = frozenset(
+    (
+        "endpoint_resolution",
+        "broker_identity",
+        "broker_discovery",
+        "instance_preparation",
+        "terminal_start",
+        "investor_verification",
+        "bridge_activation",
+        "history_sync",
+        "sync_activation",
+        "deprovision",
+        "live_sync",
+    )
+)
+PROGRESS_EVENT_STATUSES = frozenset(
+    ("started", "completed", "failed", "skipped", "info")
+)
+PROGRESS_DETAIL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class AgentContractError(RuntimeError):
@@ -119,6 +139,22 @@ def _validate_transition(response: dict, requested: str) -> dict:
     return response
 
 
+def _validate_progress(response: dict) -> dict:
+    if response.get("error_code") == "lease_lost":
+        if set(response) != {"api_version", "error_code"}:
+            raise AgentContractError(
+                "progress lease-loss response does not match contract V1"
+            )
+        return response
+    if (
+        set(response) != {"api_version", "event_recorded"}
+        or response.get("api_version") != "1"
+        or response.get("event_recorded") is not True
+    ):
+        raise AgentContractError("progress response does not match contract V1")
+    return response
+
+
 class AgentApiClient:
     API_VERSION = "1"
     def __init__(
@@ -202,4 +238,32 @@ class AgentApiClient:
         payload = {"api_version": self.API_VERSION, "lease_id": lease_id, **(result or {})}
         return _validate_transition(
             self.request("POST", f"jobs/{job_id}/{status}", payload), status
+        )
+
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict:
+        if event_code not in PROGRESS_EVENT_CODES:
+            raise ValueError("invalid progress event code")
+        if event_status not in PROGRESS_EVENT_STATUSES:
+            raise ValueError("invalid progress event status")
+        if detail_code is not None and not PROGRESS_DETAIL_PATTERN.fullmatch(detail_code):
+            raise ValueError("invalid progress detail code")
+        return _validate_progress(
+            self.request(
+                "POST",
+                f"jobs/{job_id}/progress",
+                {
+                    "api_version": self.API_VERSION,
+                    "lease_id": lease_id,
+                    "event_code": event_code,
+                    "event_status": event_status,
+                    "detail_code": detail_code,
+                },
+            )
         )

@@ -70,6 +70,37 @@ void WriteInitMarker(const string state)
             ", errore=", GetLastError());
   }
 
+// Il terminale generico ricrea il profilo Default con piu' grafici quando un profilo
+// personalizzato vuoto viene aperto. Il bridge mantiene esclusivamente il grafico sul quale e'
+// stato caricato: ChartFirst/ChartNext enumerano soltanto i grafici di questa istanza MT5 e
+// ChartClose non coinvolge altri processi o account.
+bool CloseOtherCharts()
+  {
+   long current_chart = ChartID();
+   long chart = ChartFirst();
+   int requested = 0;
+   while(chart >= 0)
+     {
+      long next_chart = ChartNext(chart);
+      if(chart != current_chart)
+        {
+         ResetLastError();
+         if(!ChartClose(chart))
+           {
+            Print("TradeJournalBridge: chiusura grafico aggiuntivo fallita, errore=",
+                  GetLastError());
+            return false;
+           }
+         requested++;
+        }
+      chart = next_chart;
+     }
+   if(requested > 0)
+      Print("TradeJournalBridge: richiusa area di lavoro a un solo grafico; grafici rimossi=",
+            requested, ".");
+   return true;
+  }
+
 //+------------------------------------------------------------------------+
 //| Utility JSON minime (scopo specifico, non un parser/serializzatore     |
 //| generico: MQL5 non ha una libreria JSON in standard library e questo   |
@@ -799,6 +830,12 @@ int OnInit()
    FolderCreate(BASE_DIR + "\\candles");
    FolderCreate(BASE_DIR + "\\events");
    WriteInitMarker("folders-ready");
+   if(!CloseOtherCharts())
+     {
+      WriteInitMarker("chart-cleanup-failed");
+      return(INIT_FAILED);
+     }
+   WriteInitMarker("single-chart-ready");
 
    g_connection_id = ReadConnectionId();
    WriteInitMarker("connection-id-ready");

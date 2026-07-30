@@ -310,3 +310,22 @@ class InstanceProvisioner:
         for child in (root / "terminal", root / "worker", root / "data"):
             if child.exists():
                 shutil.rmtree(child)
+
+    def discard_failed(self, connection_id: str) -> None:
+        """Remove every local artifact owned by an inactive failed provision.
+
+        The caller must stop and verify the exact per-instance terminal process
+        before invoking this method. Reparse points are rejected rather than
+        traversed so cleanup can never escape the canonical connection root.
+        """
+
+        layout = InstanceLayout(self.instances_root, connection_id)
+        root = layout.path
+        if root.exists():
+            if self._is_reparse_point(root) or not root.is_dir():
+                raise ValueError("failed instance root is unsafe")
+            shutil.rmtree(root)
+        self.secrets.delete_connection(connection_id)
+        secret_root = self.secrets.root / connection_id
+        if root.exists() or secret_root.exists():
+            raise OSError("failed instance cleanup is incomplete")

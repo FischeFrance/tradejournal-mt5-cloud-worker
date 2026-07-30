@@ -9,6 +9,7 @@ portable terminal belonging to the current connection.
 """
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -29,7 +30,11 @@ _LABEL = re.compile(r"^[A-Za-z0-9&'()._ /+-]{1,128}$")
 _SERVER = re.compile(r"^[A-Za-z0-9._ -]{1,128}$")
 _SAFE_USER = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_RESULT_FIELDS = {
+_SECRET_KEY = re.compile(
+    r"(?:password|passwd|token|secret|credential|hmac)",
+    re.IGNORECASE,
+)
+_RESULT_FIELDS_V1 = {
     "schema_version",
     "run_id",
     "status",
@@ -40,6 +45,7 @@ _RESULT_FIELDS = {
     "terminal_pid",
     "completed_at_unix_ms",
 }
+_RESULT_FIELDS_V2 = _RESULT_FIELDS_V1 | {"selected_broker_labels"}
 _FAILURE_REASONS = {
     "invalid_request",
     "terminal_start_failed",
@@ -55,6 +61,23 @@ _FAILURE_REASONS = {
 
 class BrokerWizardError(RuntimeError):
     """Sanitized wizard failure; messages never contain UI text or credentials."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_reason = (
+            failure_reason if failure_reason in _FAILURE_REASONS else None
+        )
+
+    @property
+    def detail_code(self) -> str:
+        if self.failure_reason is None:
+            return "wizard_failed"
+        return f"wizard_{self.failure_reason}"
 
 
 def _default_python_executable() -> Path:
@@ -92,6 +115,29 @@ class BrokerWizardEvidence:
     completed_at_unix_ms: int
     artifact_path: Path
     artifact_sha256: str
+    # v1 artifacts contained only the primary label. v2 records both native
+    # ListView columns so callers can verify which broker row was selected.
+    selected_broker_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LoginVerificationEvidence:
+    """Credential-free provenance for any successful managed MT5 login.
+
+    A direct MTAPI endpoint attempt is not a broker-wizard run.  Keeping its
+    provenance separate prevents a verified endpoint from falsely claiming it
+    was obtained through the official UI census.
+    """
+
+    run_id: str
+    expected_server_name: str
+    broker_label: str
+    source_kind: str
+    source_artifact_path: Path
+    source_artifact_sha256: str
+
+
+_LOGIN_PROVENANCE_KINDS = frozenset({"BROKER_WIZARD", "MTAPI_SEARCH"})
 
 
 def _sha256(path: Path) -> str:
@@ -141,6 +187,17 @@ def _read_json(path: Path) -> Mapping[str, Any]:
     return value
 
 
+def _reject_secret_fields(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if _SECRET_KEY.search(str(key)):
+                raise BrokerWizardError("login verification provenance contains a secret field")
+            _reject_secret_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_secret_fields(child)
+
+
 def load_wizard_evidence(
     path: str | Path,
     *,
@@ -149,9 +206,11 @@ def load_wizard_evidence(
 ) -> BrokerWizardEvidence:
     artifact = Path(path)
     document = _read_json(artifact)
-    if set(document) != _RESULT_FIELDS:
-        raise BrokerWizardError("wizard evidence fields do not match schema v1")
-    if document["schema_version"] != 1:
+    schema_version = document.get("schema_version")
+    fields = _RESULT_FIELDS_V1 if schema_version == 1 else _RESULT_FIELDS_V2
+    if set(document) != fields:
+        raise BrokerWizardError("wizard evidence fields do not match schema")
+    if schema_version not in (1, 2):
         raise BrokerWizardError("wizard evidence schema is unsupported")
     run_id = _uuid4(document["run_id"], "wizard run id")
     if run_id != _uuid4(expected_run_id, "expected wizard run id"):
@@ -160,7 +219,10 @@ def load_wizard_evidence(
         reason = document["failure_reason"]
         if reason not in _FAILURE_REASONS:
             raise BrokerWizardError("wizard failure reason is invalid")
-        raise BrokerWizardError("wizard did not succeed")
+        raise BrokerWizardError(
+            "wizard did not succeed",
+            failure_reason=reason,
+        )
     if document["failure_reason"] is not None:
         raise BrokerWizardError("wizard success contains a failure reason")
 
@@ -172,6 +234,23 @@ def load_wizard_evidence(
     broker = document["selected_broker_label"]
     if not isinstance(broker, str) or not _LABEL.fullmatch(broker):
         raise BrokerWizardError("wizard broker label is invalid")
+    raw_labels = (
+        [broker]
+        if schema_version == 1
+        else document["selected_broker_labels"]
+    )
+    if (
+        not isinstance(raw_labels, list)
+        or not raw_labels
+        or len(raw_labels) > 2
+        or any(not isinstance(label, str) or not _LABEL.fullmatch(label) for label in raw_labels)
+    ):
+        raise BrokerWizardError("wizard broker labels are invalid")
+    normalized_labels = tuple(
+        dict.fromkeys(label.strip() for label in raw_labels)
+    )
+    if broker.strip() not in normalized_labels:
+        raise BrokerWizardError("wizard primary broker label is not observed")
     raw_servers = document["censused_server_names"]
     if (
         not isinstance(raw_servers, list)
@@ -219,15 +298,19 @@ def load_wizard_evidence(
         completed_at_unix_ms=completed_at,
         artifact_path=artifact,
         artifact_sha256=digest,
+        selected_broker_labels=normalized_labels,
     )
 
 
 def write_login_verification_artifact(
     state_root: str | Path,
     *,
-    evidence: BrokerWizardEvidence,
+    evidence: BrokerWizardEvidence | LoginVerificationEvidence,
     verification_pid: int,
     verified_at_unix_ms: int | None = None,
+    process_creation_time_unix_ms: int | None = None,
+    remote_host: str | None = None,
+    remote_port: int | None = None,
 ) -> tuple[Path, str]:
     if (
         not isinstance(verification_pid, int)
@@ -235,9 +318,35 @@ def write_login_verification_artifact(
         or verification_pid <= 0
     ):
         raise BrokerWizardError("login verification PID is invalid")
-    run_id = _uuid4(evidence.run_id, "wizard run id")
-    if not _SHA256.fullmatch(evidence.artifact_sha256):
-        raise BrokerWizardError("wizard evidence digest is invalid")
+    if isinstance(evidence, BrokerWizardEvidence):
+        run_id = _uuid4(evidence.run_id, "wizard run id")
+        server_name = evidence.expected_server_name
+        broker_label = evidence.selected_broker_label
+        provenance_kind = "BROKER_WIZARD"
+        source_artifact = evidence.artifact_path
+        source_digest = evidence.artifact_sha256
+    elif isinstance(evidence, LoginVerificationEvidence):
+        run_id = _uuid4(evidence.run_id, "login verification run id")
+        server_name = evidence.expected_server_name
+        broker_label = evidence.broker_label
+        provenance_kind = evidence.source_kind
+        source_artifact = evidence.source_artifact_path
+        source_digest = evidence.source_artifact_sha256
+    else:
+        raise BrokerWizardError("login verification evidence is invalid")
+    if (
+        not _SERVER.fullmatch(server_name)
+        or not _LABEL.fullmatch(broker_label)
+        or provenance_kind not in _LOGIN_PROVENANCE_KINDS
+        or not _SHA256.fullmatch(source_digest)
+        or _is_reparse_point(source_artifact)
+        or not source_artifact.is_file()
+        or _sha256(source_artifact) != source_digest
+    ):
+        raise BrokerWizardError("login verification provenance is invalid")
+    # Source documents are copied to the registry by the publisher. Reject
+    # secret-bearing JSON here, before an immutable artifact can reference it.
+    _reject_secret_fields(_read_json(source_artifact))
     observed = (
         int(time.time() * 1000)
         if verified_at_unix_ms is None
@@ -245,23 +354,74 @@ def write_login_verification_artifact(
     )
     if not isinstance(observed, int) or isinstance(observed, bool) or observed <= 0:
         raise BrokerWizardError("login verification time is invalid")
-    destination = Path(state_root) / f"endpoint-verification-{run_id}.json"
-    atomic_json(
-        destination,
-        {
-            "schema_version": 1,
+    binding = (
+        process_creation_time_unix_ms,
+        remote_host,
+        remote_port,
+    )
+    if all(value is None for value in binding):
+        payload = {
+            "schema_version": 2,
             "verification_session_id": run_id,
-            "server_name": evidence.expected_server_name,
-            "broker_label": evidence.selected_broker_label,
+            "server_name": server_name,
+            "broker_label": broker_label,
             "protocol": "TCP/TLS",
             "verification_method": "managed_investor_login",
             "login_verified": True,
             "investor_read_only_verified": True,
             "verification_pid": verification_pid,
             "verified_at_unix_ms": observed,
-            "wizard_artifact_sha256": evidence.artifact_sha256,
-        },
-    )
+            "provenance_kind": provenance_kind,
+            "provenance_artifact_sha256": source_digest,
+        }
+    elif any(value is None for value in binding):
+        raise BrokerWizardError(
+            "endpoint process binding must be complete"
+        )
+    else:
+        if (
+            not isinstance(process_creation_time_unix_ms, int)
+            or isinstance(process_creation_time_unix_ms, bool)
+            or process_creation_time_unix_ms <= 0
+        ):
+            raise BrokerWizardError(
+                "endpoint process creation time is invalid"
+            )
+        try:
+            address = ipaddress.ip_address(str(remote_host))
+        except ValueError as exc:
+            raise BrokerWizardError("endpoint address is invalid") from exc
+        if (
+            address.is_unspecified
+            or address.is_multicast
+            or address.is_loopback
+            or address.is_link_local
+            or not isinstance(remote_port, int)
+            or isinstance(remote_port, bool)
+            or not 1 <= remote_port <= 65535
+        ):
+            raise BrokerWizardError("endpoint address is not usable")
+        payload = {
+            "schema_version": 3,
+            "verification_session_id": run_id,
+            "server_name": server_name,
+            "broker_label": broker_label,
+            "protocol": "TCP/TLS",
+            "verification_method": "managed_investor_login",
+            "login_verified": True,
+            "investor_read_only_verified": True,
+            "verification_pid": verification_pid,
+            "process_creation_time_unix_ms": (
+                process_creation_time_unix_ms
+            ),
+            "verified_at_unix_ms": observed,
+            "remote_host": address.compressed,
+            "remote_port": remote_port,
+            "provenance_kind": provenance_kind,
+            "provenance_artifact_sha256": source_digest,
+        }
+    destination = Path(state_root) / f"endpoint-verification-{run_id}.json"
+    atomic_json(destination, payload)
     digest = _sha256(destination)
     return destination, digest
 
@@ -442,13 +602,12 @@ class HiddenSessionBrokerWizard:
                         expected_run_id=run_id,
                         expected_server_name=expected,
                     )
-                    if _broker_key(evidence.selected_broker_label) != _broker_key(
-                        suggested
-                    ):
-                        raise BrokerWizardError("wizard broker identity mismatch")
                     return evidence
                 time.sleep(0.25)
-            raise BrokerWizardError("wizard timed out")
+            raise BrokerWizardError(
+                "wizard timed out",
+                failure_reason="timeout",
+            )
         finally:
             cleanup_error: BrokerWizardError | None = None
             if task_created:
@@ -465,11 +624,13 @@ class HiddenSessionBrokerWizard:
             try:
                 if not ProcessManager.cleanup_path(terminal):
                     cleanup_error = BrokerWizardError(
-                        "wizard terminal cleanup failed"
+                        "wizard terminal cleanup failed",
+                        failure_reason="cleanup_failed",
                     )
             except Exception:
                 cleanup_error = BrokerWizardError(
-                    "wizard terminal cleanup failed"
+                    "wizard terminal cleanup failed",
+                    failure_reason="cleanup_failed",
                 )
             request_path.unlink(missing_ok=True)
             launcher.unlink(missing_ok=True)

@@ -19,8 +19,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .state_store import atomic_json
 
-DEFAULT_OPENAI_MODEL = "gpt-5.6"
-_CACHE_SCHEMA_VERSION = 1
+# This project only has access to the Terra deployment. Keep the explicit
+# default aligned with the runtime service configuration so unseen-server
+# onboarding does not fail before the broker wizard can start.
+DEFAULT_OPENAI_MODEL = "gpt-5.6-terra"
+_CACHE_SCHEMA_VERSION = 2
+_LEGACY_CACHE_SCHEMA_VERSION = 1
 _SERVER_PATTERN = re.compile(r"[A-Za-z0-9._ -]{1,128}")
 _BROKER_PATTERN = re.compile(r"[A-Za-z0-9&'()._ /+-]{1,128}")
 _USABLE_CONFIDENCE = frozenset(("HIGH", "MEDIUM"))
@@ -110,9 +114,26 @@ def _validated_suggestion(
     sources = tuple(dict.fromkeys(_source_url(url) for url in value.source_urls))
     if not sources:
         raise BrokerIdentityError("broker identity provenance is missing")
+    broker_label = _label(value.broker_label, "broker label")
+    search_text = _label(value.search_text, "search text")
+    broker_key = "".join(
+        character for character in broker_label.casefold()
+        if character.isalnum()
+    )
+    search_key = "".join(
+        character for character in search_text.casefold()
+        if character.isalnum()
+    )
+    if not (
+        search_key.startswith(broker_key)
+        or broker_key.startswith(search_key)
+    ):
+        raise BrokerIdentityError(
+            "broker search text conflicts with broker label"
+        )
     return BrokerIdentitySuggestion(
-        broker_label=_label(value.broker_label, "broker label"),
-        search_text=_label(value.search_text, "search text"),
+        broker_label=broker_label,
+        search_text=search_text,
         confidence=confidence,
         source_urls=sources,
         generated_at_unix_ms=generated,
@@ -165,9 +186,14 @@ class CachedBrokerIdentityResolver:
         if (
             not isinstance(document, dict)
             or set(document) != {"schema_version", "entries"}
-            or document["schema_version"] != _CACHE_SCHEMA_VERSION
             or not isinstance(document["entries"], dict)
         ):
+            raise BrokerIdentityError("broker identity cache fields are invalid")
+        if document["schema_version"] == _LEGACY_CACHE_SCHEMA_VERSION:
+            # Prompt v1 discarded the model's broker-specific search value and
+            # cached only the broad brand. Refresh those entries once under v2.
+            return {}
+        if document["schema_version"] != _CACHE_SCHEMA_VERSION:
             raise BrokerIdentityError("broker identity cache fields are invalid")
         entries: dict[str, dict[str, object]] = {}
         for key, raw in document["entries"].items():
@@ -283,8 +309,13 @@ class OpenAIBrokerIdentityProvider:
                     "content": (
                         "Identify the exact broker or prop-firm brand for the supplied MetaTrader "
                         "server identifier. Search public sources and prefer official evidence. "
-                        "Do not infer from a similar name. Return HIGH or MEDIUM confidence only "
-                        "when the exact server is supported by the cited sources."
+                        "Return broker_label as the canonical brand and search_text as the most "
+                        "specific broker-family text to enter in MetaTrader Find Your Broker. "
+                        "Preserve meaningful entity or region suffixes from the server identifier "
+                        "(for example PepperstoneUK-Live means broker_label Pepperstone and "
+                        "search_text PepperstoneUK), but omit environment suffixes such as Live "
+                        "or Demo. Do not infer from a similar name. Return HIGH or MEDIUM "
+                        "confidence only when the exact server is supported by the cited sources."
                     ),
                 },
                 {
@@ -341,13 +372,13 @@ class OpenAIBrokerIdentityProvider:
         if not claimed or any(url not in observed for url in claimed):
             raise BrokerIdentityError("broker identity provenance is unverified")
         broker_label = _label(payload.get("broker_label"), "broker label")
+        search_text = _label(payload.get("search_text"), "search text")
         return _validated_suggestion(
             BrokerIdentitySuggestion(
                 broker_label=broker_label,
-                # The GUI search value is not an independent model claim. Deriving it from the
-                # already validated identity makes the cache deterministic and avoids accepting
-                # arbitrary display text that has no bearing on endpoint verification.
-                search_text=broker_label,
+                # This value only narrows the credential-free wizard search. The wizard still
+                # requires an exact expected-server match before the candidate can be accepted.
+                search_text=search_text,
                 confidence=str(payload.get("confidence") or ""),
                 source_urls=claimed,
                 generated_at_unix_ms=int(time.time() * 1000),

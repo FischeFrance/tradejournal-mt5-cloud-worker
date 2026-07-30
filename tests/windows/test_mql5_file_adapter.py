@@ -66,7 +66,12 @@ def test_reads_versioned_snapshots_and_preserves_sync_interface(tmp_path: Path) 
     adapter = _ready_adapter(tmp_path)
     assert adapter.verify_identity() == {"login": "42", "server": "Demo-Server"}
     assert adapter.terminal_info().connected is True
-    assert adapter.account_info().trade_allowed is False
+    account = adapter.account_info()
+    assert account.trade_allowed is False
+    assert account.balance == 100.0
+    assert account.equity == 101.0
+    assert account.currency == "USD"
+    assert account.leverage == 100
     snapshot = adapter.snapshot()
     assert set(snapshot) == {"positions", "orders", "deals"}
     assert list(snapshot["deals"]) == ["3"]
@@ -144,7 +149,15 @@ def test_rejects_identity_mismatch_and_keeps_checkpoint_bounded(tmp_path: Path) 
     _write(
         adapter.files_dir,
         "account.json",
-        {"login": "42", "server": "Demo-Server", "trade_allowed": False},
+        {
+            "login": "42",
+            "server": "Demo-Server",
+            "balance": 100.0,
+            "equity": 101.0,
+            "currency": "USD",
+            "leverage": 100,
+            "trade_allowed": False,
+        },
         sequence=44,
     )
     _write(

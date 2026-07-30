@@ -127,6 +127,21 @@ def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text
 
 
+def test_bridge_keeps_only_the_chart_that_hosts_the_readonly_ea():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    cleanup = text[text.index("bool CloseOtherCharts()"):text.index("//+------------------------------------------------------------------------+", text.index("bool CloseOtherCharts()"))]
+    on_init = text[text.index("int OnInit()"):text.index("void OnDeinit")]
+
+    assert "long current_chart = ChartID();" in cleanup
+    assert "long chart = ChartFirst();" in cleanup
+    assert "long next_chart = ChartNext(chart);" in cleanup
+    assert "if(chart != current_chart)" in cleanup
+    assert "if(!ChartClose(chart))" in cleanup
+    assert "if(!CloseOtherCharts())" in on_init
+    assert "return(INIT_FAILED);" in on_init
+    assert 'WriteInitMarker("single-chart-ready");' in on_init
+
+
 def test_discovery_script_only_waits_for_account_connection():
     text = (MT5_EXPERTS_DIR / "TradeJournalDiscovery.mq5").read_text(encoding="utf-8")
     assert "void OnStart()" in text

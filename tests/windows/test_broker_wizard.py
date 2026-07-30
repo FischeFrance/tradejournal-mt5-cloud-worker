@@ -18,12 +18,13 @@ from windows_agent.broker_wizard import (
 
 def _wizard_document(run_id: str) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "status": "SUCCESS",
         "failure_reason": None,
         "expected_server_name": "GoatFunded-Server3",
         "selected_broker_label": "Goat Funded Trader",
+        "selected_broker_labels": ["Goat Funded Trader", "GoatFunded"],
         "censused_server_names": [
             "GoatFunded-Server",
             "GoatFunded-Server2",
@@ -49,6 +50,7 @@ def test_load_wizard_evidence_accepts_exact_server_and_verifies_digest(tmp_path)
     )
 
     assert evidence.selected_broker_label == "Goat Funded Trader"
+    assert evidence.selected_broker_labels == ("Goat Funded Trader", "GoatFunded")
     assert evidence.terminal_pid == 4321
     assert evidence.artifact_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -96,6 +98,30 @@ def test_load_wizard_evidence_rejects_invalid_or_secret_bearing_output(
         )
 
 
+def test_failed_wizard_evidence_preserves_only_sanitized_reason(tmp_path):
+    run_id = str(uuid4())
+    document = _wizard_document(run_id)
+    document.update(
+        status="FAILED",
+        failure_reason="server_not_found",
+        selected_broker_label=None,
+        censused_server_names=[],
+    )
+    path = tmp_path / "wizard-result.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(BrokerWizardError) as exc_info:
+        load_wizard_evidence(
+            path,
+            expected_run_id=run_id,
+            expected_server_name="GoatFunded-Server3",
+        )
+
+    assert str(exc_info.value) == "wizard did not succeed"
+    assert exc_info.value.failure_reason == "server_not_found"
+    assert exc_info.value.detail_code == "wizard_server_not_found"
+
+
 def test_write_login_verification_artifact_is_atomic_and_contains_no_secret(tmp_path):
     wizard_path = tmp_path / "wizard-result.json"
     wizard_path.write_text("{}", encoding="utf-8")
@@ -121,7 +147,8 @@ def test_write_login_verification_artifact_is_atomic_and_contains_no_secret(tmp_
     assert payload["login_verified"] is True
     assert payload["investor_read_only_verified"] is True
     assert payload["verification_pid"] == 9876
-    assert payload["wizard_artifact_sha256"] == evidence.artifact_sha256
+    assert payload["provenance_kind"] == "BROKER_WIZARD"
+    assert payload["provenance_artifact_sha256"] == evidence.artifact_sha256
     assert digest == hashlib.sha256(artifact_path.read_bytes()).hexdigest()
     serialized = artifact_path.read_text(encoding="utf-8").lower()
     assert "password" not in serialized

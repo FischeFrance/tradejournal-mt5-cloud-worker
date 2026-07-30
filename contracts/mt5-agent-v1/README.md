@@ -16,6 +16,7 @@ local digest and byte-for-byte equality with a checked-out peer repository.
 
 - `tradejournal-drp/supabase/functions/trading-agent/index.ts` (routes, request/response shapes)
 - `tradejournal-drp/supabase/migrations/20260715135432_mt5_agent_control_plane.sql` (job_type, history_mode, status enums)
+- `tradejournal-drp/supabase/migrations/20260729130000_mt5_job_progress_events.sql` (lease-bound progress events)
 
 If you change the Edge Function's request/response shape, update `schema.json` and
 `fixtures.json` here FIRST, copy both files into the other repository, then update
@@ -51,6 +52,16 @@ on this shape:
   `mt5_login`/`mt5_server`/`mt5_broker_label`/`mt5_endpoint`/`mt5_investor_password`
   it already persisted to DPAPI during the
   connection's original `provision` job.
+
+## Progress
+
+`POST jobs/{job_id}/progress` accepts only an allowlisted phase, phase status, and optional
+machine-readable detail code. It never accepts arbitrary metadata or free text. The database
+checks the active agent lease atomically and makes duplicate delivery idempotent.
+
+Deploy the additive database/Edge contract before deploying an Agent that emits progress.
+Older Agents remain compatible because the existing claim, heartbeat, and transition routes do
+not change.
 
 ## Versioning
 

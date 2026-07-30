@@ -9,6 +9,7 @@ delivery semantics instead of a second, parallel implementation.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +50,32 @@ class TradingIngestionSink:
         if result.status != "sent":
             raise RuntimeError("ingestion delivery was not acknowledged")
 
-    def send_heartbeat(self) -> bool:
-        result = self._sender.send({"event_type": "heartbeat"})
+    def send_heartbeat(self, account_info: Any | None = None) -> bool:
+        payload: dict[str, Any] = {"event_type": "heartbeat"}
+        if account_info is not None:
+            balance = float(getattr(account_info, "balance"))
+            equity = float(getattr(account_info, "equity"))
+            currency = str(getattr(account_info, "currency")).strip().upper()
+            leverage = getattr(account_info, "leverage")
+            if (
+                not math.isfinite(balance)
+                or not math.isfinite(equity)
+                or not currency.isalnum()
+                or not 3 <= len(currency) <= 12
+                or not isinstance(leverage, int)
+                or isinstance(leverage, bool)
+                or not 1 <= leverage <= 1_000_000
+            ):
+                raise ValueError("invalid account snapshot")
+            payload.update(
+                {
+                    "balance": balance,
+                    "equity": equity,
+                    "currency": currency,
+                    "leverage": leverage,
+                }
+            )
+        result = self._sender.send(payload)
         if result.status == "failed":
             logger.warning("live_sync heartbeat delivery failed (error=%s)", result.error)
             return False

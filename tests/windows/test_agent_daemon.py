@@ -64,3 +64,34 @@ def test_default_handlers_raise_not_implemented():
             assert name in str(exc)
         else:
             raise AssertionError(f"{name} handler should have raised NotImplementedError")
+
+
+def test_run_forever_starts_and_stops_background_worker(tmp_path):
+    api = QueueApi([])
+    started = threading.Event()
+    stopped = threading.Event()
+
+    def background_worker(stop_event):
+        started.set()
+        stop_event.wait()
+        stopped.set()
+
+    runner = JobRunner(
+        tmp_path / "state.json",
+        api,
+        default_handlers(),
+        background_workers=(background_worker,),
+    )
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=run_forever,
+        args=(runner, 0.01, stop_event),
+    )
+    thread.start()
+
+    assert started.wait(timeout=1)
+    stop_event.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert stopped.is_set()

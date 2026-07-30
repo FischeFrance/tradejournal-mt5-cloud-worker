@@ -5,13 +5,11 @@ import hashlib
 import json
 import logging
 import os
-import socket
 import shutil
 import subprocess
 import sys
 import time
-from uuid import UUID
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -32,6 +30,8 @@ class NativeMt5Status:
     account: dict[str, Any]
     heartbeat: dict[str, Any]
     files_path: Path
+    requested_server: str | None = None
+    effective_server: str | None = None
 
 
 class NativeMt5Runtime:
@@ -40,6 +40,8 @@ class NativeMt5Runtime:
     This route deliberately does not import the MetaTrader5 Python wheel.  It is
     compatible with terminal builds whose Python IPC is temporarily broken.
     """
+
+    _MANAGED_CHART_PROFILE = "TradeJournal"
 
     def __init__(self, instance_root: Path, connection_id: str) -> None:
         self.root = instance_root.resolve()
@@ -165,145 +167,6 @@ class NativeMt5Runtime:
         durable_replace(temporary, destination)
         return destination
 
-    @staticmethod
-    def _read_assistant_config(path: Path) -> tuple[str, str]:
-        raw = path.read_bytes()
-        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-            encoding = "utf-16"
-        elif raw.startswith(b"\xef\xbb\xbf"):
-            encoding = "utf-8-sig"
-        else:
-            encoding = "utf-8"
-        return raw.decode(encoding), encoding
-
-    @classmethod
-    def _assistant_mcp_ports(cls, path: Path) -> tuple[int, int] | None:
-        try:
-            content, _ = cls._read_assistant_config(path)
-        except (OSError, UnicodeDecodeError):
-            return None
-        ports: dict[str, int] = {}
-        section = ""
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if line.startswith("[") and line.endswith("]"):
-                section = line.casefold()
-                continue
-            if not line.casefold().startswith("endpoint="):
-                continue
-            if section not in ("[mcp.metaeditor]", "[mcp.metatrader]"):
-                continue
-            prefix = "endpoint=http://127.0.0.1:"
-            suffix = "/mcp"
-            if not line.casefold().startswith(prefix) or not line.casefold().endswith(suffix):
-                return None
-            raw_port = line[len(prefix) : -len(suffix)]
-            if not raw_port.isdigit():
-                return None
-            port = int(raw_port)
-            if not 1 <= port <= 65535:
-                return None
-            ports[section] = port
-        if set(ports) != {"[mcp.metaeditor]", "[mcp.metatrader]"}:
-            return None
-        return ports["[mcp.metaeditor]"], ports["[mcp.metatrader]"]
-
-    @staticmethod
-    def _ports_are_bindable(ports: tuple[int, int]) -> bool:
-        sockets: list[socket.socket] = []
-        try:
-            for port in ports:
-                candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sockets.append(candidate)
-                candidate.bind(("127.0.0.1", port))
-            return True
-        except OSError:
-            return False
-        finally:
-            for candidate in sockets:
-                candidate.close()
-
-    def _reserved_mcp_ports(self) -> set[int]:
-        reserved: set[int] = set()
-        instances_root = self.root.parent
-        try:
-            children = tuple(instances_root.iterdir())
-        except OSError as exc:
-            raise NativeMt5Error("mcp_port_inventory_failed") from exc
-        for child in children:
-            if child == self.root:
-                continue
-            try:
-                UUID(child.name)
-            except ValueError:
-                continue
-            if child.is_symlink() or not child.is_dir():
-                raise NativeMt5Error("mcp_port_inventory_invalid")
-            ports = self._assistant_mcp_ports(
-                child / "terminal" / "Config" / "assistant.ini"
-            )
-            if ports is not None:
-                reserved.update(ports)
-        return reserved
-
-    def _allocate_mcp_ports(self, reserved: set[int]) -> tuple[int, int]:
-        pair_count = 15_000
-        offset = int(UUID(self.connection_id)) % pair_count
-        for step in range(pair_count):
-            pair_index = (offset + step) % pair_count
-            ports = (30_000 + pair_index * 2, 30_001 + pair_index * 2)
-            if any(port in reserved for port in ports):
-                continue
-            if self._ports_are_bindable(ports):
-                return ports
-        raise NativeMt5Error("mcp_port_allocation_failed")
-
-    def _ensure_mcp_endpoint_isolation(self) -> tuple[int, int]:
-        path = self.terminal_root / "Config" / "assistant.ini"
-        if path.is_symlink() or not path.is_file():
-            raise NativeMt5Error("assistant_config_invalid")
-        reserved = self._reserved_mcp_ports()
-        current = self._assistant_mcp_ports(path)
-        if (
-            current is not None
-            and 30_000 <= current[0] <= 59_998
-            and current[1] == current[0] + 1
-            and not any(port in reserved for port in current)
-            and self._ports_are_bindable(current)
-        ):
-            return current
-        ports = self._allocate_mcp_ports(reserved)
-        try:
-            content, encoding = self._read_assistant_config(path)
-        except (OSError, UnicodeDecodeError) as exc:
-            raise NativeMt5Error("assistant_config_invalid") from exc
-        updated: list[str] = []
-        section = ""
-        replacements: set[str] = set()
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-            if line.startswith("[") and line.endswith("]"):
-                section = line.casefold()
-            if line.casefold().startswith("endpoint="):
-                if section == "[mcp.metaeditor]":
-                    raw_line = f"Endpoint=http://127.0.0.1:{ports[0]}/mcp"
-                    replacements.add(section)
-                elif section == "[mcp.metatrader]":
-                    raw_line = f"Endpoint=http://127.0.0.1:{ports[1]}/mcp"
-                    replacements.add(section)
-            updated.append(raw_line)
-        if replacements != {"[mcp.metaeditor]", "[mcp.metatrader]"}:
-            raise NativeMt5Error("assistant_config_invalid")
-        temporary = path.with_suffix(".ini.tmp")
-        try:
-            self._write_text_durable(
-                temporary, "\n".join(updated) + "\n", encoding
-            )
-            durable_replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return ports
-
     def _bridge_template_symbol(self) -> str:
         path = self.files / "TradeJournalBridge.tpl"
         try:
@@ -322,12 +185,22 @@ class NativeMt5Runtime:
             raise NativeMt5Error("bridge_template_invalid")
         return symbols[0]
 
-    def _reset_default_chart_profile(self) -> int:
-        """Remove generated chart state while the isolated terminal is stopped."""
+    def _reset_managed_chart_profile(self) -> int:
+        """Keep the dedicated MT5 profile empty while the isolated terminal is stopped."""
         if self._running_terminal_pids():
             raise NativeMt5Error("chart_profile_in_use")
-        profile = self.terminal_root / "Profiles" / "Charts" / "Default"
+        profiles = self.terminal_root / "Profiles" / "Charts"
         try:
+            profiles_stat = os.lstat(profiles)
+            if (
+                profiles.is_symlink()
+                or not profiles.is_dir()
+                or bool(getattr(profiles_stat, "st_file_attributes", 0) & 0x400)
+            ):
+                raise NativeMt5Error("chart_profile_invalid")
+            profile = profiles / self._MANAGED_CHART_PROFILE
+            if not profile.exists():
+                profile.mkdir()
             profile_stat = os.lstat(profile)
             if (
                 profile.is_symlink()
@@ -397,14 +270,17 @@ class NativeMt5Runtime:
         if password is not None:
             common.append(f"Password={password}")
         common.extend((f"KeepPrivate={int(keep_private)}", "NewsEnable=0", ""))
+        charts = [
+            "[Charts]",
+            f"ProfileLast={self._MANAGED_CHART_PROFILE}",
+            "PreloadCharts=0",
+            "",
+        ]
         if script_name is not None:
             # A script receives OnStart even while MT5 is completing the account switch. It waits
             # for the authorized session and then attaches the real EA through a chart template.
             sections = [
-                "[Charts]",
-                "ProfileLast=Default",
-                "PreloadCharts=1",
-                "",
+                *charts,
                 "[Experts]",
                 "Enabled=1",
                 "AllowLiveTrading=0",
@@ -425,10 +301,7 @@ class NativeMt5Runtime:
             # Passing an absolute EX5 path leaves the chart open but does not reliably attach
             # the EA in portable installations.
             sections = [
-                "[Charts]",
-                "ProfileLast=Default",
-                "PreloadCharts=1",
-                "",
+                *charts,
                 "[Experts]",
                 "Enabled=1",
                 "AllowLiveTrading=0",
@@ -447,6 +320,7 @@ class NativeMt5Runtime:
             # A chart forces MT5 to hydrate the broker/account caches, but no Expert is attached
             # during this warm-up phase.
             sections = [
+                *charts,
                 "[Experts]",
                 "Enabled=0",
                 "AllowLiveTrading=0",
@@ -462,6 +336,7 @@ class NativeMt5Runtime:
             # here reintroduces the build-6032 first-start hang that this two-phase bootstrap
             # deliberately avoids.
             sections = [
+                *charts,
                 "[Experts]",
                 "Enabled=0",
                 "AllowLiveTrading=0",
@@ -659,11 +534,12 @@ class NativeMt5Runtime:
         login: int,
         server: str,
         timeout: float,
-    ) -> None:
+        connection_endpoint: str | None = None,
+    ) -> str:
         deadline = time.monotonic() + timeout
         seen_process = False
         expected_login = f"'{login}'"
-        expected_server = server.casefold()
+        expected_endpoint = (connection_endpoint or "").strip().casefold()
         while time.monotonic() < deadline:
             self._check_cancelled()
             lines = self._journal_lines_since(checkpoint)
@@ -671,13 +547,43 @@ class NativeMt5Runtime:
                 folded = line.casefold()
                 if "invalid account" in folded:
                     raise NativeMt5Error("authorization_failed")
-                if (
-                    "authorized on" in folded
-                    and expected_server in folded
-                    and expected_login in line
-                ):
+                if expected_endpoint and expected_endpoint in folded:
+                    if (
+                        "connection to" in folded
+                        and "failed" in folded
+                    ):
+                        raise NativeMt5Error("endpoint_connection_failed")
+                    if (
+                        "connection refused" in folded
+                        or "actively refused" in folded
+                    ):
+                        raise NativeMt5Error("endpoint_connection_refused")
+                    if (
+                        "protocol mismatch" in folded
+                        or "unsupported protocol" in folded
+                    ):
+                        raise NativeMt5Error(
+                            "endpoint_protocol_incompatible"
+                        )
+                    if (
+                        "server not found" in folded
+                        or "unknown server" in folded
+                    ):
+                        raise NativeMt5Error(
+                            "endpoint_server_unrecognized"
+                        )
+                if "authorized on" in folded and expected_login in line:
+                    marker = folded.find("authorized on")
+                    reported_server = line[
+                        marker + len("authorized on") :
+                    ].strip()
+                    through = reported_server.casefold().find(" through ")
+                    if through >= 0:
+                        reported_server = reported_server[:through].strip()
+                    if not reported_server:
+                        continue
                     self._release_interactive_task()
-                    return
+                    return reported_server
 
             pids = self._running_terminal_pids()
             if pids:
@@ -786,6 +692,7 @@ class NativeMt5Runtime:
         if os.name == "nt" and not interactive_user:
             raise NativeMt5Error("dedicated_interactive_user_required")
         if interactive_user:
+            self._wait_for_interactive_session(interactive_user)
             self._prepare_interactive_runtime_acl(interactive_user)
             launcher = self.state / "launch-terminal.cmd"
             launcher_content = (
@@ -824,6 +731,49 @@ class NativeMt5Runtime:
         )
         return self._process
 
+    @staticmethod
+    def _interactive_session_present(interactive_user: str) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import win32ts
+        except ImportError as exc:
+            raise NativeMt5Error("interactive_session_probe_unavailable") from exc
+        expected = interactive_user.casefold()
+        try:
+            sessions = win32ts.WTSEnumerateSessions(None, 1, 0)
+            for session in sessions:
+                if session.get("State") not in (
+                    win32ts.WTSActive,
+                    win32ts.WTSDisconnected,
+                ):
+                    continue
+                observed = win32ts.WTSQuerySessionInformation(
+                    None,
+                    int(session["SessionId"]),
+                    win32ts.WTSUserName,
+                )
+                if isinstance(observed, str) and observed.casefold() == expected:
+                    return True
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise NativeMt5Error("interactive_session_probe_failed") from exc
+        return False
+
+    def _wait_for_interactive_session(
+        self,
+        interactive_user: str,
+        timeout: float = 90.0,
+    ) -> None:
+        """Allow secure Windows autologon to finish before a reboot recovery launch."""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            if self._interactive_session_present(interactive_user):
+                return
+            time.sleep(0.5)
+        raise NativeMt5Error("interactive_session_unavailable")
+
     def _release_interactive_task(self) -> None:
         """Delete a successful one-shot launcher without stopping its MT5 child."""
         task = self._interactive_task
@@ -843,6 +793,186 @@ class NativeMt5Runtime:
             (self.state / "launch-terminal.cmd").unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _terminal_process_identity(self, pid: int) -> tuple[Path, int]:
+        try:
+            import psutil
+        except ImportError as exc:
+            raise NativeMt5Error("terminal_window_identity_failed") from exc
+        try:
+            process = psutil.Process(pid)
+            executable = Path(process.exe()).resolve()
+            creation_time_unix_ms = int(process.create_time() * 1000)
+        except (psutil.Error, OSError, ValueError) as exc:
+            raise NativeMt5Error("terminal_window_identity_failed") from exc
+        if executable != self.terminal.resolve() or creation_time_unix_ms <= 0:
+            raise NativeMt5Error("terminal_window_identity_failed")
+        return executable, creation_time_unix_ms
+
+    def set_terminal_window_visibility(
+        self,
+        pid: int,
+        *,
+        visible: bool,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Change only this terminal's windows in its dedicated interactive session."""
+        interactive_user = self._interactive_user()
+        if not interactive_user:
+            raise NativeMt5Error("dedicated_interactive_user_required")
+        executable, creation_time_unix_ms = self._terminal_process_identity(pid)
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "windows"
+            / "Set-Mt5WindowVisibility.ps1"
+        )
+        if not source.is_file():
+            raise NativeMt5Error("terminal_window_helper_missing")
+
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.files.mkdir(parents=True, exist_ok=True)
+        helper = self.state / "set-mt5-window-visibility.ps1"
+        helper_temporary = helper.with_suffix(".ps1.tmp")
+        request = self.state / "window-visibility-request.json"
+        request_temporary = request.with_suffix(".json.tmp")
+        result = self.files / "window-visibility-result.json"
+        result_temporary = result.with_suffix(".json.tmp")
+        launcher = self.state / "set-window-visibility.cmd"
+        task = f"TradeJournalMT5-Window-{self.connection_id}"
+        action = "show" if visible else "hide"
+        task_created = False
+        cleanup_failed = False
+        try:
+            source_digest = self._sha256(source)
+            shutil.copy2(source, helper_temporary)
+            with helper_temporary.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            if self._sha256(helper_temporary) != source_digest:
+                raise NativeMt5Error("terminal_window_helper_integrity_failed")
+            durable_replace(helper_temporary, helper)
+            self._grant_interactive_acl(helper, interactive_user, "(RX)")
+
+            payload = {
+                "schema_version": 1,
+                "process_id": pid,
+                "creation_time_unix_ms": creation_time_unix_ms,
+                "expected_executable": str(executable),
+                "action": action,
+            }
+            self._write_text_durable(
+                request_temporary,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                "utf-8",
+            )
+            durable_replace(request_temporary, request)
+            self._restrict_private_acl(request, "(R)")
+            result.unlink(missing_ok=True)
+            result_temporary.unlink(missing_ok=True)
+
+            launcher_content = (
+                "@echo off\r\n"
+                "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                f'-File "{helper}" -RequestPath "{request}" -ResultPath "{result}"\r\n'
+                "exit /b %ERRORLEVEL%\r\n"
+            )
+            self._write_text_durable(launcher, launcher_content, "utf-8")
+            self._grant_interactive_acl(launcher, interactive_user, "(RX)")
+
+            create = [
+                "schtasks",
+                "/Create",
+                "/TN",
+                task,
+                "/SC",
+                "ONCE",
+                "/ST",
+                "23:59",
+                "/RU",
+                interactive_user,
+                "/IT",
+                "/RL",
+                "LIMITED",
+                "/TR",
+                str(launcher),
+                "/F",
+            ]
+            completed = subprocess.run(
+                create, capture_output=True, text=True, check=False
+            )
+            if completed.returncode != 0:
+                raise NativeMt5Error("terminal_window_task_create_failed")
+            task_created = True
+            completed = subprocess.run(
+                ["schtasks", "/Run", "/TN", task],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise NativeMt5Error("terminal_window_task_run_failed")
+
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not result.is_file():
+                self._check_cancelled()
+                time.sleep(0.1)
+            record = self._read_json(result) if result.is_file() else None
+            if (
+                record is None
+                or record.get("schema_version") != 1
+                or record.get("success") is not True
+                or record.get("action") != action
+                or record.get("process_id") != pid
+                or record.get("creation_time_unix_ms")
+                != creation_time_unix_ms
+                or not isinstance(record.get("windows_matched"), int)
+                or record["windows_matched"] < 1
+                or not isinstance(record.get("visible_after"), int)
+                or (visible and record["visible_after"] < 1)
+                or (not visible and record["visible_after"] != 0)
+            ):
+                raise NativeMt5Error("terminal_window_visibility_failed")
+            return record
+        finally:
+            if task_created:
+                subprocess.run(
+                    ["schtasks", "/End", "/TN", task],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                completed = subprocess.run(
+                    ["schtasks", "/Delete", "/TN", task, "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                cleanup_failed = completed.returncode != 0
+            for path in (
+                helper_temporary,
+                helper,
+                request_temporary,
+                request,
+                result_temporary,
+                result,
+                launcher,
+            ):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    cleanup_failed = True
+            if cleanup_failed and sys.exc_info()[0] is None:
+                raise NativeMt5Error("terminal_window_cleanup_failed")
+
+    def _ready_status(
+        self,
+        pid: int,
+        account: dict[str, Any],
+        heartbeat: dict[str, Any],
+    ) -> NativeMt5Status:
+        self._release_interactive_task()
+        self.set_terminal_window_visibility(pid, visible=False)
+        return NativeMt5Status(pid, account, heartbeat, self.files)
 
     def _wait_for_heartbeat(
         self, timeout: float, login: int | None = None, server: str | None = None
@@ -876,8 +1006,7 @@ class NativeMt5Runtime:
                 time.sleep(1)
                 continue
             if login is None:
-                self._release_interactive_task()
-                return NativeMt5Status(pid, account or {}, heartbeat, self.files)
+                return self._ready_status(pid, account or {}, heartbeat)
             if account is None:
                 time.sleep(1)
                 continue
@@ -894,8 +1023,7 @@ class NativeMt5Runtime:
                 continue
             if bool(account.get("trade_allowed", True)):
                 raise NativeMt5Error("investor_readonly_not_verified")
-            self._release_interactive_task()
-            return NativeMt5Status(pid, account, heartbeat, self.files)
+            return self._ready_status(pid, account, heartbeat)
         logger.error(
             "native MT5 runtime: heartbeat.json never appeared within %.0fs "
             "(connection_id=%s, symbol=%s) -- check whether that symbol exists in this "
@@ -940,13 +1068,13 @@ class NativeMt5Runtime:
         expert_binary: Path,
         history_mode: str = "new_only",
         symbol: str = "EURUSD",
-        # The second phase can legitimately spend ~144s on the build-6032 first-run MQL5
-        # compilation before StartUp attaches the bridge.
-        timeout: float = 240.0,
+        # The bounded investor-proof window starts only after authentication succeeded.
+        # It is intentionally separate from short boot/readiness checks: a broker may take
+        # time to emit its journal state, but we never start the EA without that proof.
+        timeout: float = 300.0,
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
-        self._ensure_mcp_endpoint_isolation()
         symbol = self._startup_symbol(symbol)
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
@@ -970,13 +1098,25 @@ class NativeMt5Runtime:
             gc.collect()
             checkpoint = self._journal_checkpoint()
             self._start_process(bootstrap)
-            self._wait_for_authorization(checkpoint, login, server, min(timeout, 120.0))
+            observed_server = self._wait_for_authorization(
+                checkpoint,
+                login,
+                server,
+                min(timeout, 120.0),
+                startup_server,
+            )
+            effective_server = (
+                observed_server.strip()
+                if isinstance(observed_server, str)
+                and observed_server.strip()
+                else server
+            )
             self._wait_for_account_database(min(timeout, 15.0))
             self._secure_delete_config(bootstrap)
             bootstrap = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
-            self._reset_default_chart_profile()
+            self._reset_managed_chart_profile()
 
             # Phase 2: open a credential-free discovery chart so MT5 hydrates the broker symbol
             # catalogue. Once investor synchronization is proven, the in-terminal MQL5 script
@@ -996,15 +1136,20 @@ class NativeMt5Runtime:
             self._write_symbol_preference(symbol)
             checkpoint = self._journal_checkpoint()
             self._start_process(discovery, login)
-            self._wait_for_authorization(checkpoint, login, server, min(timeout, 120.0))
-            self._wait_for_investor_sync(checkpoint, login, min(timeout, 120.0))
+            self._wait_for_authorization(
+                checkpoint,
+                login,
+                effective_server,
+                min(timeout, 120.0),
+            )
+            self._wait_for_investor_sync(checkpoint, login, min(timeout, 300.0))
             symbol = self._probe_broker_symbol(symbol)
             self._last_symbol = symbol
             self._secure_delete_config(discovery)
             discovery = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
-            self._reset_default_chart_profile()
+            self._reset_managed_chart_profile()
 
             # Phase 3: start passwordlessly on the persisted account. A read-only script receives
             # OnStart immediately, waits for the account to be synchronized, then applies the
@@ -1024,9 +1169,25 @@ class NativeMt5Runtime:
             )
             checkpoint = self._journal_checkpoint()
             self._start_process(startup, login)
-            self._wait_for_authorization(checkpoint, login, server, min(timeout, 120.0))
+            self._wait_for_authorization(
+                checkpoint,
+                login,
+                effective_server,
+                min(timeout, 120.0),
+            )
             self._wait_for_investor_sync(checkpoint, login, min(timeout, 120.0))
-            return self._wait_for_heartbeat(min(timeout, 90.0), login, server)
+            status = self._wait_for_heartbeat(
+                min(timeout, 90.0),
+                login,
+                effective_server,
+            )
+            if effective_server.casefold() == server.casefold():
+                return status
+            return replace(
+                status,
+                requested_server=server,
+                effective_server=effective_server,
+            )
         except Exception:
             # A failed bootstrap has no consumer yet, so its isolated terminal must not be
             # retained. Successful starts deliberately remain alive for history/live sync.
@@ -1051,12 +1212,11 @@ class NativeMt5Runtime:
         """Resume a previously provisioned account without reusing a plaintext password."""
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
-        self._ensure_mcp_endpoint_isolation()
         symbol = self._bridge_template_symbol()
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
         self._remove_readiness_files()
-        self._reset_default_chart_profile()
+        self._reset_managed_chart_profile()
         config = self._write_startup_config(
             login,
             server,
@@ -1092,7 +1252,7 @@ class NativeMt5Runtime:
         self._last_symbol = symbol
         self.install_expert(expert_binary, "new_only")
         self._install_bridge_template(symbol)
-        self._reset_default_chart_profile()
+        self._reset_managed_chart_profile()
         config = self._write_startup_config(None, None, None, symbol)
         try:
             self._start_process(config)
@@ -1141,12 +1301,40 @@ class NativeMt5Runtime:
         except ImportError:
             return False
         try:
-            candidates = [psutil.Process(pid) for pid in pids]
+            # A terminal can naturally disappear between the executable scan above and
+            # Process(pid).  That is already a successful cleanup, not a failure.
+            candidates = []
+            for pid in pids:
+                try:
+                    candidates.append(psutil.Process(pid))
+                except psutil.NoSuchProcess:
+                    continue
+
             for candidate in candidates:
-                candidate.terminate()
+                try:
+                    candidate.terminate()
+                except psutil.NoSuchProcess:
+                    continue
+
             _, alive = psutil.wait_procs(candidates, timeout=timeout)
+            kill_candidates = []
             for candidate in alive:
-                candidate.kill()
+                try:
+                    candidate.kill()
+                    kill_candidates.append(candidate)
+                except psutil.NoSuchProcess:
+                    continue
+
+            # kill() is asynchronous on Windows.  Do not immediately rescan and turn
+            # that normal termination race into terminal_stop_failed.
+            if kill_candidates:
+                _, still_alive = psutil.wait_procs(
+                    kill_candidates,
+                    timeout=min(5.0, timeout),
+                )
+                if still_alive:
+                    return False
             return not self._running_terminal_pids() and not self._running_metaeditor_pids()
-        except (psutil.Error, OSError):
+        except (psutil.AccessDenied, OSError):
+            # Fail closed only when the exact instance process cannot be controlled.
             return False

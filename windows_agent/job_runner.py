@@ -72,9 +72,13 @@ class JobRunner:
         api: Any,
         handlers: dict[str, Callable[[dict], dict]],
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        background_workers: tuple[
+            Callable[[threading.Event], None], ...
+        ] = (),
     ) -> None:
         self.state, self.api, self.handlers = state, api, handlers
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.background_workers = background_workers
 
     def run_once(self) -> bool:
         job = self.api.claim()

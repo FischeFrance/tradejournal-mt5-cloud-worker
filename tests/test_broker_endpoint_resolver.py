@@ -28,15 +28,16 @@ def _fixture(tmp_path: Path, *, status: str = "VERIFIED") -> tuple[Path, Path, P
         encoding="utf-8",
     )
     registry = tmp_path / "endpoint-registry.json"
+    invalidated = status in {"INVALID", "SUPERSEDED"}
     registry.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 3,
                 "updated_at_unix_ms": 1_000_000,
-                "ttl_seconds": 100,
                 "brokers": {
                     "FPMTrading": [
                         {
+                            "server_name": "FPMTrading-Live",
                             "host": "188.42.136.4",
                             "port": 443,
                             "protocol": "TCP/TLS",
@@ -44,10 +45,24 @@ def _fixture(tmp_path: Path, *, status: str = "VERIFIED") -> tuple[Path, Path, P
                             "observed_at_unix_ms": 1_000_000,
                             "discovery_method": "MT5_LOGIN_DIALOG_IP",
                             "verification_pid": 4800,
+                            "process_creation_time_unix_ms": 999_000,
                             "verification_session_id": RUN_ID,
                             "confidence": "MEDIUM",
                             "artifact_relative_path": artifact.name,
                             "artifact_sha256": digest,
+                            "invalidated_at_unix_ms": (
+                                1_000_001 if invalidated else None
+                            ),
+                            "invalidation_reason": (
+                                "SUPERSEDED_BY_NEW_VERIFICATION"
+                                if status == "SUPERSEDED"
+                                else "ENDPOINT_CONNECTION_FAILED"
+                                if status == "INVALID"
+                                else None
+                            ),
+                            "invalidation_event_id": (
+                                RUN_ID if invalidated else None
+                            ),
                         }
                     ]
                 },
@@ -63,9 +78,9 @@ def _resolve(tmp_path: Path, registry: Path, manifest: Path):
     return resolve_verified_broker_endpoint(
         registry,
         broker_label="FPM Trading",
+        server_name="FPMTrading-Live",
         artifact_root=tmp_path,
         artifact_manifest=manifest,
-        now_unix_ms=1_000_001,
     )
 
 
@@ -77,23 +92,38 @@ def test_resolves_one_verified_endpoint_with_independent_provenance(tmp_path: Pa
     assert endpoint.confidence == "MEDIUM"
 
 
-@pytest.mark.parametrize("status", ["CANDIDATE", "METAQUOTES_CDN", "EXPIRED"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        "CANDIDATE",
+        "METAQUOTES_CDN",
+        "INVALID",
+        "SUPERSEDED",
+    ],
+)
 def test_non_verified_status_never_resolves(tmp_path: Path, status: str) -> None:
     registry, manifest, _ = _fixture(tmp_path, status=status)
     with pytest.raises(BrokerEndpointResolutionError, match="missing or ambiguous"):
         _resolve(tmp_path, registry, manifest)
 
 
-def test_expired_or_multiple_verified_endpoint_is_rejected(tmp_path: Path) -> None:
+def test_verified_endpoint_does_not_expire_with_time(tmp_path: Path) -> None:
     registry, manifest, _ = _fixture(tmp_path)
-    with pytest.raises(BrokerEndpointResolutionError, match="missing or ambiguous"):
-        resolve_verified_broker_endpoint(
-            registry,
-            broker_label="FPMTrading",
-            artifact_root=tmp_path,
-            artifact_manifest=manifest,
-            now_unix_ms=1_100_001,
-        )
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["updated_at_unix_ms"] = 9_999_999_999_999
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    resolved = resolve_verified_broker_endpoint(
+        registry,
+        broker_label="FPMTrading",
+        server_name="FPMTrading-Live",
+        artifact_root=tmp_path,
+        artifact_manifest=manifest,
+    )
+    assert resolved.server_address == "188.42.136.4:443"
+
+
+def test_multiple_verified_endpoints_are_rejected(tmp_path: Path) -> None:
+    registry, manifest, _ = _fixture(tmp_path)
     payload = json.loads(registry.read_text(encoding="utf-8"))
     payload["brokers"]["FPMTrading"].append(
         {**payload["brokers"]["FPMTrading"][0], "host": "203.0.113.10"}
@@ -190,7 +220,72 @@ def test_symlink_artifact_root_is_rejected(tmp_path: Path) -> None:
         resolve_verified_broker_endpoint(
             registry,
             broker_label="FPM Trading",
+            server_name="FPMTrading-Live",
             artifact_root=linked_root,
             artifact_manifest=manifest,
-            now_unix_ms=1_000_001,
+        )
+
+
+def test_exact_server_name_selects_only_its_verified_endpoint(
+    tmp_path: Path,
+) -> None:
+    registry, manifest, _ = _fixture(tmp_path)
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["brokers"]["FPMTrading"].append(
+        {
+            **payload["brokers"]["FPMTrading"][0],
+            "server_name": "FPMTrading-Demo",
+            "host": "203.0.113.10",
+        }
+    )
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+
+    live = resolve_verified_broker_endpoint(
+        registry,
+        broker_label="FPM Trading",
+        server_name="FPMTrading-Live",
+        artifact_root=tmp_path,
+        artifact_manifest=manifest,
+    )
+    demo = resolve_verified_broker_endpoint(
+        registry,
+        broker_label="FPM Trading",
+        server_name="FPMTrading-Demo",
+        artifact_root=tmp_path,
+        artifact_manifest=manifest,
+    )
+    assert live.server_address == "188.42.136.4:443"
+    assert demo.server_address == "203.0.113.10:443"
+    server_only = resolve_verified_broker_endpoint(
+        registry,
+        broker_label=None,
+        server_name="FPMTrading-Live",
+        artifact_root=tmp_path,
+        artifact_manifest=manifest,
+    )
+    assert server_only.broker_label == "FPMTrading"
+
+
+def test_server_only_lookup_rejects_cross_broker_ambiguity(
+    tmp_path: Path,
+) -> None:
+    registry, manifest, _ = _fixture(tmp_path)
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["brokers"]["Other Broker"] = [
+        {
+            **payload["brokers"]["FPMTrading"][0],
+            "host": "203.0.113.10",
+        }
+    ]
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        BrokerEndpointResolutionError,
+        match="missing or ambiguous",
+    ):
+        resolve_verified_broker_endpoint(
+            registry,
+            broker_label=None,
+            server_name="FPMTrading-Live",
+            artifact_root=tmp_path,
+            artifact_manifest=manifest,
         )

@@ -19,13 +19,27 @@ from windows_agent.broker_endpoint_resolver import (
     BrokerEndpointResolutionError,
     VerifiedBrokerEndpoint,
 )
+from windows_agent.broker_endpoint_registry import (
+    EndpointInvalidation,
+    EndpointPromotion,
+    ObservedProcessEndpoint,
+)
 from windows_agent.broker_identity import BrokerIdentitySuggestion
 from windows_agent.broker_wizard import BrokerWizardError, BrokerWizardEvidence
+from windows_agent.mtapi_search import (
+    MtApiEndpointCandidate,
+    MtApiSearchResult,
+    MtApiSearchUnavailable,
+)
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
+from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.secret_store import WindowsSecretStore
-from windows_agent.real_handlers import build_real_handlers, sweep_stale_instances
-from windows_agent.state_store import read_json
+from windows_agent.real_handlers import (
+    build_real_handlers,
+    reconcile_startup_instances,
+)
+from windows_agent.state_store import atomic_json, read_json
 from windows_agent.worker.adapter_errors import (
     IdentityMismatch,
     Mt5Error,
@@ -76,6 +90,19 @@ class FakeApi:
     def transition(self, job_id: str, lease_id: str, status: str, result: dict | None = None) -> dict:
         self.transitions.append((status, result))
         return {"status": "failed" if status == "fail" else status}
+
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict:
+        if not hasattr(self, "progress_events"):
+            self.progress_events = []
+        self.progress_events.append((event_code, event_status, detail_code))
+        return {"api_version": "1", "event_recorded": True}
 
 
 class ScriptedAdapter:
@@ -143,7 +170,25 @@ class FakeProcessManager:
 
 
 @pytest.fixture()
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    # These are offline handler tests, not a DPAPI integration test.  A real Windows session
+    # reached through SSH may have no loadable user master key, so keep the fixture deterministic
+    # exactly like the daemon E2E tests do.
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_protect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_unprotect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda path: None),
+    )
     instances_root = tmp_path / "instances"
     secrets_root = tmp_path / "secrets"
     source_terminal = tmp_path / "golden" / "terminal64.exe"
@@ -157,10 +202,17 @@ def _handlers(
     env,
     api,
     *,
+    native_runtime=False,
     script: dict | None = None,
+    process_factory=FakeProcessManager,
     endpoint_resolver=None,
+    endpoint_observer=None,
+    endpoint_publisher=None,
+    endpoint_invalidator=None,
     broker_identity_resolver=None,
     broker_wizard=None,
+    mtapi_search=None,
+    instance_pool=None,
 ):
     def adapter_factory(terminal, login, server):
         return ScriptedAdapter(terminal, login, server, script=script or {})
@@ -170,11 +222,16 @@ def _handlers(
         instances_root=env.instances_root,
         secrets_root=env.secrets_root,
         source_terminal=env.source_terminal,
-        adapter_factory=adapter_factory,
-        process_factory=FakeProcessManager,
+        adapter_factory=None if native_runtime else adapter_factory,
+        process_factory=process_factory,
         endpoint_resolver=endpoint_resolver,
+        endpoint_observer=endpoint_observer,
+        endpoint_publisher=endpoint_publisher,
+        endpoint_invalidator=endpoint_invalidator,
         broker_identity_resolver=broker_identity_resolver,
         broker_wizard=broker_wizard,
+        mtapi_search=mtapi_search,
+        instance_pool=instance_pool,
     )
 
 
@@ -190,6 +247,26 @@ def _provision_payload(
         "expected_server": server,
         "broker_label": broker_label,
     }
+
+
+def _verified_endpoint() -> VerifiedBrokerEndpoint:
+    return VerifiedBrokerEndpoint(
+        broker_label="Demo Broker",
+        server_name="Demo-Server",
+        host="203.0.113.10",
+        port=443,
+        protocol="TCP/TLS",
+        observed_at_unix_ms=1,
+        discovery_method="MT5_MANAGED_INVESTOR_LOGIN",
+        verification_pid=123,
+        process_creation_time_unix_ms=999,
+        verification_session_id=(
+            "12345678-1234-4234-8234-123456789abc"
+        ),
+        confidence="HIGH",
+        artifact_relative_path="events.jsonl",
+        artifact_sha256="1" * 64,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,22 +293,107 @@ def test_provision_full_success_persists_secrets_and_progress(env):
     # the plaintext ciphertext/password must never appear in any local state file
     dump = json.dumps(read_json(root / "state" / "job_progress.json"))
     assert "investor-pw" not in dump
+    assert api.progress_events == [
+        ("broker_identity", "completed", "request_identity"),
+        ("endpoint_resolution", "started", None),
+        ("endpoint_resolution", "skipped", "resolver_not_configured"),
+        ("instance_preparation", "started", None),
+        ("instance_preparation", "completed", None),
+        ("terminal_start", "started", None),
+        ("terminal_start", "completed", None),
+        ("investor_verification", "started", None),
+        ("investor_verification", "completed", None),
+        ("history_sync", "started", "new_only"),
+        ("history_sync", "completed", "new_only"),
+        ("sync_activation", "started", None),
+        ("sync_activation", "completed", None),
+    ]
+
+
+def test_provision_claims_prebuilt_instance_before_direct_copy(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    original_provision = InstanceProvisioner.provision
+    pooled_root = original_provision(
+        InstanceProvisioner(env.instances_root, env.secrets_root),
+        cid,
+        env.source_terminal,
+    )
+
+    class FakePool:
+        def __init__(self):
+            self.calls = []
+
+        def claim(self, connection_id):
+            self.calls.append(connection_id)
+            return pooled_root
+
+    pool = FakePool()
+
+    def unexpected_direct_copy(*args, **kwargs):
+        raise AssertionError("direct-copy fallback must not run")
+
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "provision",
+        unexpected_direct_copy,
+    )
+    result = _handlers(
+        env,
+        FakeApi(),
+        instance_pool=pool,
+    )["provision"](
+        _job("provision", cid, payload=_provision_payload())
+    )
+
+    assert result["live_sync_started"] is True
+    assert pool.calls == [cid]
+
+
+def test_provision_uses_direct_copy_only_when_pool_is_empty(env):
+    cid = str(uuid4())
+
+    class EmptyPool:
+        def __init__(self):
+            self.calls = []
+
+        def claim(self, connection_id):
+            self.calls.append(connection_id)
+            return None
+
+    pool = EmptyPool()
+    result = _handlers(
+        env,
+        FakeApi(),
+        instance_pool=pool,
+    )["provision"](
+        _job("provision", cid, payload=_provision_payload())
+    )
+
+    assert result["live_sync_started"] is True
+    assert pool.calls == [cid]
+    assert (env.instances_root / cid / "terminal" / "terminal64.exe").is_file()
 
 
 def test_provision_resolves_and_persists_verified_connection_endpoint(env):
     cid = str(uuid4())
     observed_labels: list[str] = []
 
-    def resolve(label: str) -> VerifiedBrokerEndpoint:
+    def resolve(label: str, server: str) -> VerifiedBrokerEndpoint:
         observed_labels.append(label)
+        assert server == "Demo-Server"
         return VerifiedBrokerEndpoint(
             broker_label="Demo Broker",
+            server_name="Demo-Server",
             host="203.0.113.10",
             port=443,
             protocol="TCP/TLS",
             observed_at_unix_ms=1,
             discovery_method="MT5_LOGIN_DIALOG_IP",
             verification_pid=123,
+            process_creation_time_unix_ms=999,
             verification_session_id="12345678-1234-4234-8234-123456789abc",
             confidence="MEDIUM",
             artifact_relative_path="events.jsonl",
@@ -262,7 +424,7 @@ def test_provision_resolves_and_persists_verified_connection_endpoint(env):
 def test_provision_resolves_missing_broker_once_before_verified_endpoint_lookup(env):
     cid = str(uuid4())
     identity_calls: list[str] = []
-    endpoint_calls: list[str] = []
+    endpoint_calls: list[str | None] = []
 
     def resolve_identity(server: str) -> BrokerIdentitySuggestion:
         identity_calls.append(server)
@@ -274,16 +436,26 @@ def test_provision_resolves_missing_broker_once_before_verified_endpoint_lookup(
             generated_at_unix_ms=1_000,
         )
 
-    def resolve_endpoint(label: str) -> VerifiedBrokerEndpoint:
+    def resolve_endpoint(
+        label: str | None,
+        server: str,
+    ) -> VerifiedBrokerEndpoint:
         endpoint_calls.append(label)
+        assert server == "Demo-Server"
+        if label is None:
+            raise BrokerEndpointResolutionError(
+                "fixture has no server-only match"
+            )
         return VerifiedBrokerEndpoint(
             broker_label="Demo Broker",
+            server_name="Demo-Server",
             host="203.0.113.10",
             port=443,
             protocol="TCP/TLS",
             observed_at_unix_ms=1,
             discovery_method="MT5_LOGIN_DIALOG_IP",
             verification_pid=123,
+            process_creation_time_unix_ms=999,
             verification_session_id="12345678-1234-4234-8234-123456789abc",
             confidence="MEDIUM",
             artifact_relative_path="events.jsonl",
@@ -301,14 +473,70 @@ def test_provision_resolves_missing_broker_once_before_verified_endpoint_lookup(
     result = handlers["provision"](_job("provision", cid, payload=payload))
 
     assert identity_calls == ["Demo-Server"]
-    assert endpoint_calls == ["Demo Broker"]
+    assert endpoint_calls == [None, "Demo Broker"]
     assert result["verified_broker_label"] == "Demo Broker"
     assert WindowsSecretStore(env.secrets_root).read(cid, "mt5_broker_label") == "Demo Broker"
 
 
+def test_provision_exact_server_registry_hit_skips_ai_identity_lookup(env):
+    cid = str(uuid4())
+    endpoint_calls: list[tuple[str | None, str]] = []
+
+    def resolve_endpoint(
+        label: str | None,
+        server: str,
+    ) -> VerifiedBrokerEndpoint:
+        endpoint_calls.append((label, server))
+        return VerifiedBrokerEndpoint(
+            broker_label="Demo Broker",
+            server_name=server,
+            host="203.0.113.10",
+            port=443,
+            protocol="TCP/TLS",
+            observed_at_unix_ms=1,
+            discovery_method="MT5_MANAGED_INVESTOR_LOGIN",
+            verification_pid=123,
+            process_creation_time_unix_ms=999,
+            verification_session_id=(
+                "12345678-1234-4234-8234-123456789abc"
+            ),
+            confidence="HIGH",
+            artifact_relative_path="events.jsonl",
+            artifact_sha256="1" * 64,
+        )
+
+    def unexpected_identity(_server: str):
+        raise AssertionError("AI identity resolver must not be called")
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=resolve_endpoint,
+        broker_identity_resolver=unexpected_identity,
+    )
+    result = handlers["provision"](
+        _job(
+            "provision",
+            cid,
+            payload=_provision_payload(broker_label=None),
+        )
+    )
+
+    assert endpoint_calls == [(None, "Demo-Server")]
+    assert result["verified_broker_label"] == "Demo Broker"
+
+
 def test_provision_missing_broker_fails_closed_without_identity_resolver(env):
     cid = str(uuid4())
-    handlers = _handlers(env, FakeApi(), endpoint_resolver=lambda _label: None)
+
+    def reject_endpoint(_label, _server):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=reject_endpoint,
+    )
 
     with pytest.raises(Exception) as exc_info:
         handlers["provision"](
@@ -326,7 +554,7 @@ def test_provision_missing_broker_fails_closed_without_identity_resolver(env):
 def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(env):
     cid = str(uuid4())
 
-    def reject(_label: str):
+    def reject(_label: str, _server: str):
         raise BrokerEndpointResolutionError("fixture unavailable")
 
     handlers = _handlers(env, FakeApi(), endpoint_resolver=reject)
@@ -340,6 +568,7 @@ def test_provision_fails_before_secret_persistence_when_endpoint_is_unavailable(
 def test_provision_censuses_unknown_server_before_login_and_promotes_after_success(env):
     cid = str(uuid4())
     wizard_calls: list[tuple[str, str, str]] = []
+    promotions: list[EndpointPromotion] = []
     generated_example = (
         env.instances_root
         / cid
@@ -350,7 +579,7 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         / "ExpertMACD.ex5"
     )
 
-    def reject_endpoint(_label: str):
+    def reject_endpoint(_label: str, _server: str):
         raise BrokerEndpointResolutionError("fixture unavailable")
 
     def resolve_identity(server: str) -> BrokerIdentitySuggestion:
@@ -388,10 +617,53 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
             artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
         )
 
+    def observe_endpoint(pid: int) -> ObservedProcessEndpoint:
+        assert pid == 123
+        return ObservedProcessEndpoint(
+            host="203.0.113.10",
+            port=443,
+            pid=pid,
+            process_creation_time_unix_ms=1_785_190_001_000,
+            observed_at_unix_ms=1_785_190_002_000,
+        )
+
+    def publish_endpoint(
+        promotion: EndpointPromotion,
+    ) -> VerifiedBrokerEndpoint:
+        promotions.append(promotion)
+        evidence = json.loads(
+            promotion.verification_artifact.read_text(encoding="utf-8")
+        )
+        assert evidence["schema_version"] == 3
+        assert evidence["remote_host"] == "203.0.113.10"
+        assert evidence["remote_port"] == 443
+        assert evidence["process_creation_time_unix_ms"] == 1_785_190_001_000
+        assert evidence["provenance_kind"] == "BROKER_WIZARD"
+        assert promotion.provenance_artifact == artifact
+        return VerifiedBrokerEndpoint(
+            broker_label=promotion.broker_label,
+            server_name=promotion.server_name,
+            host=promotion.observation.host,
+            port=promotion.observation.port,
+            protocol="TCP/TLS",
+            observed_at_unix_ms=promotion.observation.observed_at_unix_ms,
+            discovery_method="MT5_MANAGED_INVESTOR_LOGIN",
+            verification_pid=promotion.observation.pid,
+            process_creation_time_unix_ms=(
+                promotion.observation.process_creation_time_unix_ms
+            ),
+            verification_session_id=promotion.verification_session_id,
+            confidence="HIGH",
+            artifact_relative_path="artifacts/fixture/verification.json",
+            artifact_sha256=promotion.verification_artifact_sha256,
+        )
+
     handlers = _handlers(
         env,
         FakeApi(),
         endpoint_resolver=reject_endpoint,
+        endpoint_observer=observe_endpoint,
+        endpoint_publisher=publish_endpoint,
         broker_identity_resolver=resolve_identity,
         broker_wizard=run_wizard,
     )
@@ -411,12 +683,15 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         ("Goat Funded Trader", "Goat Funded Trader", "GoatFunded-Server3")
     ]
     assert not generated_example.exists()
-    assert store.read(cid, "mt5_endpoint") == "GoatFunded-Server3"
+    assert store.read(cid, "mt5_endpoint") == "203.0.113.10:443"
     assert store.read(cid, "mt5_broker_label") == "Goat Funded Trader"
     assert result["verified_server_name"] == "GoatFunded-Server3"
     assert result["verified_broker_label"] == "Goat Funded Trader"
     assert result["verification_method"] == "managed_investor_login"
     assert result["endpoint_protocol"] == "TCP/TLS"
+    assert result["endpoint_registry_status"] == "PROMOTED"
+    assert result["promoted_endpoint"] == "203.0.113.10:443"
+    assert len(promotions) == 1
     assert len(result["endpoint_artifact_sha256"]) == 64
     assert (
         result["endpoint_verification_session_id"]
@@ -439,16 +714,20 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
 def test_provision_wizard_failure_keeps_credential_envelope_unopened(env):
     cid = str(uuid4())
 
-    def reject_endpoint(_label: str):
+    def reject_endpoint(_label: str, _server: str):
         raise BrokerEndpointResolutionError("fixture unavailable")
 
     def fail_wizard(*_args):
         assert not (env.secrets_root / cid).exists()
-        raise BrokerWizardError("sanitized fixture failure")
+        raise BrokerWizardError(
+            "sanitized fixture failure",
+            failure_reason="timeout",
+        )
 
+    api = FakeApi()
     handlers = _handlers(
         env,
-        FakeApi(),
+        api,
         endpoint_resolver=reject_endpoint,
         broker_wizard=fail_wizard,
     )
@@ -459,7 +738,458 @@ def test_provision_wizard_failure_keeps_credential_envelope_unopened(env):
         )
 
     assert exc_info.value.error_code == "broker_discovery_failed"
+    assert (
+        "broker_discovery",
+        "failed",
+        "wizard_timeout",
+    ) in api.progress_events
     assert not (env.secrets_root / cid).exists()
+    assert not (env.instances_root / cid).exists()
+
+
+def test_provision_mtapi_exact_match_skips_wizard_and_persists_sanitized_audit(env):
+    cid = str(uuid4())
+    wizard_calls: list[tuple[str, str, str]] = []
+
+    def reject_endpoint(_label: str, _server: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def search(server: str) -> MtApiSearchResult:
+        assert server == "PepperstoneUK-Live"
+        return MtApiSearchResult(
+            outcome="EXACT_MATCH",
+            candidates=(
+                MtApiEndpointCandidate(
+                    company_name="Pepperstone Limited",
+                    server_name="PepperstoneUK-Live",
+                    host="13.134.102.187",
+                    port=443,
+                ),
+            ),
+            company_names=("Pepperstone Limited",),
+            fetched_at_unix_ms=1_785_190_000_000,
+        )
+
+    def unexpected_identity(_server: str):
+        raise AssertionError("AI must not run after an exact MTAPI Search match")
+
+    def run_wizard(root, search_text, suggested_broker_label, expected_server, _guard):
+        wizard_calls.append((search_text, suggested_broker_label, expected_server))
+        assert not (env.secrets_root / cid).exists()
+        artifact = root / "state" / "broker-wizard-result.json"
+        artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
+        return BrokerWizardEvidence(
+            run_id="12345678-1234-4234-8234-123456789abc",
+            expected_server_name=expected_server,
+            selected_broker_label="Pepperstone Limited",
+            censused_server_names=(expected_server,),
+            terminal_pid=4321,
+            completed_at_unix_ms=1_785_190_000_000,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        )
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        endpoint_resolver=reject_endpoint,
+        broker_identity_resolver=unexpected_identity,
+        broker_wizard=run_wizard,
+        mtapi_search=search,
+    )
+    handlers["provision"](
+        _job(
+            "provision",
+            cid,
+            payload=_provision_payload(
+                server="PepperstoneUK-Live",
+                broker_label=None,
+            ),
+        )
+    )
+
+    assert wizard_calls == []
+    audit = (env.instances_root / cid / "state" / "mtapi-search.json").read_text(
+        encoding="utf-8"
+    )
+    assert "13.134.102.187" in audit
+    assert "investor-pw" not in audit
+    assert "password" not in audit.lower()
+
+
+def test_provision_mtapi_candidates_are_tried_before_wizard(env, monkeypatch):
+    cid = str(uuid4())
+    attempted: list[str] = []
+    wizard_calls: list[str] = []
+
+    def reject_endpoint(_label: str, _server: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def search(_server: str) -> MtApiSearchResult:
+        return MtApiSearchResult(
+            outcome="EXACT_MATCH",
+            candidates=(
+                MtApiEndpointCandidate(
+                    company_name="Fortune Prime Global Capital Pty Ltd",
+                    server_name="FortunePrimeGlobal-Live",
+                    host="192.81.110.54",
+                    port=443,
+                ),
+                MtApiEndpointCandidate(
+                    company_name="Fortune Prime Global Capital Pty Ltd",
+                    server_name="FortunePrimeGlobal-Live",
+                    host="192.229.23.143",
+                    port=443,
+                ),
+            ),
+            company_names=("Fortune Prime Global Capital Pty Ltd",),
+            fetched_at_unix_ms=1_785_190_000_000,
+        )
+
+    def run_native(*args, **kwargs):
+        endpoint = kwargs.get("connection_endpoint") or args[6]
+        attempted.append(endpoint)
+        if len(attempted) == 1:
+            raise real_handlers.Mt5InitializeFailed("endpoint_connection_refused")
+        return {"effective_server_name": "FortunePrimeGlobal-Live", "_verification_pid": 42}
+
+    def unexpected_wizard(*_args):
+        wizard_calls.append("called")
+        raise AssertionError("wizard must not run after a successful MTAPI candidate")
+
+    monkeypatch.setattr(real_handlers, "_start_file_bridge_and_sync", run_native)
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        native_runtime=True,
+        endpoint_resolver=reject_endpoint,
+        broker_wizard=unexpected_wizard,
+        mtapi_search=search,
+    )
+
+    result = handlers["provision"](
+        _job(
+            "provision",
+            cid,
+            payload=_provision_payload(
+                server="FortunePrimeGlobal-Live",
+                broker_label=None,
+            ),
+        )
+    )
+
+    assert attempted == ["192.81.110.54:443", "192.229.23.143:443"]
+    assert wizard_calls == []
+    assert result["effective_server_name"] == "FortunePrimeGlobal-Live"
+
+
+def test_provision_mtapi_hostname_is_tried_before_ip_candidates(env, monkeypatch):
+    cid = str(uuid4())
+    attempted: list[str] = []
+
+    def reject_endpoint(_label: str, _server: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def search(_server: str) -> MtApiSearchResult:
+        return MtApiSearchResult(
+            outcome="EXACT_MATCH",
+            candidates=(
+                MtApiEndpointCandidate(
+                    company_name="Fortune Prime Limited",
+                    server_name="FortunePrime-Live2",
+                    host="ga-bp14h62c0bwpfhso8fwxp.aliyunga0017.com",
+                    port=443,
+                ),
+                MtApiEndpointCandidate(
+                    company_name="Fortune Prime Limited",
+                    server_name="FortunePrime-Live2",
+                    host="38.76.16.208",
+                    port=443,
+                ),
+            ),
+            company_names=("Fortune Prime Limited",),
+            fetched_at_unix_ms=1_785_190_000_000,
+        )
+
+    def run_native(*args, **kwargs):
+        endpoint = kwargs.get("connection_endpoint") or args[6]
+        attempted.append(endpoint)
+        if endpoint.startswith("ga-bp"):
+            return {"effective_server_name": "FortunePrime-Live2", "_verification_pid": 42}
+        raise AssertionError("IP fallback must not run after hostname authentication")
+
+    monkeypatch.setattr(real_handlers, "_start_file_bridge_and_sync", run_native)
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        native_runtime=True,
+        endpoint_resolver=reject_endpoint,
+        mtapi_search=search,
+    )
+
+    handlers["provision"](
+        _job("provision", cid, payload=_provision_payload(server="FortunePrime-Live2", broker_label=None))
+    )
+
+    assert attempted == ["ga-bp14h62c0bwpfhso8fwxp.aliyunga0017.com:443"]
+
+
+def test_direct_mtapi_login_binds_promoted_endpoint_to_exact_candidate(env, monkeypatch):
+    cid = str(uuid4())
+    observed_bindings: list[tuple[int, str | None, int | None]] = []
+    promotions: list[EndpointPromotion] = []
+
+    def reject_endpoint(_label: str, _server: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def search(_server: str) -> MtApiSearchResult:
+        return MtApiSearchResult(
+            outcome="EXACT_MATCH",
+            candidates=(
+                MtApiEndpointCandidate(
+                    company_name="Fortune Prime Global",
+                    server_name="FortunePrimeGlobal-Live",
+                    host="192.81.110.54",
+                    port=443,
+                ),
+            ),
+            company_names=("Fortune Prime Global",),
+            fetched_at_unix_ms=1_785_190_000_000,
+        )
+
+    def observe(pid: int, *, expected_host=None, expected_port=None):
+        observed_bindings.append((pid, expected_host, expected_port))
+        return ObservedProcessEndpoint(
+            host="192.81.110.54",
+            port=443,
+            pid=pid,
+            process_creation_time_unix_ms=1_785_190_001_000,
+            observed_at_unix_ms=1_785_190_002_000,
+        )
+
+    def start_native(*args, **kwargs):
+        observer = kwargs["endpoint_observer"]
+        return {
+            "effective_server_name": "FortunePrimeGlobal-Live",
+            "_verification_pid": 42,
+            "_verification_observation": observer(42),
+        }
+
+    def publish(promotion: EndpointPromotion) -> VerifiedBrokerEndpoint:
+        promotions.append(promotion)
+        document = json.loads(promotion.verification_artifact.read_text(encoding="utf-8"))
+        assert document["provenance_kind"] == "MTAPI_SEARCH"
+        assert promotion.provenance_artifact.name == "mtapi-search.json"
+        return VerifiedBrokerEndpoint(
+            broker_label=promotion.broker_label,
+            server_name=promotion.server_name,
+            host=promotion.observation.host,
+            port=promotion.observation.port,
+            protocol="TCP/TLS",
+            observed_at_unix_ms=promotion.observation.observed_at_unix_ms,
+            discovery_method="MT5_MANAGED_INVESTOR_LOGIN",
+            verification_pid=promotion.observation.pid,
+            process_creation_time_unix_ms=promotion.observation.process_creation_time_unix_ms,
+            verification_session_id=promotion.verification_session_id,
+            confidence="HIGH",
+            artifact_relative_path="artifacts/fixture/verification.json",
+            artifact_sha256=promotion.verification_artifact_sha256,
+        )
+
+    monkeypatch.setattr(real_handlers, "_start_file_bridge_and_sync", start_native)
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        native_runtime=True,
+        endpoint_resolver=reject_endpoint,
+        endpoint_observer=observe,
+        endpoint_publisher=publish,
+        mtapi_search=search,
+    )
+
+    result = handlers["provision"](
+        _job(
+            "provision",
+            cid,
+            payload=_provision_payload(
+                server="FortunePrimeGlobal-Live",
+                broker_label=None,
+            ),
+        )
+    )
+
+    assert observed_bindings == [(42, "192.81.110.54", 443)]
+    assert len(promotions) == 1
+    assert result["endpoint_registry_status"] == "PROMOTED"
+
+
+def test_provision_mtapi_unavailable_falls_back_to_existing_wizard_search(env):
+    cid = str(uuid4())
+    wizard_calls: list[str] = []
+
+    def reject_endpoint(_label: str, _server: str):
+        raise BrokerEndpointResolutionError("fixture unavailable")
+
+    def unavailable(_server: str) -> MtApiSearchResult:
+        raise MtApiSearchUnavailable("MTAPI Search is unavailable")
+
+    def run_wizard(root, search_text, _suggested_broker_label, expected_server, _guard):
+        wizard_calls.append(search_text)
+        artifact = root / "state" / "broker-wizard-result.json"
+        artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
+        return BrokerWizardEvidence(
+            run_id="12345678-1234-4234-8234-123456789abc",
+            expected_server_name=expected_server,
+            selected_broker_label="Demo Broker",
+            censused_server_names=(expected_server,),
+            terminal_pid=4321,
+            completed_at_unix_ms=1_785_190_000_000,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        )
+
+    api = FakeApi()
+    handlers = _handlers(
+        env,
+        api,
+        endpoint_resolver=reject_endpoint,
+        broker_wizard=run_wizard,
+        mtapi_search=unavailable,
+    )
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+
+    assert wizard_calls == ["Demo Broker"]
+    assert ("broker_discovery", "info", "mtapi_search_unavailable") in api.progress_events
+    assert not (env.instances_root / cid / "state" / "mtapi-search.json").exists()
+
+
+def test_failed_provision_removes_instance_and_persisted_secrets(env):
+    cid = str(uuid4())
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        script={"session_error": Mt5IpcError("fixture failure")},
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
+
+    assert exc_info.value.error_code == "mt5_initialize_failed"
+    assert not (env.instances_root / cid).exists()
+    assert not (env.secrets_root / cid).exists()
+
+
+def test_retry_discards_stale_failed_instance_before_fresh_provision(env):
+    cid = str(uuid4())
+    stale_root = InstanceLayout(env.instances_root, cid).create()
+    stale_config = stale_root / "terminal" / "Config" / "accounts.dat"
+    stale_config.parent.mkdir(parents=True)
+    stale_config.write_bytes(b"stale-account-cache")
+    atomic_json(
+        stale_root / "state" / "job_progress.json",
+        {
+            "connection_id": cid,
+            "status": "censusing_broker",
+        },
+    )
+    WindowsSecretStore(env.secrets_root).write(
+        cid,
+        "mt5_server",
+        "Stale-Server",
+    )
+
+    result = _handlers(env, FakeApi())["provision"](
+        _job("provision", cid, payload=_provision_payload())
+    )
+
+    assert result["live_sync_started"] is True
+    assert not stale_config.exists()
+    assert read_json(
+        env.instances_root / cid / "state" / "job_progress.json"
+    )["status"] == "connected"
+    assert (
+        WindowsSecretStore(env.secrets_root).read(cid, "mt5_server")
+        == "Demo-Server"
+    )
+
+
+def test_retry_discards_partial_instance_with_only_compiler_process_path(
+    env,
+):
+    cid = str(uuid4())
+    stale_root = InstanceLayout(env.instances_root, cid).create()
+    terminal = stale_root / "terminal" / "terminal64.exe"
+    compiler = stale_root / "terminal" / "metaeditor64.exe"
+    compiler.write_bytes(b"stale-compiler")
+    atomic_json(
+        stale_root / "state" / "job_progress.json",
+        {
+            "connection_id": cid,
+            "status": "censusing_broker",
+        },
+    )
+    cleanup_calls = []
+
+    class RecordingProcessManager(FakeProcessManager):
+        def cleanup_path(self, executable) -> bool:
+            cleanup_calls.append(executable)
+            return True
+
+    result = _handlers(
+        env,
+        FakeApi(),
+        process_factory=RecordingProcessManager,
+    )["provision"](
+        _job("provision", cid, payload=_provision_payload())
+    )
+
+    assert result["live_sync_started"] is True
+    assert cleanup_calls == [terminal]
+    assert not compiler.exists()
+
+
+def test_failed_duplicate_provision_preserves_connected_instance(env):
+    cid = str(uuid4())
+    job = _job("provision", cid, payload=_provision_payload())
+    _handlers(env, FakeApi())["provision"](job)
+    root = env.instances_root / cid
+    secret = env.secrets_root / cid / "mt5_investor_password.dpapi"
+
+    with pytest.raises(Exception) as exc_info:
+        _handlers(
+            env,
+            FakeApi(),
+            script={"session_error": Mt5IpcError("fixture failure")},
+        )["provision"](job)
+
+    assert exc_info.value.error_code == "mt5_initialize_failed"
+    assert root.is_dir()
+    assert secret.is_file()
+
+
+def test_failed_provision_blocks_retry_when_process_cleanup_is_unverified(env):
+    cid = str(uuid4())
+
+    class UnverifiedCleanupProcessManager(FakeProcessManager):
+        def cleanup_path(self, executable) -> bool:
+            return False
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        script={"session_error": Mt5IpcError("fixture failure")},
+        process_factory=UnverifiedCleanupProcessManager,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
+
+    assert exc_info.value.error_code == "instance_cleanup_failed"
+    assert (env.instances_root / cid).is_dir()
 
 
 def test_provision_is_idempotent_on_retry(env):
@@ -551,6 +1281,98 @@ def test_provision_authorization_error_maps_to_mt5_authorization_failed(env):
     assert exc_info.value.error_code == "mt5_authorization_failed"
 
 
+@pytest.mark.parametrize(
+    ("failure_code", "expected_reason", "expected_error_code"),
+    [
+        (
+            "server_identity_mismatch",
+            "SERVER_IDENTITY_MISMATCH",
+            "server_identity_mismatch",
+        ),
+        (
+            "endpoint_connection_failed",
+            "ENDPOINT_CONNECTION_FAILED",
+            "mt5_initialize_failed",
+        ),
+        (
+            "endpoint_connection_refused",
+            "ENDPOINT_CONNECTION_REFUSED",
+            "mt5_initialize_failed",
+        ),
+        (
+            "endpoint_protocol_incompatible",
+            "ENDPOINT_PROTOCOL_INCOMPATIBLE",
+            "mt5_initialize_failed",
+        ),
+        (
+            "endpoint_server_unrecognized",
+            "ENDPOINT_SERVER_UNRECOGNIZED",
+            "mt5_initialize_failed",
+        ),
+    ],
+)
+def test_endpoint_specific_failure_invalidates_exact_record(
+    env,
+    failure_code,
+    expected_reason,
+    expected_error_code,
+):
+    cid = str(uuid4())
+    invalidations: list[EndpointInvalidation] = []
+    endpoint = _verified_endpoint()
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        script={"session_error": Mt5Error(failure_code)},
+        endpoint_resolver=lambda _label, _server: endpoint,
+        endpoint_invalidator=invalidations.append,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
+
+    assert exc_info.value.error_code == expected_error_code
+    assert len(invalidations) == 1
+    assert invalidations[0].endpoint is endpoint
+    assert invalidations[0].reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (Mt5Error("authorization_failed"), "mt5_authorization_failed"),
+        (Mt5Error("authorization_timeout"), "mt5_initialize_failed"),
+        (Mt5IpcError("IPC timeout"), "mt5_initialize_failed"),
+    ],
+)
+def test_auth_or_environment_failure_preserves_verified_endpoint(
+    env,
+    failure,
+    expected_code,
+):
+    cid = str(uuid4())
+    invalidations: list[EndpointInvalidation] = []
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        script={"session_error": failure},
+        endpoint_resolver=lambda _label, _server: _verified_endpoint(),
+        endpoint_invalidator=invalidations.append,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
+
+    assert exc_info.value.error_code == expected_code
+    assert invalidations == []
+
+
 def test_provision_trade_allowed_account_is_investor_access_not_verified(env):
     cid = str(uuid4())
     handlers = _handlers(env, FakeApi(), script={"trade_allowed": True})
@@ -558,6 +1380,49 @@ def test_provision_trade_allowed_account_is_investor_access_not_verified(env):
     with pytest.raises(Exception) as exc_info:
         handlers["provision"](job)
     assert exc_info.value.error_code == "investor_access_not_verified"
+
+
+def test_native_investor_sync_timeout_has_a_recoverable_error_code(env):
+    """A missing journal proof is not an MT5 initialization failure or proof of master access."""
+    cid = str(uuid4())
+    root = InstanceLayout(env.instances_root, cid).path
+    terminal = root / "terminal"
+    terminal.mkdir(parents=True)
+    (terminal / "terminal64.exe").write_bytes(b"stub")
+    expert = env.instances_root / "bridge.ex5"
+    expert.write_bytes(b"stub")
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_investor_password", "fixture-password")
+
+    class TimeoutRuntime:
+        def __init__(self, _root, _connection_id):
+            pass
+
+        def set_cancel_check(self, _check):
+            pass
+
+        def start(self, **_kwargs):
+            raise real_handlers.NativeMt5Error("investor_sync_timeout")
+
+    with pytest.raises(Exception) as exc_info:
+        real_handlers._start_file_bridge_and_sync(
+            _job("provision", cid),
+            FakeApi(),
+            root,
+            cid,
+            42,
+            "Demo-Server",
+            "203.0.113.10:443",
+            "new_only",
+            None,
+            store,
+            FakeProcessManager,
+            expert,
+            TimeoutRuntime,
+            "https://example.invalid/events",
+        )
+
+    assert exc_info.value.error_code == "investor_verification_timeout"
 
 
 def test_provision_disconnected_terminal_is_mt5_initialize_failed(env):
@@ -774,30 +1639,172 @@ def test_deprovision_only_touches_its_own_connection(env):
 
 
 # ---------------------------------------------------------------------------
-# Recovery: stale/orphaned processes at daemon startup
+# Recovery: preserve valid terminals and clean only unsafe/ambiguous processes
 # ---------------------------------------------------------------------------
 
-def test_sweep_stale_instances_terminates_orphans(env, monkeypatch):
+def test_startup_reconciliation_adopts_valid_running_instance(env, monkeypatch):
     cid = str(uuid4())
     handlers = _handlers(env, FakeApi())
     handlers["provision"](_job("provision", cid, payload=_provision_payload()))
     root = InstanceLayout(env.instances_root, cid).path
 
+    adopted = []
     cleaned = []
     monkeypatch.setattr(real_handlers.ProcessManager, "find", staticmethod(lambda executable: [4242]))
 
     class RecordingProcessManager(FakeProcessManager):
+        def adopt(self, executable):
+            adopted.append((self.state_path, executable))
+            return 4242
+
         def cleanup_path(self, executable):
             cleaned.append((self.state_path, executable))
             return True
 
-    swept = sweep_stale_instances(env.instances_root, process_factory=RecordingProcessManager)
-    assert swept == [cid]
-    assert cleaned and cleaned[0][1] == root / "terminal" / "terminal64.exe"
+    result = reconcile_startup_instances(
+        env.instances_root,
+        env.secrets_root,
+        process_factory=RecordingProcessManager,
+    )
+
+    assert result.adopted == (cid,)
+    assert result.missing == ()
+    assert result.terminated == ()
+    assert result.blocked == ()
+    assert adopted == [
+        (
+            root / "state" / "terminal-process.json",
+            root / "terminal" / "terminal64.exe",
+        )
+    ]
+    assert cleaned == []
 
 
-def test_sweep_stale_instances_empty_root_is_safe(tmp_path):
-    assert sweep_stale_instances(tmp_path / "does-not-exist") == []
+def test_startup_reconciliation_leaves_missing_instance_for_live_sync(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi())
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda executable: []),
+    )
+
+    result = reconcile_startup_instances(
+        env.instances_root,
+        env.secrets_root,
+        process_factory=FakeProcessManager,
+    )
+
+    assert result.missing == (cid,)
+    assert result.adopted == ()
+    assert result.terminated == ()
+
+
+def test_startup_reconciliation_terminates_duplicate_exact_path_processes(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi())
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    cleaned = []
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda executable: [4242, 4343]),
+    )
+
+    class RecordingProcessManager(FakeProcessManager):
+        def cleanup_path(self, executable):
+            cleaned.append(executable)
+            return True
+
+    result = reconcile_startup_instances(
+        env.instances_root,
+        env.secrets_root,
+        process_factory=RecordingProcessManager,
+    )
+
+    assert result.terminated == (cid,)
+    assert result.adopted == ()
+    assert cleaned == [
+        InstanceLayout(env.instances_root, cid).path
+        / "terminal"
+        / "terminal64.exe"
+    ]
+
+
+def test_startup_reconciliation_adopt_failure_preserves_valid_terminal(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi())
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    cleaned = []
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda executable: [4242]),
+    )
+
+    class FailingAdoptionProcessManager(FakeProcessManager):
+        def adopt(self, executable):
+            raise OSError("sanitized fixture write failure")
+
+        def cleanup_path(self, executable):
+            cleaned.append(executable)
+            return True
+
+    result = reconcile_startup_instances(
+        env.instances_root,
+        env.secrets_root,
+        process_factory=FailingAdoptionProcessManager,
+    )
+
+    assert result.blocked == (cid,)
+    assert result.adopted == ()
+    assert result.terminated == ()
+    assert cleaned == []
+
+
+def test_startup_reconciliation_terminates_invalid_publication(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi())
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    root = InstanceLayout(env.instances_root, cid).path
+    atomic_json(
+        root / "state" / "instance.json",
+        {"connection_id": cid, "status": "deprovisioned"},
+    )
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda executable: [4242]),
+    )
+
+    result = reconcile_startup_instances(
+        env.instances_root,
+        env.secrets_root,
+        process_factory=FakeProcessManager,
+    )
+
+    assert result.terminated == (cid,)
+    assert result.adopted == ()
+
+
+def test_startup_reconciliation_empty_root_is_safe(tmp_path):
+    assert reconcile_startup_instances(
+        tmp_path / "does-not-exist",
+        tmp_path / "secrets",
+    ) == real_handlers.StartupReconciliation()
 
 
 # ---------------------------------------------------------------------------

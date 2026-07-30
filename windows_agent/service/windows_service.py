@@ -53,10 +53,16 @@ class TradeJournalAgentService(win32serviceutil.ServiceFramework):
         try:
             config = load_runtime_config()
             runner = build_runner(config)
-        except Exception as exc:
-            servicemanager.LogErrorMsg(f"TradeJournal agent failed to start: {exc}")
-            win32event.WaitForSingleObject(self.stop_event, win32event.INFINITE)
-            return
+        except Exception:
+            # Do not leave a process that SCM considers healthy but that can
+            # never claim jobs.  A deterministic non-zero exit is required so
+            # the service recovery policy can restart the Agent.  The detailed
+            # exception is deliberately kept out of the event log because a
+            # configuration failure may contain sensitive deployment paths.
+            servicemanager.LogErrorMsg(
+                "TradeJournal agent failed to start; service recovery requested"
+            )
+            raise RuntimeError("TradeJournal agent startup failed")
 
         self._worker = threading.Thread(
             target=run_forever, args=(runner, config.poll_seconds, self._stop_signal), daemon=True

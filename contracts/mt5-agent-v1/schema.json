@@ -13,6 +13,15 @@
     "errorCode": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
     "jobType": { "enum": ["provision", "deprovision", "historical_sync", "live_sync"] },
     "historyMode": { "enum": ["new_only", "from_date", "all_available"] },
+    "progressEventCode": {
+      "enum": [
+        "endpoint_resolution", "broker_identity", "broker_discovery",
+        "instance_preparation", "terminal_start", "investor_verification",
+        "bridge_activation", "history_sync", "sync_activation",
+        "deprovision", "live_sync"
+      ]
+    },
+    "progressEventStatus": { "enum": ["started", "completed", "failed", "skipped", "info"] },
     "credentialEnvelope": {
       "type": "object",
       "additionalProperties": false,
@@ -142,6 +151,33 @@
       }
     },
 
+    "progressRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id", "event_code", "event_status", "detail_code"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "event_code": { "$ref": "#/$defs/progressEventCode" },
+        "event_status": { "$ref": "#/$defs/progressEventStatus" },
+        "detail_code": {
+          "anyOf": [
+            { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "progressResponseOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "event_recorded"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "event_recorded": { "const": true }
+      }
+    },
+
     "errorResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -152,7 +188,8 @@
             "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed",
             "invalid_identifier", "lease_lost", "route_not_found", "invalid_error_code",
             "method_not_allowed", "server_not_configured", "payload_too_large",
-            "rate_limited", "forbidden_scope", "internal_error"
+            "rate_limited", "forbidden_scope", "invalid_event_code",
+            "invalid_event_status", "invalid_detail_code", "progress_failed", "internal_error"
           ]
         }
       }

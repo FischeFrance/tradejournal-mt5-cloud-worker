@@ -37,6 +37,8 @@ def validate_against(def_name: str, value: object) -> None:
         ("transitionRequest", "failRequest"),
         ("transitionResponseOk", "failResponseOk"),
         ("transitionResponseLeaseLost", "transitionResponseLeaseLost"),
+        ("progressRequest", "progressRequest"),
+        ("progressResponseOk", "progressResponseOk"),
         ("errorResponse", "errorResponse_unauthorized"),
     ],
 )
@@ -130,6 +132,55 @@ def test_transition_lease_lost_returns_body_instead_of_raising() -> None:
     job = FIXTURES["claimResponseJob_provision"]
     result = client.transition(job["job_id"], job["lease_id"], "complete")
     assert result == body
+
+
+def test_progress_request_body_matches_schema_and_contains_no_arbitrary_metadata() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=FIXTURES["progressResponseOk"])
+
+    client = AgentApiClient(
+        "https://agent.example/", "fixture", httpx.MockTransport(handler)
+    )
+    job = FIXTURES["claimResponseJob_provision"]
+    result = client.progress(
+        job["job_id"],
+        job["lease_id"],
+        "broker_discovery",
+        "started",
+        "wizard_required",
+    )
+
+    validate_against("progressRequest", captured["body"])
+    validate_against("progressResponseOk", result)
+    assert set(captured["body"]) == {
+        "api_version",
+        "lease_id",
+        "event_code",
+        "event_status",
+        "detail_code",
+    }
+
+
+def test_progress_rejects_unallowlisted_or_free_text_values_locally() -> None:
+    client = AgentApiClient(
+        "https://agent.example/",
+        "fixture",
+        httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    job = FIXTURES["claimResponseJob_provision"]
+    with pytest.raises(ValueError, match="event code"):
+        client.progress(job["job_id"], job["lease_id"], "read_password", "started")
+    with pytest.raises(ValueError, match="detail code"):
+        client.progress(
+            job["job_id"],
+            job["lease_id"],
+            "broker_discovery",
+            "started",
+            "raw detail!",
+        )
 
 
 def test_transient_5xx_is_retried_then_succeeds() -> None:

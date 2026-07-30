@@ -3,6 +3,7 @@ tests/test_event_sender.py). Unlike test_real_handlers.py, this module has no py
 (EventSender/LocalEventSink are both plain-Python), so it runs on any platform."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +29,54 @@ def test_send_heartbeat_posts_heartbeat_event_type(tmp_path):
     _, kwargs = mock_post.call_args
     assert kwargs["json"] == {"event_type": "heartbeat"}
     assert kwargs["headers"]["Authorization"] == "Bearer tjmt5_test-token"
+
+def test_send_heartbeat_posts_sanitized_account_snapshot(tmp_path):
+    account = SimpleNamespace(
+        balance=10_250.75,
+        equity=10_310.25,
+        currency="eur",
+        leverage=100,
+    )
+    with patch("requests.post", return_value=_response(200)) as mock_post:
+        ok = _sink(tmp_path).send_heartbeat(account)
+
+    assert ok is True
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"] == {
+        "event_type": "heartbeat",
+        "balance": 10_250.75,
+        "equity": 10_310.25,
+        "currency": "EUR",
+        "leverage": 100,
+    }
+
+
+def test_send_heartbeat_rejects_invalid_account_snapshot_without_http(tmp_path):
+    account = SimpleNamespace(
+        balance=float("nan"),
+        equity=100.0,
+        currency="EUR",
+        leverage=100,
+    )
+    with patch("requests.post") as mock_post:
+        with pytest.raises(ValueError, match="invalid account snapshot"):
+            _sink(tmp_path).send_heartbeat(account)
+
+    mock_post.assert_not_called()
+
+
+def test_send_heartbeat_rejects_non_integer_leverage_without_http(tmp_path):
+    account = SimpleNamespace(
+        balance=100.0,
+        equity=100.0,
+        currency="EUR",
+        leverage=100.5,
+    )
+    with patch("requests.post") as mock_post:
+        with pytest.raises(ValueError, match="invalid account snapshot"):
+            _sink(tmp_path).send_heartbeat(account)
+
+    mock_post.assert_not_called()
 
 
 def test_send_heartbeat_returns_false_on_permanent_failure(tmp_path):

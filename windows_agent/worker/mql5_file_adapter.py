@@ -9,6 +9,7 @@ available for an explicitly selected future fallback.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +134,25 @@ class Mql5FileMt5Adapter:
             raise Mql5FileIdentityMismatch("server_identity_mismatch")
         if not isinstance(payload.get("trade_allowed"), bool):
             raise Mql5FileAdapterError("account_schema_invalid")
+        balance = payload.get("balance")
+        equity = payload.get("equity")
+        currency = payload.get("currency")
+        leverage = payload.get("leverage")
+        if (
+            not isinstance(balance, (int, float))
+            or isinstance(balance, bool)
+            or not math.isfinite(float(balance))
+            or not isinstance(equity, (int, float))
+            or isinstance(equity, bool)
+            or not math.isfinite(float(equity))
+            or not isinstance(currency, str)
+            or not re.fullmatch(r"[A-Z0-9]{3,12}", currency.upper())
+            or not isinstance(leverage, int)
+            or isinstance(leverage, bool)
+            or leverage < 1
+            or leverage > 1_000_000
+        ):
+            raise Mql5FileAdapterError("account_schema_invalid")
         return payload
 
     def verify_identity(self) -> dict[str, str]:
@@ -144,7 +164,13 @@ class Mql5FileMt5Adapter:
 
     def account_info(self) -> Any:
         account = self._account()
-        return SimpleNamespace(trade_allowed=bool(account["trade_allowed"]))
+        return SimpleNamespace(
+            trade_allowed=bool(account["trade_allowed"]),
+            balance=float(account["balance"]),
+            equity=float(account["equity"]),
+            currency=str(account["currency"]).upper(),
+            leverage=int(account["leverage"]),
+        )
 
     def _rows(self, name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         envelope, payload = self._read_envelope(name)

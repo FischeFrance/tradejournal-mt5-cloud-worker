@@ -1,7 +1,7 @@
 """Independent, read-only consumer for the verified broker endpoint registry.
 
-The offline laboratory owns registry publication. The Windows Agent deliberately
-does not import lab code and cannot create or promote endpoint records.
+Publication and invalidation use a separate fail-closed component. Resolution
+never mutates records and never imports laboratory code.
 """
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ import ipaddress
 import json
 import re
 import stat
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 
-_REGISTRY_SCHEMA_VERSION = 1
+_REGISTRY_SCHEMA_VERSION = 3
 _MAX_JSON_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(
@@ -26,6 +25,7 @@ _SECRET_KEYS = re.compile(
     r"(?:password|passwd|token|secret|credential|hmac)", re.IGNORECASE
 )
 _RECORD_FIELDS = {
+    "server_name",
     "host",
     "port",
     "protocol",
@@ -33,13 +33,38 @@ _RECORD_FIELDS = {
     "observed_at_unix_ms",
     "discovery_method",
     "verification_pid",
+    "process_creation_time_unix_ms",
     "verification_session_id",
     "confidence",
     "artifact_relative_path",
     "artifact_sha256",
+    "invalidated_at_unix_ms",
+    "invalidation_reason",
+    "invalidation_event_id",
 }
-_VERIFIED_METHODS = {"MT5_LOGIN_DIALOG_IP", "MT5_NONINTERACTIVE_CONFIG"}
+_VERIFIED_METHODS = {
+    "MT5_LOGIN_DIALOG_IP",
+    "MT5_NONINTERACTIVE_CONFIG",
+    "MT5_MANAGED_INVESTOR_LOGIN",
+}
 _CONFIDENCES = {"LOW", "MEDIUM", "HIGH"}
+_STATUSES = {
+    "VERIFIED",
+    "INVALID",
+    "SUPERSEDED",
+    "CANDIDATE",
+    "METAQUOTES_CDN",
+}
+_INVALIDATION_REASONS = {
+    "ENDPOINT_CONNECTION_FAILED",
+    "ENDPOINT_CONNECTION_REFUSED",
+    "ENDPOINT_PROTOCOL_INCOMPATIBLE",
+    "ENDPOINT_SERVER_UNRECOGNIZED",
+    "SERVER_IDENTITY_MISMATCH",
+    "SUPERSEDED_BY_NEW_VERIFICATION",
+    "LEGACY_PROVENANCE_INSUFFICIENT",
+    "LEGACY_STATUS_MIGRATION",
+}
 
 
 class BrokerEndpointResolutionError(ValueError):
@@ -49,12 +74,14 @@ class BrokerEndpointResolutionError(ValueError):
 @dataclass(frozen=True)
 class VerifiedBrokerEndpoint:
     broker_label: str
+    server_name: str | None
     host: str
     port: int
     protocol: str
     observed_at_unix_ms: int
     discovery_method: str
     verification_pid: int
+    process_creation_time_unix_ms: int | None
     verification_session_id: str
     confidence: str
     artifact_relative_path: str
@@ -63,7 +90,9 @@ class VerifiedBrokerEndpoint:
     @property
     def server_address(self) -> str:
         address = ipaddress.ip_address(self.host)
-        return f"[{address.compressed}]:{self.port}" if address.version == 6 else f"{address.compressed}:{self.port}"
+        if address.version == 6:
+            return f"[{address.compressed}]:{self.port}"
+        return f"{address.compressed}:{self.port}"
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -145,7 +174,7 @@ def _sha256(path: Path) -> str:
 
 def _record(broker_label: str, value: Any) -> VerifiedBrokerEndpoint:
     if not isinstance(value, Mapping) or set(value) != _RECORD_FIELDS:
-        raise BrokerEndpointResolutionError("endpoint record fields do not match registry v1")
+        raise BrokerEndpointResolutionError("endpoint record fields do not match registry v3")
     try:
         address = ipaddress.ip_address(str(value["host"]))
     except ValueError as exc:
@@ -162,19 +191,53 @@ def _record(broker_label: str, value: Any) -> VerifiedBrokerEndpoint:
         raise BrokerEndpointResolutionError("endpoint port is invalid")
     if value["protocol"] != "TCP/TLS":
         raise BrokerEndpointResolutionError("endpoint protocol is unsupported")
-    if value["status"] not in {"VERIFIED", "CANDIDATE", "METAQUOTES_CDN", "EXPIRED"}:
+    status = value["status"]
+    if status not in _STATUSES:
         raise BrokerEndpointResolutionError("endpoint status is invalid")
     discovery_method = value["discovery_method"]
     if not isinstance(discovery_method, str) or not discovery_method:
         raise BrokerEndpointResolutionError("endpoint discovery method is invalid")
-    if value["status"] == "VERIFIED" and discovery_method not in _VERIFIED_METHODS:
+    if status == "VERIFIED" and discovery_method not in _VERIFIED_METHODS:
         raise BrokerEndpointResolutionError("verified endpoint method is not verifiable")
+    server_name = value["server_name"]
+    legacy_invalid = (
+        status == "INVALID"
+        and value.get("invalidation_reason")
+        in {
+            "LEGACY_PROVENANCE_INSUFFICIENT",
+            "LEGACY_STATUS_MIGRATION",
+        }
+    )
+    if legacy_invalid and server_name is None:
+        normalized_server_name = None
+    elif (
+        not isinstance(server_name, str)
+        or not server_name.strip()
+        or len(server_name) > 128
+        or any(character in server_name for character in "\r\n")
+    ):
+        raise BrokerEndpointResolutionError("endpoint server name is invalid")
+    else:
+        normalized_server_name = server_name.strip()
     observed = value["observed_at_unix_ms"]
     if not isinstance(observed, int) or isinstance(observed, bool) or observed <= 0:
         raise BrokerEndpointResolutionError("endpoint observation timestamp is invalid")
     pid = value["verification_pid"]
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         raise BrokerEndpointResolutionError("endpoint verification PID is invalid")
+    process_creation_time = value["process_creation_time_unix_ms"]
+    if legacy_invalid and process_creation_time is None:
+        normalized_process_creation_time = None
+    elif (
+        not isinstance(process_creation_time, int)
+        or isinstance(process_creation_time, bool)
+        or process_creation_time <= 0
+    ):
+        raise BrokerEndpointResolutionError(
+            "endpoint process creation time is invalid"
+        )
+    else:
+        normalized_process_creation_time = process_creation_time
     session_id = value["verification_session_id"]
     if not isinstance(session_id, str) or not _RUN_ID.fullmatch(session_id):
         raise BrokerEndpointResolutionError("endpoint verification session is invalid")
@@ -187,14 +250,53 @@ def _record(broker_label: str, value: Any) -> VerifiedBrokerEndpoint:
     relative = value["artifact_relative_path"]
     if not isinstance(relative, str) or not relative:
         raise BrokerEndpointResolutionError("endpoint artifact path is invalid")
+    invalidated_at = value["invalidated_at_unix_ms"]
+    invalidation_reason = value["invalidation_reason"]
+    invalidation_event_id = value["invalidation_event_id"]
+    if status in {"INVALID", "SUPERSEDED"}:
+        if (
+            not isinstance(invalidated_at, int)
+            or isinstance(invalidated_at, bool)
+            or invalidated_at <= 0
+            or invalidation_reason not in _INVALIDATION_REASONS
+            or not isinstance(invalidation_event_id, str)
+            or not _RUN_ID.fullmatch(invalidation_event_id)
+        ):
+            raise BrokerEndpointResolutionError(
+                "endpoint invalidation metadata is invalid"
+            )
+        if (
+            status == "SUPERSEDED"
+            and invalidation_reason != "SUPERSEDED_BY_NEW_VERIFICATION"
+        ):
+            raise BrokerEndpointResolutionError(
+                "superseded endpoint reason is invalid"
+            )
+        if (
+            status == "INVALID"
+            and invalidation_reason == "SUPERSEDED_BY_NEW_VERIFICATION"
+        ):
+            raise BrokerEndpointResolutionError(
+                "invalid endpoint reason is invalid"
+            )
+    elif (
+        invalidated_at is not None
+        or invalidation_reason is not None
+        or invalidation_event_id is not None
+    ):
+        raise BrokerEndpointResolutionError(
+            "active endpoint contains invalidation metadata"
+        )
     return VerifiedBrokerEndpoint(
         broker_label=broker_label,
+        server_name=normalized_server_name,
         host=address.compressed,
         port=port,
         protocol=value["protocol"],
         observed_at_unix_ms=observed,
         discovery_method=discovery_method,
         verification_pid=pid,
+        process_creation_time_unix_ms=normalized_process_creation_time,
         verification_session_id=session_id,
         confidence=confidence,
         artifact_relative_path=relative,
@@ -205,27 +307,48 @@ def _record(broker_label: str, value: Any) -> VerifiedBrokerEndpoint:
 def resolve_verified_broker_endpoint(
     registry_path: str | Path,
     *,
-    broker_label: str,
+    broker_label: str | None,
+    server_name: str,
     artifact_root: str | Path,
     artifact_manifest: str | Path,
-    now_unix_ms: int | None = None,
 ) -> VerifiedBrokerEndpoint:
-    """Return exactly one non-expired VERIFIED endpoint with intact provenance."""
+    """Return exactly one VERIFIED endpoint with intact provenance.
 
-    requested = broker_label.strip()
-    if not requested or len(requested) > 128 or any(character in requested for character in "\r\n"):
-        raise BrokerEndpointResolutionError("broker label is invalid")
-    requested_key = "".join(
-        character for character in requested.casefold() if character.isalnum()
-    )
-    if not requested_key:
-        raise BrokerEndpointResolutionError("broker label is invalid")
+    Verified endpoints do not expire with time. They remain eligible until an
+    endpoint-specific failed attempt atomically changes their status.
+    """
+
+    requested_key: str | None = None
+    if broker_label is not None:
+        requested = broker_label.strip()
+        if (
+            not requested
+            or len(requested) > 128
+            or any(character in requested for character in "\r\n")
+        ):
+            raise BrokerEndpointResolutionError("broker label is invalid")
+        requested_key = "".join(
+            character
+            for character in requested.casefold()
+            if character.isalnum()
+        )
+        if not requested_key:
+            raise BrokerEndpointResolutionError("broker label is invalid")
+    requested_server = server_name.strip()
+    if (
+        not requested_server
+        or len(requested_server) > 128
+        or any(character in requested_server for character in "\r\n")
+    ):
+        raise BrokerEndpointResolutionError("server name is invalid")
     registry = _read_json(Path(registry_path), "endpoint registry")
     manifest = _read_json(Path(artifact_manifest), "artifact manifest")
     _reject_secrets(registry)
     _reject_secrets(manifest)
-    if set(registry) != {"schema_version", "updated_at_unix_ms", "ttl_seconds", "brokers"}:
-        raise BrokerEndpointResolutionError("registry fields do not match registry v1")
+    if set(registry) != {"schema_version", "updated_at_unix_ms", "brokers"}:
+        raise BrokerEndpointResolutionError(
+            "registry fields do not match registry v3"
+        )
     if registry["schema_version"] != _REGISTRY_SCHEMA_VERSION:
         raise BrokerEndpointResolutionError("registry schema is unsupported")
     if (
@@ -234,9 +357,6 @@ def resolve_verified_broker_endpoint(
         or registry["updated_at_unix_ms"] <= 0
     ):
         raise BrokerEndpointResolutionError("registry timestamp is invalid")
-    ttl_seconds = registry["ttl_seconds"]
-    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
-        raise BrokerEndpointResolutionError("registry TTL is invalid")
     brokers = registry["brokers"]
     if not isinstance(brokers, Mapping):
         raise BrokerEndpointResolutionError("registry brokers are invalid")
@@ -262,20 +382,22 @@ def resolve_verified_broker_endpoint(
             (normalized_label, label, raw_records, records)
         )
     matches = [
-        (label, raw_records, records)
+        (normalized_label, label, raw_records, records)
         for normalized_label, label, raw_records, records in validated_brokers
-        if normalized_label == requested_key
+        if requested_key is None or normalized_label == requested_key
     ]
-    if len(matches) != 1:
+    if requested_key is not None and len(matches) != 1:
         raise BrokerEndpointResolutionError("broker endpoint is missing or ambiguous")
-    canonical_label, raw_records, records = matches[0]
-    now = int(time.time() * 1000) if now_unix_ms is None else now_unix_ms
-    verified = [
-        record
-        for raw, record in zip(raw_records, records)
-        if raw["status"] == "VERIFIED"
-        and record.observed_at_unix_ms + ttl_seconds * 1000 >= now
-    ]
+    verified: list[VerifiedBrokerEndpoint] = []
+    for _, _, raw_records, records in matches:
+        verified.extend(
+            record
+            for raw, record in zip(raw_records, records)
+            if raw["status"] == "VERIFIED"
+            and isinstance(record.server_name, str)
+            and record.server_name.casefold()
+            == requested_server.casefold()
+        )
     if len(verified) != 1:
         raise BrokerEndpointResolutionError("verified broker endpoint is missing or ambiguous")
     selected = verified[0]

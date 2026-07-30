@@ -36,14 +36,6 @@ def _runtime(
     terminal = tmp_path / "terminal" / "terminal64.exe"
     terminal.parent.mkdir(parents=True)
     terminal.write_bytes(b"terminal")
-    config = terminal.parent / "Config"
-    config.mkdir()
-    (config / "assistant.ini").write_text(
-        "[MCP.MetaEditor]\nEndpoint=http://127.0.0.1:22345/mcp\n"
-        "[MCP.MetaTrader]\nEndpoint=http://127.0.0.1:22346/mcp\n"
-        "[MCP.Custom]\n",
-        encoding="utf-8",
-    )
     loader = terminal.parent / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalLoader.ex5"
     loader.parent.mkdir(parents=True)
     loader.write_bytes(b"loader")
@@ -59,6 +51,11 @@ def _runtime(
     for name in ("chart01.chr", "chart02.chr", "chart03.chr", "chart04.chr"):
         (profile / name).write_text("generated chart", encoding="utf-8")
     (profile / "order.wnd").write_bytes(b"generated layout")
+    managed_profile = terminal.parent / "Profiles" / "Charts" / "TradeJournal"
+    managed_profile.mkdir()
+    for name in ("chart01.chr", "chart02.chr", "chart03.chr", "chart04.chr"):
+        (managed_profile / name).write_text("generated chart", encoding="utf-8")
+    (managed_profile / "order.wnd").write_bytes(b"generated layout")
     return NativeMt5Runtime(tmp_path, connection_id)
 
 
@@ -151,7 +148,7 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     ]
     assert checkpoint.call_count == 3
     assert wait_for_authorization.call_args_list == [
-        call({}, 42, "Demo", ANY),
+        call({}, 42, "Demo", ANY, "203.0.113.10:443"),
         call({}, 42, "Demo", ANY),
         call({}, 42, "Demo", ANY),
     ]
@@ -183,67 +180,25 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert "InpCandleBars=200\n</inputs>" in template
 
 
-def test_mcp_endpoint_isolation_assigns_distinct_loopback_ports(
-    tmp_path: Path,
-) -> None:
-    instances = tmp_path / "instances"
-    first_id = "00000000-0000-4000-8000-000000000001"
-    second_id = "00000000-0000-4000-8000-000000000002"
-    first = _runtime(instances / first_id, first_id)
-    second = _runtime(instances / second_id, second_id)
-
-    with patch.object(
-        NativeMt5Runtime, "_ports_are_bindable", return_value=True
-    ):
-        first_ports = first._ensure_mcp_endpoint_isolation()
-        second_ports = second._ensure_mcp_endpoint_isolation()
-
-    assert first_ports != second_ports
-    assert first_ports[1] == first_ports[0] + 1
-    assert second_ports[1] == second_ports[0] + 1
-    assert 30_000 <= first_ports[0] <= 59_998
-    assert 30_000 <= second_ports[0] <= 59_998
-    assert NativeMt5Runtime._assistant_mcp_ports(
-        first.terminal_root / "Config" / "assistant.ini"
-    ) == first_ports
-    assert NativeMt5Runtime._assistant_mcp_ports(
-        second.terminal_root / "Config" / "assistant.ini"
-    ) == second_ports
-
-
-def test_mcp_endpoint_isolation_preserves_mt5_utf16_config(
+def test_reset_managed_chart_profile_removes_only_managed_generated_chart_state(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(tmp_path)
-    assistant = runtime.terminal_root / "Config" / "assistant.ini"
-    content = assistant.read_text(encoding="utf-8")
-    assistant.write_text(content, encoding="utf-16")
-
-    with patch.object(
-        NativeMt5Runtime, "_ports_are_bindable", return_value=True
-    ):
-        ports = runtime._ensure_mcp_endpoint_isolation()
-
-    assert assistant.read_bytes().startswith(b"\xff\xfe")
-    assert NativeMt5Runtime._assistant_mcp_ports(assistant) == ports
-
-
-def test_reset_default_chart_profile_removes_only_generated_chart_state(
-    tmp_path: Path,
-) -> None:
-    runtime = _runtime(tmp_path)
-    profile = runtime.terminal_root / "Profiles" / "Charts" / "Default"
+    profile = runtime.terminal_root / "Profiles" / "Charts" / "TradeJournal"
     retained = profile / "profile-note.txt"
     retained.write_text("keep", encoding="utf-8")
 
-    assert runtime._reset_default_chart_profile() == 5
+    assert runtime._reset_managed_chart_profile() == 5
 
     assert not tuple(profile.glob("*.chr"))
     assert not (profile / "order.wnd").exists()
     assert retained.read_text(encoding="utf-8") == "keep"
+    default_profile = runtime.terminal_root / "Profiles" / "Charts" / "Default"
+    assert len(tuple(default_profile.glob("*.chr"))) == 4
+    assert (default_profile / "order.wnd").is_file()
 
 
-def test_reset_default_chart_profile_refuses_running_terminal(
+def test_reset_managed_chart_profile_refuses_running_terminal(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(tmp_path)
@@ -252,7 +207,7 @@ def test_reset_default_chart_profile_refuses_running_terminal(
         patch.object(runtime, "_running_terminal_pids", return_value=[123]),
         pytest.raises(NativeMt5Error, match="chart_profile_in_use"),
     ):
-        runtime._reset_default_chart_profile()
+        runtime._reset_managed_chart_profile()
 
 
 def test_resume_uses_cached_account_and_direct_readonly_expert(
@@ -277,7 +232,6 @@ def test_resume_uses_cached_account_and_direct_readonly_expert(
     )
 
     with (
-        patch.object(runtime, "_ensure_mcp_endpoint_isolation"),
         patch.object(
             runtime, "_write_startup_config", return_value=config
         ) as write_config,
@@ -313,6 +267,9 @@ def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path
     config = runtime._write_startup_config(None, None, None, "EURUSD")
     content = config.read_text(encoding="utf-8")
     assert "Expert=TradeJournal\\TradeJournalBridge" in content
+    assert "ProfileLast=TradeJournal" in content
+    assert "PreloadCharts=0" in content
+    assert "ProfileLast=Default" not in content
     assert str(runtime.terminal_root) not in content
 
 
@@ -541,6 +498,11 @@ def test_start_process_uses_limited_dedicated_interactive_session(
         ),
     )
     completed = Mock(returncode=0)
+    monkeypatch.setattr(
+        runtime,
+        "_interactive_session_present",
+        lambda _user: True,
+    )
 
     with patch("subprocess.run", return_value=completed) as run:
         assert runtime._start_process(config, 42) is None
@@ -607,6 +569,58 @@ def test_start_process_uses_limited_dedicated_interactive_session(
     assert str(config) in launcher
 
 
+def test_reboot_recovery_waits_for_dedicated_interactive_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    probes = iter((False, False, True))
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        runtime,
+        "_interactive_session_present",
+        lambda _user: next(probes),
+    )
+    monkeypatch.setattr(
+        "windows_agent.worker.native_mt5_runtime.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    runtime._wait_for_interactive_session("TradeJournalMT5", timeout=90)
+
+    assert sleeps == [0.5, 0.5]
+
+
+def test_reboot_recovery_fails_closed_without_interactive_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    clock = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(
+        runtime,
+        "_interactive_session_present",
+        lambda _user: False,
+    )
+    monkeypatch.setattr(
+        "windows_agent.worker.native_mt5_runtime.time.monotonic",
+        lambda: next(clock),
+    )
+    monkeypatch.setattr(
+        "windows_agent.worker.native_mt5_runtime.time.sleep",
+        lambda _seconds: None,
+    )
+
+    with pytest.raises(
+        NativeMt5Error,
+        match="interactive_session_unavailable",
+    ):
+        runtime._wait_for_interactive_session(
+            "TradeJournalMT5",
+            timeout=0.5,
+        )
+
+
 def test_successful_interactive_launch_deletes_one_shot_task(
     tmp_path: Path,
 ) -> None:
@@ -668,6 +682,178 @@ def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> 
         runtime._wait_for_authorization(checkpoint, 42, "Demo", 1.0)
 
 
+def test_wait_for_authorization_returns_redirected_server_for_same_login(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    logs = runtime.terminal_root / "logs"
+    logs.mkdir()
+    (logs / "20260729.log").write_bytes(
+        (
+            "AA\t0\t08:14:26\tNetwork\t"
+            "'42': authorized on PepperstoneEU-Live\r\n"
+        ).encode("utf-16-le")
+    )
+
+    with patch.object(runtime, "_running_terminal_pids", return_value=[123]):
+        effective_server = runtime._wait_for_authorization(
+            {},
+            42,
+            "PepperstoneUK-Live",
+            1.0,
+        )
+
+    assert effective_server == "PepperstoneEU-Live"
+
+
+def test_start_uses_redirected_server_for_followup_identity_checks(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    runtime.state.mkdir()
+    configs = [
+        runtime.state / "login-bootstrap.ini",
+        runtime.state / "symbol-discovery.ini",
+        runtime.state / "startup.ini",
+    ]
+    for config in configs:
+        config.write_text("temporary", encoding="utf-8")
+    ready = NativeMt5Status(
+        pid=123,
+        account={
+            "login": "42",
+            "server": "PepperstoneEU-Live",
+            "trade_allowed": False,
+        },
+        heartbeat={"terminal_connected": True},
+        files_path=runtime.files,
+    )
+
+    with (
+        patch.object(runtime, "install_expert"),
+        patch.object(
+            runtime,
+            "_write_startup_config",
+            side_effect=configs,
+        ),
+        patch.object(runtime, "_journal_checkpoint", return_value={}),
+        patch.object(runtime, "_start_process"),
+        patch.object(
+            runtime,
+            "_wait_for_authorization",
+            side_effect=[
+                "PepperstoneEU-Live",
+                "PepperstoneEU-Live",
+                "PepperstoneEU-Live",
+            ],
+        ) as wait_for_authorization,
+        patch.object(runtime, "_wait_for_account_database"),
+        patch.object(runtime, "_wait_for_investor_sync"),
+        patch.object(
+            runtime,
+            "_probe_broker_symbol",
+            return_value="EURUSD",
+        ),
+        patch.object(runtime, "_remove_readiness_files"),
+        patch.object(runtime, "_install_bridge_template"),
+        patch.object(
+            runtime,
+            "_wait_for_heartbeat",
+            return_value=ready,
+        ) as wait_for_heartbeat,
+        patch.object(runtime, "stop", return_value=True),
+        patch("gc.collect"),
+    ):
+        result = runtime.start(
+            login=42,
+            server="PepperstoneUK-Live",
+            investor_password="placeholder",
+            expert_binary=expert,
+        )
+
+    assert result.requested_server == "PepperstoneUK-Live"
+    assert result.effective_server == "PepperstoneEU-Live"
+    assert wait_for_authorization.call_args_list[1].args[2] == (
+        "PepperstoneEU-Live"
+    )
+    assert wait_for_authorization.call_args_list[2].args[2] == (
+        "PepperstoneEU-Live"
+    )
+    wait_for_heartbeat.assert_called_once_with(
+        90.0,
+        42,
+        "PepperstoneEU-Live",
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        (
+            "'42': connection to 203.0.113.10:443 failed",
+            "endpoint_connection_failed",
+        ),
+        (
+            "'42': connection refused by 203.0.113.10:443",
+            "endpoint_connection_refused",
+        ),
+        (
+            "'42': protocol mismatch at 203.0.113.10:443",
+            "endpoint_protocol_incompatible",
+        ),
+        (
+            "'42': unknown server 203.0.113.10:443",
+            "endpoint_server_unrecognized",
+        ),
+    ],
+)
+def test_wait_for_authorization_classifies_exact_endpoint_failure(
+    tmp_path: Path,
+    message: str,
+    expected_code: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    logs = runtime.terminal_root / "logs"
+    logs.mkdir()
+    (logs / "20260718.log").write_bytes(
+        f"AA\t0\t10:00:00\tNetwork\t{message}\r\n".encode("utf-16-le")
+    )
+
+    with pytest.raises(NativeMt5Error, match=expected_code):
+        runtime._wait_for_authorization(
+            {},
+            42,
+            "Demo",
+            1.0,
+            "203.0.113.10:443",
+        )
+
+
+def test_invalid_account_remains_auth_failure_even_with_endpoint(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    logs = runtime.terminal_root / "logs"
+    logs.mkdir()
+    (logs / "20260718.log").write_bytes(
+        (
+            "AA\t0\t10:00:00\tNetwork\t"
+            "'42': invalid account at 203.0.113.10:443\r\n"
+        ).encode("utf-16-le")
+    )
+
+    with pytest.raises(NativeMt5Error, match="authorization_failed"):
+        runtime._wait_for_authorization(
+            {},
+            42,
+            "Demo",
+            1.0,
+            "203.0.113.10:443",
+        )
+
+
 def test_wait_for_heartbeat_binds_pid_after_interactive_task_release(
     tmp_path: Path,
 ) -> None:
@@ -682,10 +868,71 @@ def test_wait_for_heartbeat_binds_pid_after_interactive_task_release(
     runtime._interactive_task = None
     runtime._process = None
 
-    with patch.object(runtime, "_running_terminal_pids", return_value=[456]):
+    with (
+        patch.object(runtime, "_running_terminal_pids", return_value=[456]),
+        patch.object(runtime, "set_terminal_window_visibility") as set_visibility,
+    ):
         status = runtime._wait_for_heartbeat(1.0, 42, "Demo")
 
     assert status.pid == 456
+    set_visibility.assert_called_once_with(456, visible=False)
+
+
+def test_terminal_window_visibility_uses_pid_creation_time_and_interactive_task(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.state.mkdir()
+    runtime.files.mkdir(parents=True)
+    creation_time_unix_ms = 1_785_230_000_123
+    commands: list[list[str]] = []
+
+    def run_command(arguments, **kwargs):
+        del kwargs
+        command = [str(value) for value in arguments]
+        commands.append(command)
+        if "/Run" in command:
+            (runtime.files / "window-visibility-result.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "success": True,
+                        "action": "hide",
+                        "process_id": 456,
+                        "creation_time_unix_ms": creation_time_unix_ms,
+                        "windows_matched": 1,
+                        "visible_before": 1,
+                        "visible_after": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return Mock(returncode=0)
+
+    with (
+        patch.object(runtime, "_interactive_user", return_value="TradeJournalMT5"),
+        patch.object(
+            runtime,
+            "_terminal_process_identity",
+            return_value=(runtime.terminal.resolve(), creation_time_unix_ms),
+        ),
+        patch.object(runtime, "_restrict_private_acl"),
+        patch.object(runtime, "_grant_interactive_acl"),
+        patch("subprocess.run", side_effect=run_command),
+    ):
+        result = runtime.set_terminal_window_visibility(456, visible=False)
+
+    assert result["visible_after"] == 0
+    create = next(command for command in commands if "/Create" in command)
+    assert "/IT" in create
+    assert "/RU" in create
+    assert create[create.index("/RU") + 1] == "TradeJournalMT5"
+    assert not (runtime.state / "window-visibility-request.json").exists()
+    assert not (runtime.state / "set-window-visibility.cmd").exists()
+    assert not (runtime.files / "window-visibility-result.json").exists()
+    serialized_commands = " ".join(" ".join(command) for command in commands)
+    assert "Password=" not in serialized_commands
+    assert "Token=" not in serialized_commands
 
 
 def test_wait_for_investor_sync_requires_sync_and_readonly_lines(tmp_path: Path) -> None:
@@ -765,3 +1012,50 @@ def test_crashed_process_is_reported(tmp_path: Path) -> None:
     with patch.object(runtime, "_running_terminal_pids", return_value=[]):
         with pytest.raises(NativeMt5Error, match="mt5_process_crashed"):
             runtime._wait_for_heartbeat(1.0, 42, "Demo")
+
+
+def test_stop_treats_process_exit_during_cleanup_as_success(tmp_path: Path, monkeypatch) -> None:
+    runtime = _runtime(tmp_path)
+
+    class ProcessExited:
+        def terminate(self) -> None:
+            raise psutil.NoSuchProcess(123)
+
+    import psutil
+
+    pid_scans = iter(([123], []))
+    monkeypatch.setattr(runtime, "_running_terminal_pids", lambda: next(pid_scans))
+    monkeypatch.setattr(runtime, "_running_metaeditor_pids", lambda: [])
+    monkeypatch.setattr(psutil, "Process", lambda pid: ProcessExited())
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: ([], []))
+
+    assert runtime.stop(timeout=0.1) is True
+
+
+def test_stop_waits_after_forced_kill_before_final_rescan(tmp_path: Path, monkeypatch) -> None:
+    runtime = _runtime(tmp_path)
+    calls: list[list[object]] = []
+
+    class ProcessStillAlive:
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+    import psutil
+
+    process = ProcessStillAlive()
+    pid_scans = iter(([123], [], []))
+    monkeypatch.setattr(runtime, "_running_terminal_pids", lambda: next(pid_scans))
+    monkeypatch.setattr(runtime, "_running_metaeditor_pids", lambda: [])
+    monkeypatch.setattr(psutil, "Process", lambda pid: process)
+
+    def wait_procs(processes, timeout):
+        calls.append(list(processes))
+        return ([], [process]) if len(calls) == 1 else ([process], [])
+
+    monkeypatch.setattr(psutil, "wait_procs", wait_procs)
+
+    assert runtime.stop(timeout=0.1) is True
+    assert calls == [[process], [process]]

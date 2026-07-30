@@ -72,5 +72,13 @@
   },
   "failResponseOk": { "api_version": "1", "status": "failed" },
   "transitionResponseLeaseLost": { "api_version": "1", "error_code": "lease_lost" },
+  "progressRequest": {
+    "api_version": "1",
+    "lease_id": "9d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6a",
+    "event_code": "broker_discovery",
+    "event_status": "started",
+    "detail_code": "wizard_required"
+  },
+  "progressResponseOk": { "api_version": "1", "event_recorded": true },
   "errorResponse_unauthorized": { "error_code": "unauthorized" }
 }
