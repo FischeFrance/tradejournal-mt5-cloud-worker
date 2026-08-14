@@ -13,6 +13,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from windows_agent import real_handlers
+from windows_agent.agent_errors import DeprovisionFailed
 from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
@@ -461,6 +462,8 @@ def test_deprovision_is_idempotent(env):
     result_2 = handlers["deprovision"](_job("deprovision", cid))
     assert result_1 == {"deprovisioned": True}
     assert result_2 == {"deprovisioned": True}
+    assert not root.exists()
+    assert not (env.secrets_root / cid).exists()
     store = WindowsSecretStore(env.secrets_root)
     with pytest.raises(Exception):
         store.read(cid, "mt5_investor_password")
@@ -479,10 +482,38 @@ def test_deprovision_only_touches_its_own_connection(env):
     handlers["provision"](_job("provision", cid_a, payload=_provision_payload()))
     handlers["provision"](_job("provision", cid_b, payload=_provision_payload(login=999, server="Other")))
     handlers["deprovision"](_job("deprovision", cid_a))
-    assert not (InstanceLayout(env.instances_root, cid_a).path / "terminal").exists()
+    assert not InstanceLayout(env.instances_root, cid_a).path.exists()
     root_b = InstanceLayout(env.instances_root, cid_b).path
     assert (root_b / "terminal" / "terminal64.exe").exists()
     assert WindowsSecretStore(env.secrets_root).read(cid_b, "mt5_login") == "999"
+
+
+def test_deprovision_fails_closed_when_instance_process_cleanup_is_not_confirmed(env):
+    cid = str(uuid4())
+    handlers = _handlers(env, FakeApi())
+    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    root = InstanceLayout(env.instances_root, cid).path
+
+    class UncleanableProcessManager(FakeProcessManager):
+        def cleanup_path(self, executable):
+            return False
+
+    handlers = build_real_handlers(
+        FakeApi(),
+        instances_root=env.instances_root,
+        secrets_root=env.secrets_root,
+        source_terminal=env.source_terminal,
+        adapter_factory=lambda terminal, login, server: ScriptedAdapter(
+            terminal, login, server
+        ),
+        process_factory=UncleanableProcessManager,
+    )
+
+    with pytest.raises(DeprovisionFailed):
+        handlers["deprovision"](_job("deprovision", cid))
+
+    assert root.exists()
+    assert WindowsSecretStore(env.secrets_root).read(cid, "mt5_login") == "12345"
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,8 @@ _TRADING_CALL_PATTERNS = [
     re.compile(r"\bOrderDelete\s*\("),
     re.compile(r"\bPositionClose\s*\("),
     re.compile(r"\bPositionClosePartial\s*\("),
+    re.compile(r"\bPositionOpen\s*\("),
+    re.compile(r"\bPositionModify\s*\("),
     # L'inclusione della libreria standard di trading (necessaria per usare CTrade) e' il segnale
     # di uso reale: il solo nome "CTrade" puo' comparire in un commento che ne documenta
     # l'assenza (come in questo stesso file), quindi non e' usato come pattern a se stante.
@@ -79,3 +81,28 @@ def test_expert_advisor_declares_required_handlers():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
     for handler in ("OnInit", "OnDeinit", "OnTimer", "OnTradeTransaction"):
         assert re.search(rf"\b{handler}\s*\(", text), f"handler mancante: {handler}"
+
+
+def test_bootstrap_heartbeat_precedes_expensive_history_backfill():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    on_init = text[text.index("int OnInit()"):text.index("void OnDeinit(")]
+    on_timer = text[text.index("void OnTimer()"):text.index("void OnTradeTransaction(")]
+    assert "WriteBootstrapHandshake();" in on_init
+    assert "RunBackfill();" not in on_init
+    assert "RunBackfill();" in on_timer
+
+
+def test_expert_declares_versioned_file_bridge_contract():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    for required in (
+        "schema_version",
+        "generated_at",
+        "sequence",
+        "account_identity",
+        "server_identity",
+        "payload",
+        "deals.json",
+        "candles\\\\",
+        "events\\\\",
+    ):
+        assert required in text, f"contratto file bridge mancante: {required}"

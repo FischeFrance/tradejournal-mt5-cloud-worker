@@ -48,10 +48,7 @@ class InstanceProvisioner:
         root = layout.path
         if not root.exists():
             return
-        atomic_json(
-            root / "state" / "instance.json",
-            {"connection_id": connection_id, "status": "deprovisioned"},
-        )
-        for child in (root / "terminal", root / "worker", root / "data"):
-            if child.exists():
-                shutil.rmtree(child)
+        # A completed deprovision is the proof that no account-owned runtime material remains.
+        # Keep no tombstone inside the instance root: doing so previously left state/log files on
+        # the VPS and made an application-side delete look complete while local data survived.
+        shutil.rmtree(root)

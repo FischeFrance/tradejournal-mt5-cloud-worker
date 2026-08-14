@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from windows_agent.agent_daemon import run_forever
 from windows_agent.job_runner import JobRunner
+from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.real_handlers import build_real_handlers
 
@@ -176,6 +177,8 @@ def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp
     failed = [job_id for job_id, status, _ in control_plane.transitions if status == "fail"]
     assert failed == []
     assert completed == ["job-provision", "job-historical-sync", "job-deprovision"]
+    assert not InstanceLayout(instances_root, cid).path.exists()
+    assert not (secrets_root / cid).exists()
 
     store = WindowsSecretStore(secrets_root)
     # Provisioned secrets must be gone after deprovision -- proves deprovision actually ran

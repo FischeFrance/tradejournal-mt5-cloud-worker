@@ -306,7 +306,23 @@ def build_real_handlers(
             # call even if the instance was never fully provisioned (process.stop() is a no-op
             # when its state file is absent, and InstanceProvisioner.deprovision() is itself
             # idempotent, see test_fake_provision_deprovision_idempotent).
-            process_factory(root / "state" / "terminal-process.json").stop()
+            process = process_factory(root / "state" / "terminal-process.json")
+            stop_error: Exception | None = None
+            try:
+                process.stop()
+            except Exception as exc:
+                # A stale or mismatched PID state is not enough to abandon cleanup. The exact
+                # executable-path sweep below is the authoritative proof that no process from this
+                # account instance survives. Preserve the stop error if that sweep also fails.
+                stop_error = exc
+
+            terminal = root / "terminal" / "terminal64.exe"
+            if root.exists():
+                cleanup_path = getattr(process, "cleanup_path", None)
+                if not callable(cleanup_path) or not cleanup_path(terminal):
+                    raise RuntimeError(
+                        "terminal cleanup could not be confirmed for the account instance"
+                    ) from stop_error
             InstanceProvisioner(instances_root, secrets_root).deprovision(cid)
         except Exception as exc:
             raise DeprovisionFailed("deprovision failed") from exc

@@ -165,12 +165,16 @@ def run_customer_flow(
     secrets_root,
     source_terminal,
     control_plane=None,
-    adapter_factory=DirectMt5Adapter,
+    adapter_factory=None,
     secret_store=None,
     process_factory=ProcessManager,
     simulate_disconnect=False,
 ):
     report = empty_report(str(payload.get("connection_id", "invalid")))
+    if adapter_factory is None:
+        raise CustomerFlowError(
+            "legacy_direct_adapter_disabled_use_file_bridge_customer_flow"
+        )
     control = control_plane or LocalControlPlane()
     store = secret_store or WindowsSecretStore(secrets_root)
     provisioner = InstanceProvisioner(instances_root, secrets_root)
@@ -320,6 +324,8 @@ def main():
         instances_root=Path(r"C:\TradeJournal\instances"),
         secrets_root=Path(r"C:\TradeJournal\secrets"),
         source_terminal=args.terminal,
+        # DirectMt5Adapter is intentionally not selected here. Use
+        # scripts/windows/run-real-file-bridge-customer-flow.ps1 instead.
         simulate_disconnect=args.disconnect,
     )
     write_report(report, args.report)

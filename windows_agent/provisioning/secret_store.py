@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -73,12 +74,9 @@ class WindowsSecretStore:
         directory = safe_child(self.root, connection_id)
         if not directory.exists():
             return
-        for path in directory.glob("*.dpapi"):
-            path.unlink()
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
+        # Delete the complete per-connection enclave and propagate any failure. A silent partial
+        # cleanup must never be reported as a successful deprovision to the control plane.
+        shutil.rmtree(directory)
 
     @staticmethod
     def restrict_acl(path: Path) -> None:
