@@ -103,9 +103,18 @@ class JobRunner:
             # control plane only ever receives the sanitized error_code (see agent_errors.py).
             logger.exception("job %s failed (job_type=%s): sending error_code=%s", job["job_id"], minimal["action"], error_code)
             self.api.transition(job["job_id"], job["lease_id"], "fail", {"error_code": error_code})
-            atomic_json(
-                self.state, {**minimal, "status": "failed", "error": type(exc).__name__}
-            )
+            try:
+                atomic_json(
+                    self.state, {**minimal, "status": "failed", "error": type(exc).__name__}
+                )
+            except ValueError:
+                # atomic_json's secrets-forbidden guard matches any quoted JSON string that
+                # *starts* with a marker word (see state_store.py) -- a coincidental case, not an
+                # actual secret: SecretStoreFailed itself starts with "secret". The control plane
+                # already has the real, sanitized error_code from the transition() call above;
+                # local diagnostic state losing the class name here is a cosmetic downgrade, not a
+                # reason to let this crash escape run_once() and mask the job's real failure.
+                atomic_json(self.state, {**minimal, "status": "failed", "error": "redacted"})
         return True
 
     def recover(self) -> dict:

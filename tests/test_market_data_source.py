@@ -6,7 +6,6 @@ senza dipendenze esterne."""
 
 from __future__ import annotations
 
-from datetime import timezone
 
 from market_data_source import (
     TIMEFRAME_SECONDS,
