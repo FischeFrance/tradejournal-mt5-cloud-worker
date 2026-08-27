@@ -45,11 +45,28 @@ class FakeNativeRuntime:
 
     def start(self, **kwargs: Any) -> NativeMt5Status:
         assert kwargs["expert_binary"].name == "TradeJournalBridge.ex5"
+        managed_assets = (
+            Path("MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"),
+            Path("MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5"),
+            Path("MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5"),
+        )
+        for relative in managed_assets:
+            asset = self.root / "terminal" / relative
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(b"fixture-managed-runtime")
         files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"
         files.mkdir(parents=True, exist_ok=True)
         records = {
             "heartbeat.json": {"terminal_connected": True, "account_trade_allowed": False},
-            "account.json": {"login": "42", "server": "Demo", "trade_allowed": False},
+            "account.json": {
+                "login": "42",
+                "server": "Demo",
+                "balance": 100.0,
+                "equity": 100.0,
+                "currency": "USD",
+                "leverage": 100,
+                "trade_allowed": False,
+            },
             "positions.json": [],
             "orders.json": [],
             "history_orders.json": [{"ticket": "1", "time": "2026-07-01T00:00:00Z"}],
@@ -58,6 +75,10 @@ class FakeNativeRuntime:
         for name, payload in records.items():
             (files / name).write_text(json.dumps(_bridge_envelope(payload)), encoding="utf-8")
         return NativeMt5Status(999, records["account.json"], records["heartbeat.json"], files)
+
+    def resume(self, **kwargs: Any) -> NativeMt5Status:
+        assert "investor_password" not in kwargs
+        return self.start(**kwargs)
 
 
 class FakeProcessManager:
@@ -87,7 +108,17 @@ class QueueApi:
 
     def transition(self, job_id: str, lease_id: str, status: str, result: dict[str, object] | None = None) -> dict[str, str]:
         self.transitions.append((job_id, status, result))
-        return {"status": status}
+        return {"status": "failed" if status == "fail" else status}
+
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict[str, bool]:
+        return {"event_recorded": True}
 
 
 def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Path, monkeypatch) -> None:
@@ -105,7 +136,7 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
     expert.write_bytes(b"expert")
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     jobs = [
-        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "all_available", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo"}},
+        {"job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1", "history_mode": "new_only", "payload": {"credential_envelope": _envelope({"investor_password": "read-only"}), "expected_login": 42, "expected_server": "Demo", "broker_label": "Demo Broker"}},
         {"job_id": "deprovision", "job_type": "deprovision", "connection_id": cid, "lease_id": "2", "history_mode": None, "payload": {}},
     ]
     api = QueueApi(jobs)
@@ -137,6 +168,9 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    monkeypatch.setattr(
+        "requests.post", MagicMock(return_value=MagicMock(status_code=200))
+    )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
     terminal = tmp_path / "template" / "terminal64.exe"
@@ -147,11 +181,12 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     api = QueueApi([{
         "job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1",
-        "history_mode": "all_available",
+        "history_mode": "new_only",
         "payload": {
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
             "expected_server": "Demo",
+            "broker_label": "Demo Broker",
             "bridge_token": "tjmt5_test-bridge-token",
         },
     }])
@@ -171,7 +206,7 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     return cid, api, handlers
 
 
-def test_legacy_live_sync_job_does_not_send_periodic_heartbeat(tmp_path: Path, monkeypatch) -> None:
+def test_live_sync_job_sends_heartbeat_over_http(tmp_path: Path, monkeypatch) -> None:
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
     api.jobs.append({
         "job_id": "live-sync-1", "job_type": "live_sync", "connection_id": cid, "lease_id": "2",
@@ -182,7 +217,13 @@ def test_legacy_live_sync_job_does_not_send_periodic_heartbeat(tmp_path: Path, m
         assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once() is True
 
     assert api.transitions[-1][1] == "complete"
-    assert mock_post.call_count == 0
+    heartbeat_calls = [
+        call
+        for call in mock_post.call_args_list
+        if call.kwargs.get("json", {}).get("event_type") == "heartbeat"
+    ]
+    assert len(heartbeat_calls) == 1
+    assert heartbeat_calls[0].kwargs["headers"]["Authorization"] == "Bearer tjmt5_test-bridge-token"
 
 
 def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monkeypatch) -> None:
@@ -191,13 +232,13 @@ def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monk
     runtime_factory) rather than fail, exactly like a genuine crash/reboot recovery would."""
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
     relaunched = []
-    original_start = FakeNativeRuntime.start
+    original_resume = FakeNativeRuntime.resume
 
-    def _tracking_start(self, **kwargs):
+    def _tracking_resume(self, **kwargs):
         relaunched.append(self.connection_id)
-        return original_start(self, **kwargs)
+        return original_resume(self, **kwargs)
 
-    monkeypatch.setattr(FakeNativeRuntime, "start", _tracking_start)
+    monkeypatch.setattr(FakeNativeRuntime, "resume", _tracking_resume)
     api.jobs.append({
         "job_id": "live-sync-1", "job_type": "live_sync", "connection_id": cid, "lease_id": "2",
         "history_mode": None, "payload": {},
@@ -224,11 +265,12 @@ def test_live_sync_job_fails_fast_when_ingestion_url_not_configured(tmp_path: Pa
     WindowsSecretStore(secrets).write(AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME, KEY)
     api = QueueApi([{
         "job_id": "provision", "job_type": "provision", "connection_id": cid, "lease_id": "1",
-        "history_mode": "all_available",
+        "history_mode": "new_only",
         "payload": {
             "credential_envelope": _envelope({"investor_password": "read-only"}),
             "expected_login": 42,
             "expected_server": "Demo",
+            "broker_label": "Demo Broker",
             "bridge_token": "tjmt5_test-bridge-token",
         },
     }])
