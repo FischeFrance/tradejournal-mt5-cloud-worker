@@ -43,6 +43,7 @@ bool g_backfill_done = false;
 //--- anche fra connessioni/account diversi con ticket numericamente coincidenti.
 string g_connection_id = "unknown-connection";
 bool   g_new_only      = false;
+datetime g_history_from = 0;
 ulong  g_new_only_started_ms = 0;
 const ulong NEW_ONLY_STARTUP_GRACE_MS = 5000;
 
@@ -201,6 +202,24 @@ bool ReadNewOnlyMode()
    StringTrimLeft(content);
    StringTrimRight(content);
    return content == "new_only";
+  }
+
+datetime ReadHistoryFrom()
+  {
+   string path = BASE_DIR + "\\history_from_unix";
+   if(!FileIsExist(path))
+      return 0;
+   int handle = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ, 0, CP_UTF8);
+   if(handle == INVALID_HANDLE)
+      return 0;
+   string content = "";
+   while(!FileIsEnding(handle))
+      content += FileReadString(handle);
+   FileClose(handle);
+   StringTrimLeft(content);
+   StringTrimRight(content);
+   long unix_time = StringToInteger(content);
+   return unix_time > 0 ? (datetime)unix_time : 0;
   }
 
 //+------------------------------------------------------------------------+
@@ -418,7 +437,7 @@ string BuildOrdersJson()
 string BuildHistoryOrdersJson()
   {
    datetime to_time = TimeCurrent();
-   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
+   datetime from_time = g_history_from;
    string json = "[";
    bool first = true;
    if(!HistorySelect(from_time, to_time))
@@ -449,7 +468,7 @@ string BuildHistoryOrdersJson()
 string BuildDealsJson()
   {
    datetime to_time = TimeCurrent();
-   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
+   datetime from_time = g_history_from;
    string json = "[";
    bool first = true;
    if(!HistorySelect(from_time, to_time))
@@ -467,6 +486,10 @@ string BuildDealsJson()
       json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
       json += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
       json += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
+      long deal_type = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      json += "\"type\":" + IntegerToString(deal_type) + ",";
+      json += "\"direction\":" + JsonString((deal_type == DEAL_TYPE_SELL) ? "sell" : "buy") + ",";
+      json += "\"entry\":" + JsonString(EntryToString(HistoryDealGetInteger(ticket, DEAL_ENTRY))) + ",";
       json += "\"volume\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_VOLUME)) + ",";
       json += "\"price\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PRICE)) + ",";
       json += "\"profit\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PROFIT)) + ",";
@@ -796,16 +819,13 @@ int OnInit()
    g_connection_id = ReadConnectionId();
    WriteInitMarker("connection-id-ready");
    g_new_only = ReadNewOnlyMode();
+   g_history_from = ReadHistoryFrom();
    WriteInitMarker(g_new_only ? "mode-new-only" : "mode-history");
    g_new_only_started_ms = GetTickCount64();
    LoadCursorState();
    WriteInitMarker("cursor-ready");
-   if(!g_new_only && !g_backfill_done)
-     {
-      RunBackfill();
-      g_backfill_done = true;
-     SaveCursorState();
-     }
+   // Lo storico viene ricostruito dagli snapshot e inviato in batch dal Windows Agent.
+   // Non generare migliaia di event-*.json, che appartengono esclusivamente al flusso live.
 
    // Su un'istanza live appena creata, le AccountInfo*/PositionsTotal/OrdersTotal invocate
    // durante OnInit possono attendere la cache account e impedire allo stesso terminale di

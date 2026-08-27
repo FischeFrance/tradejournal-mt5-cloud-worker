@@ -98,7 +98,16 @@ def test_rejects_identity_mismatch_and_keeps_checkpoint_bounded(tmp_path: Path) 
         adapter.files_dir,
         "account.json",
         {"login": "42", "server": "Demo-Server", "trade_allowed": False},
+        sequence=44,
     )
+    _write(
+        adapter.files_dir,
+        "heartbeat.json",
+        {"terminal_connected": True, "account_trade_allowed": False},
+        sequence=44,
+    )
+    _write(adapter.files_dir, "positions.json", [], sequence=44)
+    _write(adapter.files_dir, "orders.json", [], sequence=44)
     _write(
         adapter.files_dir,
         "deals.json",

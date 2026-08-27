@@ -116,8 +116,28 @@ def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text
 
 
-def test_discovery_script_only_waits_for_account_connection():
+def test_discovery_script_publishes_versioned_identity_bound_handoff():
     text = (MT5_EXPERTS_DIR / "TradeJournalDiscovery.mq5").read_text(encoding="utf-8")
     assert "void OnStart()" in text
+    assert "WriteStarted()" in text
+    assert "discovery-started.json" in text
+    assert '\\"chart_symbol\\"' in text
     assert "TerminalInfoInteger(TERMINAL_CONNECTED)" in text
-    assert "ChartApplyTemplate" not in text
+    assert "SymbolIsSynchronized" in text
+    for field in (
+        "schema_version",
+        "connection_id",
+        "login",
+        "server",
+        "requested_symbol",
+        "resolution",
+        "catalog_total",
+        "synchronized",
+        "terminal_connected",
+        "account_trade_allowed",
+        "terminal_build",
+        "symbol",
+    ):
+        assert f'\\\"{field}\\\"' in text
+    assert 'FileIsExist(BASE_DIR + "\\\\bridge-ready")' in text
+    assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text

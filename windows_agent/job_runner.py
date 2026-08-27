@@ -39,7 +39,11 @@ class _LeaseKeeper:
             try:
                 response = self._api.heartbeat(self._job_id, self._lease_id)
             except Exception:
-                continue
+                # A transport failure makes lease ownership unknowable. Continuing would allow
+                # this agent to overlap a server-side reclaim, so uncertainty is treated exactly
+                # like an explicit lease loss.
+                self._lease_lost.set()
+                return
             if not response.get("lease_valid", False):
                 self._lease_lost.set()
                 return
@@ -56,6 +60,10 @@ class _LeaseKeeper:
     def lease_lost(self) -> bool:
         return self._lease_lost.is_set()
 
+    def require_valid(self) -> None:
+        if self.lease_lost:
+            raise LeaseLost("lease ownership is lost or uncertain")
+
 
 class JobRunner:
     def __init__(
@@ -64,9 +72,13 @@ class JobRunner:
         api: Any,
         handlers: dict[str, Callable[[dict], dict]],
         heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        background_workers: tuple[
+            Callable[[threading.Event], None], ...
+        ] = (),
     ) -> None:
         self.state, self.api, self.handlers = state, api, handlers
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.background_workers = background_workers
 
     def run_once(self) -> bool:
         job = self.api.claim()
@@ -80,19 +92,21 @@ class JobRunner:
             "status": "running",
         }
         atomic_json(self.state, minimal)
-        self.api.transition(job["job_id"], job["lease_id"], "running")
         try:
+            self._transition(job, "running")
             keeper = _LeaseKeeper(
                 self.api, job["job_id"], job["lease_id"], self.heartbeat_interval_seconds
             )
             with keeper:
+                # Real handlers consult this private, in-process guard at every explicit lease
+                # checkpoint. It is never serialized or sent to the control plane.
+                job["_lease_guard"] = keeper.require_valid
                 result = self.handlers[minimal["action"]](job)
-            if keeper.lease_lost:
-                raise LeaseLost("lease lost during handler execution")
+            keeper.require_valid()
             heartbeat = self.api.heartbeat(job["job_id"], job["lease_id"])
             if not heartbeat.get("lease_valid", False):
                 raise LeaseLost("lease lost")
-            self.api.transition(job["job_id"], job["lease_id"], "complete", {"result": result})
+            self._transition(job, "complete", {"result": result})
             atomic_json(self.state, {**minimal, "status": "complete"})
         except LeaseLost:
             atomic_json(self.state, {**minimal, "status": "lease_lost"})
@@ -102,7 +116,13 @@ class JobRunner:
             # Full detail (message, chained cause, traceback) stays in the local log only -- the
             # control plane only ever receives the sanitized error_code (see agent_errors.py).
             logger.exception("job %s failed (job_type=%s): sending error_code=%s", job["job_id"], minimal["action"], error_code)
-            self.api.transition(job["job_id"], job["lease_id"], "fail", {"error_code": error_code})
+            try:
+                self._transition(job, "fail", {"error_code": error_code})
+            except Exception:
+                # The handler failed, but without an acknowledged terminal transition the server
+                # remains authoritative. Record uncertainty rather than a false local "failed".
+                atomic_json(self.state, {**minimal, "status": "lease_lost"})
+                return False
             try:
                 atomic_json(
                     self.state, {**minimal, "status": "failed", "error": type(exc).__name__}
@@ -116,6 +136,27 @@ class JobRunner:
                 # reason to let this crash escape run_once() and mask the job's real failure.
                 atomic_json(self.state, {**minimal, "status": "failed", "error": "redacted"})
         return True
+
+    @staticmethod
+    def _require_transition(response: object, expected_status: str) -> None:
+        if not isinstance(response, dict):
+            raise LeaseLost("transition response is not an object")
+        if response.get("error_code") == "lease_lost":
+            raise LeaseLost("lease lost during transition")
+        if response.get("status") != expected_status:
+            raise LeaseLost("transition was not acknowledged")
+
+    def _transition(
+        self, job: dict, status: str, result: dict | None = None
+    ) -> None:
+        try:
+            response = self.api.transition(
+                job["job_id"], job["lease_id"], status, result
+            )
+        except Exception as exc:
+            raise LeaseLost("transition acknowledgement is uncertain") from exc
+        expected = "failed" if status == "fail" else status
+        self._require_transition(response, expected)
 
     def recover(self) -> dict:
         return read_json(self.state)

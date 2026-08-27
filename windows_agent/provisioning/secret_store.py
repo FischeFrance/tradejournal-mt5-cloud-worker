@@ -5,6 +5,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from worker.atomic_file import durable_replace
+
 from ..security import safe_child
 
 ALLOWED = frozenset(
@@ -12,6 +14,8 @@ ALLOWED = frozenset(
         "mt5_investor_password",
         "mt5_login",
         "mt5_server",
+        "mt5_endpoint",
+        "mt5_broker_label",
         "ingestion_token",
         "agent_token",
         "worker_token",
@@ -56,7 +60,7 @@ class WindowsSecretStore:
                 handle.write(blob)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            durable_replace(temporary, path)
         finally:
             try:
                 os.unlink(temporary)
@@ -99,4 +103,48 @@ class WindowsSecretStore:
         descriptor.SetSecurityDescriptorDacl(1, acl, 0)
         win32security.SetFileSecurity(
             str(path), win32security.DACL_SECURITY_INFORMATION, descriptor
+        )
+
+    @staticmethod
+    def restrict_shared_service_acl(path: Path) -> None:
+        """Protect shared runtime state without locking out the Agent service.
+
+        Unlike DPAPI blobs, broker/runtime caches are shared between operator maintenance
+        commands and the LocalSystem service.  Binding their DACL to whichever identity wrote
+        last lets an elevated Administrator run exclude LocalSystem (or vice versa).  Keep the
+        shared state private to the two stable Windows principals that manage the Agent instead.
+        """
+        if os.name != "nt":
+            return
+
+        import win32con
+        import win32security
+
+        system_sid = win32security.CreateWellKnownSid(
+            win32security.WinLocalSystemSid, None
+        )
+        administrators_sid = win32security.CreateWellKnownSid(
+            win32security.WinBuiltinAdministratorsSid, None
+        )
+        descriptor = win32security.SECURITY_DESCRIPTOR()
+        acl = win32security.ACL()
+        inheritance = (
+            win32security.OBJECT_INHERIT_ACE
+            | win32security.CONTAINER_INHERIT_ACE
+            if path.is_dir()
+            else 0
+        )
+        for sid in (system_sid, administrators_sid):
+            acl.AddAccessAllowedAceEx(
+                win32security.ACL_REVISION_DS,
+                inheritance,
+                win32con.GENERIC_ALL,
+                sid,
+            )
+        descriptor.SetSecurityDescriptorDacl(1, acl, 0)
+        win32security.SetFileSecurity(
+            str(path),
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
         )

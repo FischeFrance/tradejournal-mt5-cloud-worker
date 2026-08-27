@@ -30,6 +30,22 @@ class InstanceProvisionFailed(AgentError):
     error_code = "instance_provision_failed"
 
 
+class InstanceCleanupFailed(AgentError):
+    error_code = "instance_cleanup_failed"
+
+
+class BrokerEndpointUnavailable(AgentError):
+    error_code = "broker_endpoint_unavailable"
+
+
+class BrokerDiscoveryFailed(AgentError):
+    error_code = "broker_discovery_failed"
+
+
+class BrokerIdentityUnavailable(AgentError):
+    error_code = "broker_identity_unavailable"
+
+
 class TerminalStartFailed(AgentError):
     error_code = "terminal_start_failed"
 
@@ -52,6 +68,12 @@ class ServerIdentityMismatch(AgentError):
 
 class InvestorAccessNotVerified(AgentError):
     error_code = "investor_access_not_verified"
+
+
+class InvestorVerificationTimeout(AgentError):
+    """MT5 authenticated, but did not prove read-only mode within the bounded window."""
+
+    error_code = "investor_verification_timeout"
 
 
 class HistorySyncFailed(AgentError):

@@ -18,6 +18,12 @@ from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.real_handlers import build_real_handlers
 
+
+class StartupOnlyWakeListener:
+    def run(self, wake_event, stop_event):
+        wake_event.set()
+        stop_event.wait()
+
 """Fase 8 end-to-end: mock control plane -> agent_daemon.run_forever()/JobRunner -> the real
 build_real_handlers() factory -> a fake MT5 adapter, covering the full provision -> heartbeat ->
 historical_sync -> deprovision lifecycle. This goes through the exact same JobRunner and
@@ -170,7 +176,7 @@ def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp
 
     watcher = threading.Thread(target=stop_once_drained)
     watcher.start()
-    run_forever(runner, poll_seconds=0.01, stop_event=stop_event)
+    run_forever(runner, stop_event, StartupOnlyWakeListener())
     watcher.join(timeout=2)
 
     completed = [job_id for job_id, status, _ in control_plane.transitions if status == "complete"]

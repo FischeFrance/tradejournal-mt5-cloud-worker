@@ -13,6 +13,76 @@
     "errorCode": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
     "jobType": { "enum": ["provision", "deprovision", "historical_sync"] },
     "historyMode": { "enum": ["new_only", "from_date", "all_available"] },
+    "progressEventCode": {
+      "enum": [
+        "endpoint_resolution", "broker_identity", "broker_discovery",
+        "instance_preparation", "terminal_start", "investor_verification",
+        "bridge_activation", "history_sync", "sync_activation", "deprovision"
+      ]
+    },
+    "progressEventStatus": { "enum": ["started", "completed", "failed", "skipped", "info"] },
+    "credentialEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "iv", "ciphertext"],
+      "properties": {
+        "alg": { "const": "aes-256-gcm-v1" },
+        "iv": { "type": "string", "minLength": 1 },
+        "ciphertext": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provisionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_envelope", "expected_login", "expected_server", "broker_label", "bridge_token"],
+      "properties": {
+        "credential_envelope": { "$ref": "#/$defs/credentialEnvelope" },
+        "expected_login": { "type": "string", "pattern": "^[0-9]{1,32}$" },
+        "expected_server": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "broker_label": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "null" }
+          ]
+        },
+        "bridge_token": { "type": "string", "pattern": "^tjmt5_[A-Za-z0-9_-]{16,128}$" }
+      }
+    },
+    "historyEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id", "event_type", "platform", "account_number", "server",
+        "external_trade_id", "symbol", "direction", "volume", "price",
+        "open_price", "close_price", "stop_loss", "take_profit",
+        "previous_stop_loss", "previous_take_profit", "profit", "commission",
+        "swap", "open_time", "close_time", "event_time"
+      ],
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "event_type": { "enum": ["trade_opened", "trade_closed"] },
+        "platform": { "const": "mt5" },
+        "account_number": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "server": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "external_trade_id": { "type": "string", "minLength": 1 },
+        "symbol": { "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "direction": { "anyOf": [{ "enum": ["buy", "sell"] }, { "type": "null" }] },
+        "volume": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "price": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "open_price": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "close_price": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "stop_loss": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "take_profit": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "previous_stop_loss": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "previous_take_profit": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "profit": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "commission": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "swap": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+        "open_time": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
+        "close_time": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
+        "event_time": { "$ref": "#/$defs/isoTimestamp" }
+      }
+    },
 
     "claimRequest": {
       "type": "object",
@@ -41,7 +111,18 @@
         "history_mode": { "anyOf": [{ "$ref": "#/$defs/historyMode" }, { "type": "null" }] },
         "from_date": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
         "payload": { "type": "object" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "job_type": { "const": "provision" } },
+            "required": ["job_type"]
+          },
+          "then": {
+            "properties": { "payload": { "$ref": "#/$defs/provisionPayload" } }
+          }
+        }
+      ]
     },
     "claimResponseNoJob": { "const": null, "description": "HTTP 204 No Content body" },
 
@@ -104,6 +185,150 @@
       }
     },
 
+    "progressRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id", "event_code", "event_status", "detail_code"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "event_code": { "$ref": "#/$defs/progressEventCode" },
+        "event_status": { "$ref": "#/$defs/progressEventStatus" },
+        "detail_code": {
+          "anyOf": [
+            { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "progressResponseOk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "event_recorded"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "event_recorded": { "const": true }
+      }
+    },
+    "historyBatchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id", "events"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": { "$ref": "#/$defs/historyEvent" }
+        }
+      }
+    },
+    "historyBatchResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "accepted", "inserted", "duplicates"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "inserted": { "type": "integer", "minimum": 0 },
+        "duplicates": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "historyFilePrepareRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version", "lease_id", "compressed_sha256", "compressed_bytes",
+        "uncompressed_bytes", "event_count"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "compressed_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "compressed_bytes": { "type": "integer", "minimum": 20, "maximum": 6291456 },
+        "uncompressed_bytes": { "type": "integer", "minimum": 2, "maximum": 50331648 },
+        "event_count": { "type": "integer", "minimum": 0, "maximum": 50000 }
+      }
+    },
+    "historyFilePrepareResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version", "already_imported", "object_path", "upload_url",
+        "expires_in", "accepted", "inserted", "duplicates"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "already_imported": { "type": "boolean" },
+        "object_path": {
+          "type": "string",
+          "pattern": "^[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/history\\.json\\.gz$"
+        },
+        "upload_url": { "anyOf": [{ "type": "string", "format": "uri" }, { "type": "null" }] },
+        "expires_in": { "type": "integer", "minimum": 0, "maximum": 7200 },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "inserted": { "type": "integer", "minimum": 0 },
+        "duplicates": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "historyFileImportRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "lease_id"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "lease_id": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "historyFileImportResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version", "accepted", "inserted", "duplicates", "object_deleted"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "inserted": { "type": "integer", "minimum": 0 },
+        "duplicates": { "type": "integer", "minimum": 0 },
+        "object_deleted": { "type": "boolean" }
+      }
+    },
+
+    "sessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version"],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" }
+      }
+    },
+    "sessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api_version", "realtime_url", "publishable_key", "access_token",
+        "expires_at", "topics"
+      ],
+      "properties": {
+        "api_version": { "$ref": "#/$defs/apiVersion" },
+        "realtime_url": { "type": "string", "pattern": "^wss://" },
+        "publishable_key": { "type": "string", "minLength": 1 },
+        "access_token": { "type": "string", "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$" },
+        "expires_at": { "$ref": "#/$defs/isoTimestamp" },
+        "topics": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^mt5-agent:(any|[0-9a-fA-F-]{36})$" }
+        }
+      }
+    },
+
     "errorResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -114,7 +339,12 @@
             "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed",
             "invalid_identifier", "lease_lost", "route_not_found", "invalid_error_code",
             "method_not_allowed", "server_not_configured", "payload_too_large",
-            "rate_limited", "internal_error"
+            "rate_limited", "forbidden_scope", "invalid_event_code",
+            "invalid_event_status", "invalid_detail_code", "progress_failed",
+            "invalid_history_batch", "invalid_history_event", "history_ingestion_failed",
+            "invalid_history_file", "history_upload_prepare_failed",
+            "history_file_unavailable", "history_file_integrity_failed",
+            "realtime_not_configured", "internal_error"
           ]
         }
       }

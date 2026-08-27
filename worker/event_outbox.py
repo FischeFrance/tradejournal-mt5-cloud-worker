@@ -16,9 +16,11 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
-from event_sender import EventSender
+
+class EventSender(Protocol):
+    def send(self, payload: Dict[str, Any]) -> Any: ...
 
 logger = logging.getLogger("mt5_worker.event_outbox")
 
@@ -177,15 +179,15 @@ class EventOutbox:
                 raise OutboxError("Formato outbox v1 non valido: pending deve essere un oggetto.")
             for event_id, payload in legacy_pending.items():
                 self._validate_keyed_payload(event_id, payload, "pending")
-            pending = self._order_legacy_pending(list(legacy_pending.values()))
+            migrated_pending = self._order_legacy_pending(list(legacy_pending.values()))
             state = {
                 "version": _FORMAT_VERSION,
-                "pending": pending,
+                "pending": migrated_pending,
                 "dead_letter": dead_letter,
             }
         elif version == _FORMAT_VERSION:
-            pending = state.get("pending")
-            if not isinstance(pending, list):
+            current_pending = state.get("pending")
+            if not isinstance(current_pending, list):
                 raise OutboxError("Formato outbox non valido: pending deve essere un array.")
         else:
             raise OutboxError("Versione del formato outbox non supportata.")
@@ -208,7 +210,7 @@ class EventOutbox:
                 raise OutboxError("Outbox persistente non valida: atteso un file regolare.")
             if (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino):
                 raise OutboxError("Outbox cambiata durante l'apertura; caricamento rifiutato.")
-            if stat.S_IMODE(file_stat.st_mode) != _SECURE_FILE_MODE:
+            if stat.S_IMODE(file_stat.st_mode) != _SECURE_FILE_MODE and os.name != "nt":
                 os.fchmod(fd, _SECURE_FILE_MODE)
                 os.fsync(fd)
 
@@ -287,7 +289,11 @@ class EventOutbox:
             prefix=f".{os.path.basename(self.file_path)}.", suffix=".tmp", dir=directory
         )
         try:
-            os.fchmod(fd, _SECURE_FILE_MODE)
+            # Windows has no os.fchmod and its chmod bits do not model NTFS ACLs. The instance
+            # directory already inherits its restricted Windows ACL; keep the POSIX 0600
+            # hardening everywhere fchmod is available.
+            if os.name != "nt":
+                os.fchmod(fd, _SECURE_FILE_MODE)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 fd = -1
                 json.dump(state, handle, sort_keys=True, separators=(",", ":"))
@@ -318,6 +324,10 @@ class EventOutbox:
 
     @staticmethod
     def _fsync_directory(directory: str) -> None:
+        # Opening a directory as a file descriptor is a POSIX durability primitive and raises
+        # on Windows. The file itself has already been flushed before the atomic os.replace.
+        if os.name == "nt":
+            return
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
         directory_fd = os.open(directory, flags)
         try:

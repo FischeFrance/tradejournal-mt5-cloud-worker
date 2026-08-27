@@ -18,21 +18,30 @@ def _sink(tmp_path) -> TradingIngestionSink:
     return TradingIngestionSink(tmp_path, "https://example.invalid/trading-mt5-events", "tjmt5_test-token")
 
 
-def test_send_heartbeat_posts_heartbeat_event_type(tmp_path):
+def test_connection_transition_posts_only_when_explicitly_requested(tmp_path):
     with patch("requests.post", return_value=_response(200)) as mock_post:
-        ok = _sink(tmp_path).send_heartbeat()
+        result = _sink(tmp_path).send_connection_transition(
+            "11111111-1111-4111-8111-111111111111", 7, False
+        )
 
-    assert ok is True
+    assert result.sent == 1 and result.pending == 0
     _, kwargs = mock_post.call_args
-    assert kwargs["json"] == {"event_type": "heartbeat"}
+    assert kwargs["json"]["event_type"] == "heartbeat"
+    assert kwargs["json"]["connected"] is False
+    assert kwargs["json"]["event_id"].endswith(":7:0")
     assert kwargs["headers"]["Authorization"] == "Bearer tjmt5_test-token"
 
 
-def test_send_heartbeat_returns_false_on_permanent_failure(tmp_path):
-    with patch("requests.post", return_value=_response(422)):
-        ok = _sink(tmp_path).send_heartbeat()
+def test_transient_failure_remains_in_persistent_outbox(tmp_path):
+    with patch("requests.post", return_value=_response(500)):
+        result = _sink(tmp_path).send_connection_transition(
+            "11111111-1111-4111-8111-111111111111", 8, True
+        )
 
-    assert ok is False
+    assert result.pending == 1 and result.transient_failures == 1
+    restarted = _sink(tmp_path)
+    with patch("requests.post", return_value=_response(200)):
+        assert restarted.flush().sent == 1
 
 
 def test_call_delivers_event_over_http(tmp_path):
@@ -44,7 +53,7 @@ def test_call_delivers_event_over_http(tmp_path):
     assert kwargs["json"] == payload
 
 
-def test_call_always_writes_to_local_audit_log_first_even_if_delivery_fails(tmp_path):
+def test_call_writes_audit_and_durable_outbox_before_delivery(tmp_path):
     payload = {"event_id": "evt-1", "event_type": "trade_opened", "symbol": "EURUSD"}
     with patch("requests.post", return_value=_response(500)):
         _sink(tmp_path)(payload)
@@ -52,6 +61,8 @@ def test_call_always_writes_to_local_audit_log_first_even_if_delivery_fails(tmp_
     lines = (tmp_path / "data" / "live.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["event_id"] == "evt-1"
+    outbox = json.loads((tmp_path / "state" / "trading-ingestion-outbox.json").read_text())
+    assert outbox["pending"][0]["event_id"] == "evt-1"
 
 
 def test_call_does_not_raise_when_delivery_fails_permanently(tmp_path):

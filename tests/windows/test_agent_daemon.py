@@ -20,14 +20,22 @@ class QueueApi:
 
     def transition(self, job_id, lease_id, status, result=None):
         self.transitions.append((status, result))
-        return {}
+        return {"status": "failed" if status == "fail" else status}
 
 
-def test_run_forever_polls_until_stop_event(tmp_path):
+class StartupOnlyWakeListener:
+    def run(self, wake_event, stop_event):
+        wake_event.set()
+        stop_event.wait()
+
+
+def test_run_forever_waits_without_recurring_claims(tmp_path):
     api = QueueApi([])
     runner = JobRunner(tmp_path / "state.json", api, default_handlers())
     stop_event = threading.Event()
-    thread = threading.Thread(target=run_forever, args=(runner, 0.01, stop_event))
+    thread = threading.Thread(
+        target=run_forever, args=(runner, stop_event, StartupOnlyWakeListener())
+    )
     thread.start()
     time.sleep(0.05)
     stop_event.set()
@@ -48,7 +56,7 @@ def test_run_forever_fails_unimplemented_handler_safely(tmp_path):
 
     watcher = threading.Thread(target=stop_after_first_claim)
     watcher.start()
-    run_forever(runner, 0.01, stop_event)
+    run_forever(runner, stop_event, StartupOnlyWakeListener())
     watcher.join(timeout=2)
 
     assert ("running", None) in api.transitions

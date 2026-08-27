@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import ANY, Mock, call, patch
 
@@ -8,6 +9,7 @@ import pytest
 
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.worker.native_mt5_runtime import (
+    _AuthFailureMonitor,
     NativeMt5Error,
     NativeMt5Runtime,
     NativeMt5Status,
@@ -39,11 +41,16 @@ def _runtime(tmp_path: Path) -> NativeMt5Runtime:
     loader.with_name("TradeJournalDiscovery.ex5").write_bytes(b"discovery")
     templates = terminal.parent / "Profiles" / "Templates"
     templates.mkdir(parents=True)
+    (terminal.parent / "Profiles" / "Charts").mkdir(parents=True)
     (templates / "ADX.tpl").write_text(
         "<chart>\nsymbol=GBPUSD\n<window>\n</window>\n</chart>\n",
         encoding="utf-16",
     )
-    return NativeMt5Runtime(tmp_path, "00000000-0000-4000-8000-000000000001")
+    return NativeMt5Runtime(
+        tmp_path,
+        "00000000-0000-4000-8000-000000000001",
+        symbol_hint_root=tmp_path / ".broker-symbol-hints",
+    )
 
 
 def _envelope(payload: dict[str, object]) -> str:
@@ -64,12 +71,10 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("Password=not-a-real-secret")
-    discovery.write_text("KeepPrivate=1")
-    startup.write_text("KeepPrivate=1")
+    startup.write_text("Password=not-a-real-secret")
     expected = NativeMt5Status(
         pid=123,
         account={"login": "42", "server": "Demo", "trade_allowed": False},
@@ -80,13 +85,15 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
+            side_effect=[bootstrap, startup],
         ) as write_config,
-        patch.object(runtime, "_journal_checkpoint", return_value={}) as checkpoint,
-        patch.object(runtime, "_start_process") as start_process,
-        patch.object(runtime, "_wait_for_authorization") as wait_for_authorization,
+        patch.object(
+            runtime,
+            "_start_and_wait_for_authorization",
+            side_effect=[({}, "Demo"), ({}, "Demo")],
+        ) as start_and_authorize,
         patch.object(runtime, "_wait_for_account_database") as wait_for_database,
-        patch.object(runtime, "_wait_for_investor_sync") as wait_for_investor_sync,
+        patch.object(runtime, "_wait_for_discovery_start", return_value=True),
         patch.object(
             runtime, "_probe_broker_symbol", return_value="EURUSD.raw"
         ) as probe_symbol,
@@ -112,48 +119,27 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
             filename="login-bootstrap.ini",
         ),
         call(
-            None,
-            None,
-            None,
+            42,
+            "Demo",
+            "not-a-real-secret",
             "EURUSD",
             keep_private=True,
             start_expert=False,
             script_name="TradeJournal\\TradeJournalDiscovery",
-            filename="symbol-discovery.ini",
-        ),
-        call(
-            None,
-            None,
-            None,
-            "EURUSD.raw",
-            keep_private=True,
-            start_expert=False,
-            script_name="TradeJournal\\TradeJournalLoader",
             filename="startup.ini",
         ),
     ]
-    assert checkpoint.call_count == 3
-    assert wait_for_authorization.call_args_list == [
-        call({}, 42, "Demo", ANY),
-        call({}, 42, "Demo", ANY),
-        call({}, 42, "Demo", ANY),
+    assert start_and_authorize.call_args_list == [
+        call(bootstrap, 42, "Demo", ANY, "Demo"),
+        call(startup, 42, "Demo", ANY),
     ]
     wait_for_database.assert_called_once_with(ANY)
-    assert wait_for_investor_sync.call_args_list == [
-        call({}, 42, ANY),
-        call({}, 42, ANY),
-    ]
-    probe_symbol.assert_called_once_with("EURUSD")
-    assert start_process.call_args_list == [
-        call(bootstrap),
-        call(discovery, 42),
-        call(startup, 42),
-    ]
-    assert stop.call_count == 2
+    probe_symbol.assert_called_once_with("EURUSD", 42, "Demo", ANY)
+    assert stop.call_count == 1
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
     assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "new_only"
+    assert (runtime.files / "history_from_unix").read_text(encoding="utf-8") == "0"
     template_path = runtime.files / "TradeJournalBridge.tpl"
     assert template_path.read_bytes().startswith(b"\xff\xfe")
     template = template_path.read_text(encoding="utf-16")
@@ -175,30 +161,31 @@ def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path
     assert str(runtime.terminal_root) not in content
 
 
-def test_start_uses_loader_to_attach_bridge_after_account_sync(tmp_path: Path) -> None:
+def test_start_hands_discovery_chart_directly_to_bridge(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("temporary")
-    discovery.write_text("temporary")
     startup.write_text("temporary")
     with (
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
+            side_effect=[bootstrap, startup],
         ),
-        patch.object(runtime, "_journal_checkpoint", return_value={}),
-        patch.object(runtime, "_start_process") as start_process,
-        patch.object(runtime, "_wait_for_authorization"),
+        patch.object(
+            runtime,
+            "_start_and_wait_for_authorization",
+            side_effect=[({}, "Demo"), ({}, "Demo")],
+        ),
         patch.object(runtime, "_wait_for_account_database"),
-        patch.object(runtime, "_wait_for_investor_sync"),
+        patch.object(runtime, "_wait_for_discovery_start", return_value=True),
         patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
         patch.object(runtime, "_remove_readiness_files") as remove_readiness,
+        patch.object(runtime, "_publish_bridge_handoff") as publish_handoff,
         patch.object(
             runtime,
             "_wait_for_heartbeat",
@@ -216,16 +203,11 @@ def test_start_uses_loader_to_attach_bridge_after_account_sync(tmp_path: Path) -
                 timeout=90,
             )
 
-    assert start_process.call_args_list == [
-        call(bootstrap),
-        call(discovery, 42),
-        call(startup, 42),
-    ]
     wait_for_heartbeat.assert_called_once_with(90.0, 42, "Demo")
-    assert stop.call_count == 3
+    publish_handoff.assert_called_once_with()
+    assert stop.call_count == 2
     assert remove_readiness.call_count == 1
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
 
 
@@ -239,6 +221,7 @@ def test_start_process_uses_portable_config(tmp_path: Path) -> None:
         assert runtime._start_process(config, 42) is process
     args = popen.call_args.args[0]
     assert "/portable" in args
+    assert "/profile:TradeJournal" in args
     assert "/login:42" in args
     assert any(value.startswith("/config:") for value in args)
 
@@ -249,6 +232,20 @@ def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
     expert.write_bytes(b"expert")
     with pytest.raises(NativeMt5Error, match="invalid_history_mode"):
         runtime.install_expert(expert, "ten_year_snapshot")
+
+
+def test_install_expert_persists_from_date_as_unix_timestamp(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    history_from = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    runtime.install_expert(expert, "from_date", history_from)
+
+    assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "from_date"
+    assert (runtime.files / "history_from_unix").read_text(encoding="utf-8") == str(
+        int(history_from.timestamp())
+    )
 
 
 def test_login_bootstrap_and_persisted_startup_configs(tmp_path: Path, monkeypatch) -> None:
@@ -305,7 +302,7 @@ def test_startup_config_allows_configured_interactive_user_to_read(
         NativeMt5Runtime,
         "_setting",
         staticmethod(
-            lambda name: "Administrator"
+            lambda name: "TradeJournalAgent"
             if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
             else ""
         ),
@@ -324,7 +321,7 @@ def test_startup_config_allows_configured_interactive_user_to_read(
 
     assert restricted == [config]
     run.assert_called_once_with(
-        ["icacls", str(config), "/grant", "Administrator:(R)"],
+        ["icacls", str(config), "/grant", "TradeJournalAgent:(R)"],
         capture_output=True,
         text=True,
         check=False,
@@ -347,6 +344,64 @@ def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> 
         )
     with patch.object(runtime, "_running_terminal_pids", return_value=[123]):
         runtime._wait_for_authorization(checkpoint, 42, "Demo", 1.0)
+
+
+def test_wait_for_authorization_fails_immediately_when_dialog_monitor_detects_rejection(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    monitor = _AuthFailureMonitor(
+        "task",
+        123,
+        456,
+        tmp_path / "helper.ps1",
+        tmp_path / "request.json",
+        tmp_path / "result.json",
+        tmp_path / "launcher.cmd",
+    )
+    with (
+        patch.object(runtime, "_authentication_failure_detected", return_value=True),
+        pytest.raises(NativeMt5Error, match="authorization_failed"),
+    ):
+        runtime._wait_for_authorization(
+            {},
+            42,
+            "Demo",
+            30.0,
+            auth_monitor=monitor,
+        )
+
+
+def test_authentication_dialog_result_is_bound_to_the_exact_terminal_process(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    result = tmp_path / "result.json"
+    monitor = _AuthFailureMonitor(
+        "task",
+        123,
+        456,
+        tmp_path / "helper.ps1",
+        tmp_path / "request.json",
+        result,
+        tmp_path / "launcher.cmd",
+    )
+    result.write_text(json.dumps({
+        "schema_version": 1,
+        "success": True,
+        "detected": True,
+        "error_code": "authorization_failed",
+        "process_id": 123,
+        "creation_time_unix_ms": 456,
+    }))
+
+    assert runtime._authentication_failure_detected(monitor) is True
+
+    document = json.loads(result.read_text())
+    document["process_id"] = 999
+    result.write_text(json.dumps(document))
+    with pytest.raises(NativeMt5Error, match="authentication_monitor_result_invalid"):
+        runtime._authentication_failure_detected(monitor)
 
 
 def test_wait_for_investor_sync_requires_sync_and_readonly_lines(tmp_path: Path) -> None:
@@ -385,23 +440,23 @@ def test_identity_and_readonly_guards(
         _envelope({"terminal_connected": True})
     )
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("temporary")
-    discovery.write_text("temporary")
     startup.write_text("temporary")
     with (
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
+            side_effect=[bootstrap, startup],
         ),
-        patch.object(runtime, "_journal_checkpoint", return_value={}),
-        patch.object(runtime, "_start_process"),
-        patch.object(runtime, "_wait_for_authorization"),
+        patch.object(
+            runtime,
+            "_start_and_wait_for_authorization",
+            side_effect=[({}, "Demo"), ({}, "Demo")],
+        ),
         patch.object(runtime, "_wait_for_account_database"),
-        patch.object(runtime, "_wait_for_investor_sync"),
+        patch.object(runtime, "_wait_for_discovery_start", return_value=True),
         patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
         patch.object(runtime, "_remove_readiness_files"),
         patch.object(runtime, "stop", return_value=True),
@@ -414,7 +469,6 @@ def test_identity_and_readonly_guards(
                 expert_binary=expert,
             )
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
 
 

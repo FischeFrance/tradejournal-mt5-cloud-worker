@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from worker.atomic_file import durable_replace
+
 from .security import SECRET_MARKERS
 
 
@@ -21,7 +23,7 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write(encoded + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(name, path)
+        durable_replace(name, path)
     finally:
         try:
             os.unlink(name)

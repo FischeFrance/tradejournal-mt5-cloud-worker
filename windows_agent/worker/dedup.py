@@ -26,3 +26,6 @@ class PersistentDedup:
         )
         self.connection.commit()
         return cursor.rowcount == 1
+
+    def close(self) -> None:
+        self.connection.close()

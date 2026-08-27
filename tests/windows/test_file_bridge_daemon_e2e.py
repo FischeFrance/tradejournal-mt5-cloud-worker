@@ -171,7 +171,7 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     return cid, api, handlers
 
 
-def test_live_sync_job_sends_heartbeat_over_http(tmp_path: Path, monkeypatch) -> None:
+def test_legacy_live_sync_job_does_not_send_periodic_heartbeat(tmp_path: Path, monkeypatch) -> None:
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
     api.jobs.append({
         "job_id": "live-sync-1", "job_type": "live_sync", "connection_id": cid, "lease_id": "2",
@@ -182,11 +182,7 @@ def test_live_sync_job_sends_heartbeat_over_http(tmp_path: Path, monkeypatch) ->
         assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once() is True
 
     assert api.transitions[-1][1] == "complete"
-    heartbeat_calls = [
-        call for call in mock_post.call_args_list if call.kwargs.get("json") == {"event_type": "heartbeat"}
-    ]
-    assert len(heartbeat_calls) == 1
-    assert heartbeat_calls[0].kwargs["headers"]["Authorization"] == "Bearer tjmt5_test-bridge-token"
+    assert mock_post.call_count == 0
 
 
 def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monkeypatch) -> None:

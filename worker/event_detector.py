@@ -1,10 +1,8 @@
 """Rilevamento eventi tramite diff tra due snapshot successivi dello stato MT5.
 
-Modulo puro (nessuna rete, nessun I/O): riceve due snapshot (dict) prodotti da
-`mt5_client`/`mock_mt5_client` tramite `snapshot_store` e restituisce una lista di eventi
-grezzi. Essendo puro, e' interamente testabile passando dizionari costruiti a mano -- la stessa
-logica funziona identicamente sia con il mock sia (in futuro) con MetaTrader5 reale, perche'
-entrambi i client espongono la stessa forma di snapshot.
+Modulo puro (nessuna rete, nessun I/O): riceve due snapshot prodotti dal
+file adapter Windows e restituisce una lista di eventi grezzi. È interamente
+testabile passando dizionari costruiti a mano.
 
 Forma di uno snapshot:
 {

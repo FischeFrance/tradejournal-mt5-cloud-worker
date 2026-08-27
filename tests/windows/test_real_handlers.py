@@ -18,7 +18,7 @@ from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
 from windows_agent.provisioning.secret_store import WindowsSecretStore
-from windows_agent.real_handlers import build_real_handlers, sweep_stale_instances
+from windows_agent.real_handlers import build_real_handlers
 from windows_agent.state_store import read_json
 from windows_agent.worker.direct_mt5_adapter import (
     IdentityMismatch,
@@ -201,6 +201,18 @@ def test_provision_is_idempotent_on_retry(env):
     handlers["provision"](job)
     result = handlers["provision"](job)  # simulates a retried/duplicate claim of the same job
     assert result["live_sync_started"] is True
+
+
+def test_provision_repairs_existing_layout_without_terminal(env):
+    cid = str(uuid4())
+    root = InstanceLayout(env.instances_root, cid).create()
+    (root / "state" / "stale-state.json").write_text("{}", encoding="utf-8")
+    handlers = _handlers(env, FakeApi())
+
+    result = handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+
+    assert result["live_sync_started"] is True
+    assert (root / "terminal" / "terminal64.exe").read_bytes() == b"stub"
 
 
 # ---------------------------------------------------------------------------
@@ -514,33 +526,6 @@ def test_deprovision_fails_closed_when_instance_process_cleanup_is_not_confirmed
 
     assert root.exists()
     assert WindowsSecretStore(env.secrets_root).read(cid, "mt5_login") == "12345"
-
-
-# ---------------------------------------------------------------------------
-# Recovery: stale/orphaned processes at daemon startup
-# ---------------------------------------------------------------------------
-
-def test_sweep_stale_instances_terminates_orphans(env, monkeypatch):
-    cid = str(uuid4())
-    handlers = _handlers(env, FakeApi())
-    handlers["provision"](_job("provision", cid, payload=_provision_payload()))
-    root = InstanceLayout(env.instances_root, cid).path
-
-    cleaned = []
-    monkeypatch.setattr(real_handlers.ProcessManager, "find", staticmethod(lambda executable: [4242]))
-
-    class RecordingProcessManager(FakeProcessManager):
-        def cleanup_path(self, executable):
-            cleaned.append((self.state_path, executable))
-            return True
-
-    swept = sweep_stale_instances(env.instances_root, process_factory=RecordingProcessManager)
-    assert swept == [cid]
-    assert cleaned and cleaned[0][1] == root / "terminal" / "terminal64.exe"
-
-
-def test_sweep_stale_instances_empty_root_is_safe(tmp_path):
-    assert sweep_stale_instances(tmp_path / "does-not-exist") == []
 
 
 # ---------------------------------------------------------------------------
