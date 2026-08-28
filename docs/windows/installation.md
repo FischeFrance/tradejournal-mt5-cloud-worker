@@ -251,6 +251,11 @@ release richiesta. La convergenza può occupare gran parte della finestra perch�
 istanze vengono verificati in modo conservativo; un timeout di trasporto non autorizza mai l'avvio
 del nuovo servizio senza il record di convergenza.
 
+Subito dopo la convergenza e prima del primo avvio, il deploy aggiorna anche il valore pywin32
+`PythonClass`, che contiene il percorso assoluto del wrapper Windows nella release immutabile.
+Aggiornare soltanto `PYTHONPATH` o la junction non basta: il wrapper precedente non potrebbe
+pubblicare la readiness legata al nuovo deployment.
+
 L'attivazione è ammessa solo nella finestra di manutenzione che parte alle 23:30 `Europe/Rome` e
 richiede una sessione nuova di `TradeJournalMT5` realmente standard. Dopo una demozione dal gruppo
 Administrators occorre quindi fare un `Sign out` completo e un nuovo login con la password già

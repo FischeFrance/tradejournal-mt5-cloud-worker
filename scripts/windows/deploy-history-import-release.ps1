@@ -17,6 +17,7 @@ $releaseRoot = 'C:\TradeJournal\releases'
 $currentPath = 'C:\TradeJournal\current'
 $pythonExe = $DeploymentPython
 $serviceRegistry = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+$servicePythonClassRegistry = Join-Path $serviceRegistry 'PythonClass'
 $goldenExpert = 'C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5'
 $releasePath = Join-Path $releaseRoot ("agent-" + $Revision.Substring(0, 12))
 $guardStateRoot = 'C:\TradeJournal\state'
@@ -26,6 +27,32 @@ $readinessPath = Join-Path $guardStateRoot 'agent-readiness.json'
 $deploymentId = [Guid]::NewGuid().ToString('D').ToLowerInvariant()
 $deploymentMutex = [System.Threading.Mutex]::new($false, 'Global\TradeJournalMT5AgentDeployment')
 $deploymentMutexOwned = $false
+
+function Get-ServicePythonClass {
+  $key = Get-Item -LiteralPath $servicePythonClassRegistry -ErrorAction Stop
+  $value = [string]$key.GetValue('')
+  if (
+    [string]::IsNullOrWhiteSpace($value) -or
+    $value -notmatch '^C:\\TradeJournal\\releases\\agent-[0-9a-f]{12}\\windows_agent\\service\\windows_service\.TradeJournalAgentService$'
+  ) {
+    throw 'The Agent service PythonClass binding is invalid.'
+  }
+  return $value
+}
+
+function Set-ServicePythonClass {
+  param([Parameter(Mandatory = $true)][string]$Value)
+  if (
+    $Value -notmatch '^C:\\TradeJournal\\releases\\agent-[0-9a-f]{12}\\windows_agent\\service\\windows_service\.TradeJournalAgentService$'
+  ) {
+    throw 'The next Agent service PythonClass binding is invalid.'
+  }
+  $key = Get-Item -LiteralPath $servicePythonClassRegistry -ErrorAction Stop
+  $key.SetValue('', $Value, [Microsoft.Win32.RegistryValueKind]::String)
+  if (-not [string]::Equals((Get-ServicePythonClass), $Value, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The Agent service PythonClass binding did not persist.'
+  }
+}
 trap {
   $trappedError = $_
   if ($deploymentMutexOwned) {
@@ -640,6 +667,7 @@ $snapshotCaptured = $false
 $activationBarrierCrossed = $false
 $barrierAttempted = $false
 $convergenceCompleted = $false
+$servicePythonClassSwitched = $false
 try {
   if ($serviceWasRunning) {
     Stop-Service -Name $serviceName -Force
@@ -669,6 +697,18 @@ try {
     fpm_connection_id = $RecoveryConnectionId
   } -TimeoutSeconds 7200)
   $convergenceCompleted = $true
+
+  # pywin32 stores an absolute release path in the service's PythonClass
+  # registry value. PYTHONPATH and the current junction are insufficient: an
+  # old class wrapper would run the new daemon but could not publish the
+  # deployment-bound readiness record. Switch this binding only after fleet
+  # convergence, immediately before the first start of the new service.
+  [void](Get-ServicePythonClass)
+  $nextServicePythonClass = (
+    $releasePath + '\windows_agent\service\windows_service.TradeJournalAgentService'
+  )
+  Set-ServicePythonClass -Value $nextServicePythonClass
+  $servicePythonClassSwitched = $true
 
   # Point of no return: this is deliberately the first start of the new
   # release. Every failure below is roll-forward only.
@@ -796,6 +836,9 @@ try {
     # environment or junction after new-code activation may have mutated state.
     if (-not $convergenceCompleted) {
       throw 'Deployment convergence is incomplete; the new Agent service was left stopped.'
+    }
+    if (-not $servicePythonClassSwitched) {
+      throw 'Deployment service binding is incomplete; the new Agent service was left stopped.'
     }
     try {
       $currentService = Get-Service -Name $serviceName -ErrorAction Stop

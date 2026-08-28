@@ -2150,6 +2150,11 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
         heartbeat_identity, heartbeat, heartbeat_ms, heartbeat_sequence = (
             _read_envelope(files / "heartbeat.json", "fpm_heartbeat_invalid")
         )
+        # Golden/fleet integrity checks above can take longer than the bridge
+        # heartbeat interval. Compare the envelopes with an observation made
+        # after reading them; using the earlier readiness timestamp can make a
+        # freshly advanced heartbeat appear to come from the future.
+        health_now_ms = int(time.time() * 1000)
         try:
             expected_login = str(
                 int(WindowsSecretStore(config.secrets_root).read(fpm, "mt5_login"))
@@ -2172,15 +2177,15 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
             or account.get("trade_allowed") is not False
             or heartbeat.get("terminal_connected") is not True
             or heartbeat.get("account_trade_allowed") is not False
-            or now_ms - min(account_ms, heartbeat_ms) > max_age * 1000
-            or max(account_ms, heartbeat_ms) > now_ms + 2000
+            or health_now_ms - min(account_ms, heartbeat_ms) > max_age * 1000
+            or max(account_ms, heartbeat_ms) > health_now_ms + 2000
             or not barrier["activation_started_at_unix_ms"] - 2000
             <= process_created_at
             <= min(
                 account_ms,
                 heartbeat_ms,
                 readiness["ready_at_unix_ms"],
-                now_ms,
+                health_now_ms,
             )
         ):
             raise DeployGuardError("fpm_readonly_health_invalid")
