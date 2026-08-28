@@ -10,6 +10,7 @@ import pytest
 
 from windows_agent.mt5_lifecycle import Mt5LifecycleCoordinator
 from windows_agent.mt5_maintenance import (
+    Mt5CanaryOnlyReport,
     Mt5MaintenanceCoordinator,
     Mt5MaintenanceError,
 )
@@ -252,11 +253,13 @@ class RuntimeController:
         self.fail_resume = fail_resume
         self.callbacks: list[tuple[object, bool]] = []
         self.cancel_checks: list[object] = []
+        self.factory_calls: list[tuple[Path, str]] = []
         self.resume_calls: list[dict] = []
         self.stop_calls = 0
 
-    def factory(self, root: Path, _connection_id: str):
+    def factory(self, root: Path, connection_id: str):
         owner = self
+        owner.factory_calls.append((root, connection_id))
 
         class Runtime:
             def __init__(self) -> None:
@@ -354,6 +357,317 @@ def _coordinator(
         process_factory=FakeProcess,
         secret_store=secrets,
     )
+
+
+def test_canary_only_targets_exact_fpm_account_without_shared_mutations(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live", "FPMTrading-Live", "Other-Broker"),
+    )
+    runtime = RuntimeController()
+    pool = FakePool()
+    pending_store = FakePendingStore(manager)
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        pending_store,
+    )
+    golden_before = manager.source_terminal.read_bytes()
+
+    report = coordinator.run_canary_only(
+        ids[1],
+        "fpmtrading-live",
+        Event(),
+    )
+
+    assert report == Mt5CanaryOnlyReport(ids[1], "FPMTrading-Live", ())
+    assert report.update_captured is False
+    assert runtime.factory_calls == [(instances / ids[1], ids[1])]
+    assert len(runtime.resume_calls) == 1
+    assert runtime.resume_calls[0]["server"] == "FPMTrading-Live"
+    assert runtime.resume_calls[0]["history_mode"] == "new_only"
+    assert runtime.resume_calls[0]["history_from"] is not None
+    assert runtime.stop_calls == 1
+    assert manager.source_terminal.read_bytes() == golden_before
+    assert manager.promotions == 0
+    assert manager.discards == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_captures_pending_update_without_consuming_or_promoting(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live", "Other-Broker"),
+    )
+    runtime = RuntimeController(publish_update=True)
+    pool = FakePool()
+    pending_store = FakePendingStore(manager)
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        pending_store,
+    )
+    golden_before = manager.source_terminal.read_bytes()
+
+    report = coordinator.run_canary_only(
+        ids[0],
+        "FPMTrading-Live",
+        Event(),
+    )
+
+    assert report == Mt5CanaryOnlyReport(
+        ids[0],
+        "FPMTrading-Live",
+        ("b" * 64,),
+    )
+    assert report.update_captured is True
+    assert pending_store.captures == 1
+    assert tuple(receipt.receipt_id for receipt in pending_store.pending()) == (
+        "b" * 64,
+    )
+    assert pending_store.quarantined == []
+    assert manager.source_terminal.read_bytes() == golden_before
+    assert manager.promotions == 0
+    assert manager.discards == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_requires_pending_store_before_stopping_terminal(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live",),
+    )
+    runtime = RuntimeController(publish_update=True)
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="pending update store is disabled"):
+        coordinator.run_canary_only(
+            ids[0],
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert runtime.factory_calls == []
+    assert runtime.stop_calls == 0
+    assert manager.promotions == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_rejects_wrong_server_before_stopping_terminal(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("Other-Broker",),
+    )
+    runtime = RuntimeController()
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        FakePendingStore(manager),
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="server does not match"):
+        coordinator.run_canary_only(
+            ids[0],
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert runtime.factory_calls == []
+    assert runtime.stop_calls == 0
+    assert manager.promotions == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_rejects_noncanonical_connection_before_mutation(
+    tmp_path: Path,
+) -> None:
+    _ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live",),
+    )
+    runtime = RuntimeController()
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        FakePendingStore(manager),
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="connection is invalid"):
+        coordinator.run_canary_only(
+            "NOT-A-CANONICAL-UUID",
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert runtime.factory_calls == []
+    assert runtime.stop_calls == 0
+    assert manager.promotions == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_rejects_pre_cancelled_request_without_mutation(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live",),
+    )
+    runtime = RuntimeController()
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        FakePendingStore(manager),
+    )
+    stop_event = Event()
+    stop_event.set()
+
+    with pytest.raises(Mt5MaintenanceError, match="was interrupted"):
+        coordinator.run_canary_only(
+            ids[0],
+            "FPMTrading-Live",
+            stop_event,
+        )
+
+    assert runtime.factory_calls == []
+    assert runtime.stop_calls == 0
+    assert manager.promotions == 0
+    assert pool.calls == []
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+
+
+def test_canary_only_cursor_failure_does_not_attempt_recovery_with_unbound_state(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live",),
+    )
+    runtime = RuntimeController()
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        FakePendingStore(manager),
+    )
+
+    with (
+        patch(
+            "windows_agent.mt5_maintenance.new_only_recovery_from",
+            side_effect=OSError("unavailable"),
+        ),
+        pytest.raises(Mt5MaintenanceError, match="cursor is unavailable"),
+    ):
+        coordinator.run_canary_only(
+            ids[0],
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert runtime.stop_calls == 0
+    assert rotator.rotate_one_calls == []
+    assert rotator.rotate_all_calls == []
+    assert manager.promotions == 0
+    assert pool.calls == []
+
+
+def test_failed_canary_only_probe_restores_only_requested_account(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live", "Other-Broker"),
+    )
+    runtime = RuntimeController(fail_resume=True)
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        pool,
+        FakePendingStore(manager),
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="was recovered"):
+        coordinator.run_canary_only(
+            ids[0],
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert runtime.factory_calls == [(instances / ids[0], ids[0])]
+    assert runtime.stop_calls == 2
+    assert rotator.rotate_one_calls == [(ids[0], True)]
+    assert rotator.rotate_one_history_from[-1] == runtime.resume_calls[0][
+        "history_from"
+    ]
+    assert ids[1] not in rotator.current
+    assert manager.promotions == 0
+    assert pool.calls == []
+    assert rotator.rotate_all_calls == []
 
 
 def test_new_release_is_verified_then_rebuilds_pool_and_rotates_fleet(

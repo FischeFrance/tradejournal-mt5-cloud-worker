@@ -329,6 +329,61 @@ def test_convergence_evidence_precedes_service_start_and_has_full_window_timeout
     assert catch_gate < recovery_start
 
 
+def test_ad_hoc_canary_wrapper_is_single_account_and_not_time_gated() -> None:
+    script = (
+        REPOSITORY_ROOT
+        / "scripts"
+        / "windows"
+        / "invoke-mt5-adhoc-canary.ps1"
+    ).read_text(encoding="utf-8")
+
+    for required in (
+        "windows_agent.mt5_adhoc_probe",
+        "-UserId 'SYSTEM'",
+        "Stop-Service -Name $serviceName",
+        "Start-Service -Name $serviceName",
+        "Assert-OtherTerminalsUnchanged",
+        "non_target_processes_unchanged = $true",
+        "mt5-adhoc-results",
+        "Get-ScheduledTask -ErrorAction Stop",
+        "TradeJournal-Deploy-*",
+        "TradeJournal-DeployGuard-*",
+        "2f1647b4-035e-41be-b634-0cf785a70b07",
+        "FPMTrading-Live",
+        "TRADEJOURNAL_INSTANCES_ROOT",
+        "Get-ProvisionedInstanceCount",
+        "Assert-NoActiveAgentWork",
+        "Remove-AdHocTaskSafely",
+        "$restartAgentAllowed = $false",
+        "Start-AgentAndAssertStable",
+        "Get-NetTCPConnection -OwningProcess",
+        "legacyServiceThreadFloor",
+        "Set-Service -Name $serviceName -StartupType Manual",
+        "Set-Service -Name $serviceName -StartupType Automatic",
+        "temporary FPM canary requires the approved legacy Agent release",
+    ):
+        assert required in script
+    for forbidden in (
+        "23:30",
+        "Europe/Rome",
+        "Invoke-DeployGuard -Action converge",
+        "rotate_all",
+        "accept_template_rotation",
+    ):
+        assert forbidden not in script
+
+
+def test_windows_release_preflight_runs_ad_hoc_probe_tests() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "tests\\windows\\test_mt5_adhoc_probe.py" in script
+    assert "Get-ScheduledTask -ErrorAction Stop" in script
+    assert "TradeJournal-MT5-AdHoc-*" in script
+    assert "TradeJournal-DeployGuard-*" in script
+
+
 def test_service_installer_is_fail_fast_and_uses_the_pinned_runtime() -> None:
     script = (
         REPOSITORY_ROOT / "scripts" / "windows" / "install-agent-service.ps1"

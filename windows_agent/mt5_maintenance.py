@@ -58,6 +58,19 @@ class Mt5MaintenanceReport:
 
 
 @dataclass(frozen=True)
+class Mt5CanaryOnlyReport:
+    """Sanitized result of one explicitly targeted MT5 canary probe."""
+
+    connection_id: str
+    server: str
+    pending_update_receipt_ids: tuple[str, ...]
+
+    @property
+    def update_captured(self) -> bool:
+        return bool(self.pending_update_receipt_ids)
+
+
+@dataclass(frozen=True)
 class _Canary:
     connection_id: str
     root: Path
@@ -169,7 +182,17 @@ class Mt5MaintenanceCoordinator:
             selected.append(values[0])
         return tuple(sorted(selected, key=lambda value: value.connection_id))
 
-    def _capture_callback(self, stop_event: Event) -> Callable[..., str | None]:
+    def _capture_callback(
+        self,
+        stop_event: Event,
+        *,
+        on_captured: Callable[[str], None] | None = None,
+        require_pending_store: bool = False,
+    ) -> Callable[..., str | None]:
+        pending_update_store = self.pending_update_store
+        if require_pending_store and pending_update_store is None:
+            raise Mt5MaintenanceError("MT5 pending update store is disabled")
+
         def capture(
             bundle_root: Path,
             updater: Path,
@@ -178,14 +201,18 @@ class Mt5MaintenanceCoordinator:
         ) -> str | None:
             if stop_event.is_set():
                 raise Mt5MaintenanceError("MT5 maintenance was interrupted")
-            if self.pending_update_store is not None:
-                receipt = self.pending_update_store.capture(
+            if pending_update_store is not None:
+                receipt = pending_update_store.capture(
                     bundle_root,
                     updater,
                     config,
                     signer_subject,
                 )
+                if on_captured is not None:
+                    on_captured(receipt.receipt_id)
                 return receipt.receipt_id
+            if require_pending_store:
+                raise Mt5MaintenanceError("MT5 pending update store is disabled")
 
             # Compatibility for deployments that explicitly disable scheduled
             # maintenance. Production wiring always supplies the durable store,
@@ -216,6 +243,7 @@ class Mt5MaintenanceCoordinator:
         runtime: Any,
         stop_event: Event,
         recovery_from: datetime,
+        capture_callback: Callable[..., str | None] | None = None,
     ) -> None:
         if not runtime.stop():
             raise Mt5MaintenanceError("MT5 canary recovery could not stop terminal")
@@ -225,12 +253,21 @@ class Mt5MaintenanceCoordinator:
             target,
             force=True,
             history_from=recovery_from,
-            verified_update_callback=self._capture_callback(stop_event),
+            verified_update_callback=(
+                capture_callback or self._capture_callback(stop_event)
+            ),
             verified_update_required=self.pending_update_store is not None,
         )
 
-    def _probe(self, canary: _Canary, stop_event: Event) -> None:
+    def _probe(
+        self,
+        canary: _Canary,
+        stop_event: Event,
+        *,
+        capture_callback: Callable[..., str | None] | None = None,
+    ) -> None:
         with self.lifecycle.connection(canary.connection_id):
+            self._require_not_stopped(stop_event)
             runtime = self.runtime_factory(canary.root, canary.connection_id)
             set_cancel_check = getattr(runtime, "set_cancel_check", None)
             if callable(set_cancel_check):
@@ -241,11 +278,16 @@ class Mt5MaintenanceCoordinator:
 
                 set_cancel_check(require_not_stopped)
             runtime.set_verified_vendor_update_callback(
-                self._capture_callback(stop_event),
+                capture_callback or self._capture_callback(stop_event),
                 required=self.pending_update_store is not None,
             )
             try:
                 recovery_from = new_only_recovery_from(canary.root)
+            except Exception as exc:
+                raise Mt5MaintenanceError(
+                    "MT5 canary recovery cursor is unavailable"
+                ) from exc
+            try:
                 if not runtime.stop():
                     raise Mt5MaintenanceError("MT5 canary stop failed")
                 status = runtime.resume(
@@ -264,6 +306,7 @@ class Mt5MaintenanceCoordinator:
                         runtime,
                         stop_event,
                         recovery_from,
+                        capture_callback,
                     )
                 except Exception as recovery_exc:
                     raise Mt5MaintenanceError(
@@ -272,6 +315,80 @@ class Mt5MaintenanceCoordinator:
                 raise Mt5MaintenanceError(
                     "MT5 canary probe failed and was recovered"
                 ) from exc
+
+    def run_canary_only(
+        self,
+        connection_id: str,
+        expected_server: str,
+        stop_event: Event,
+    ) -> Mt5CanaryOnlyReport:
+        """Probe exactly one account without publishing or cascading an update.
+
+        A healthy signed LiveUpdate is retained only as a durable pending
+        receipt.  The ordinary scheduled maintenance pass remains the sole
+        path that may promote the golden template, rebuild the pool, or rotate
+        the fleet.
+        """
+
+        self._require_not_stopped(stop_event)
+        if self.pending_update_store is None:
+            raise Mt5MaintenanceError("MT5 pending update store is disabled")
+        if (
+            not isinstance(expected_server, str)
+            or not expected_server
+            or expected_server != expected_server.strip()
+        ):
+            raise Mt5MaintenanceError("MT5 canary expected server is invalid")
+        try:
+            connection_id = canonical_uuid(connection_id)
+        except (TypeError, ValueError) as exc:
+            raise Mt5MaintenanceError("MT5 canary connection is invalid") from exc
+        try:
+            root = self.rotator._instance_root(connection_id)
+            state = read_json(root / "state" / "instance.json", {})
+        except Exception as exc:
+            raise Mt5MaintenanceError("MT5 canary instance is invalid") from exc
+        if (
+            state.get("connection_id") != connection_id
+            or state.get("status") != "provisioned"
+        ):
+            raise Mt5MaintenanceError("MT5 canary instance is invalid")
+        try:
+            login = int(self.secrets.read(connection_id, "mt5_login"))
+            server = self.secrets.read(connection_id, "mt5_server")
+        except Exception as exc:
+            raise Mt5MaintenanceError("MT5 canary identity is unavailable") from exc
+        if (
+            login <= 0
+            or not isinstance(server, str)
+            or not server
+            or server != server.strip()
+        ):
+            raise Mt5MaintenanceError("MT5 canary identity is invalid")
+        if server.casefold() != expected_server.casefold():
+            raise Mt5MaintenanceError("MT5 canary server does not match")
+
+        captured: list[str] = []
+
+        def record_capture(receipt_id: str) -> None:
+            if receipt_id not in captured:
+                captured.append(receipt_id)
+
+        self._require_not_stopped(stop_event)
+        self._probe(
+            _Canary(connection_id, root, login, server),
+            stop_event,
+            capture_callback=self._capture_callback(
+                stop_event,
+                on_captured=record_capture,
+                require_pending_store=True,
+            ),
+        )
+        return Mt5CanaryOnlyReport(
+            connection_id,
+            server,
+            tuple(captured),
+        )
 
     @staticmethod
     def _rotation_release(release: Mt5UpdateRelease) -> Mt5TemplateRelease:

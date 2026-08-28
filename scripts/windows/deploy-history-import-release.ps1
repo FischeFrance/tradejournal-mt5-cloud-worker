@@ -42,6 +42,23 @@ try {
 if (-not $deploymentMutexOwned) {
   throw 'Another guarded Agent deployment is already running.'
 }
+$scheduledTasks = @(Get-ScheduledTask -ErrorAction Stop)
+$incompleteCanaryTasks = @(
+  $scheduledTasks | Where-Object {
+    $_.TaskName -like 'TradeJournal-MT5-AdHoc-*'
+  }
+)
+if ($incompleteCanaryTasks.Count -ne 0) {
+  throw 'An isolated MT5 canary helper is active or requires operator review.'
+}
+$incompleteDeployGuardTasks = @(
+  $scheduledTasks | Where-Object {
+    $_.TaskName -like 'TradeJournal-DeployGuard-*'
+  }
+)
+if ($incompleteDeployGuardTasks.Count -ne 0) {
+  throw 'An earlier guarded deployment helper requires operator review.'
+}
 $releaseSourcePaths = @(
   'windows_agent',
   'worker',
@@ -477,6 +494,7 @@ try {
     (Join-Path $SourceRoot 'tests\windows\test_mt5_instance_rotation.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_instance_pool_rotation.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_maintenance.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_mt5_adhoc_probe.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_maintenance_scheduler.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_lifecycle_coordinator.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_update_store.py') `

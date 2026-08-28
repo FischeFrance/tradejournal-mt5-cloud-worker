@@ -243,6 +243,54 @@ esistente: disconnettere soltanto RDP conserva il vecchio token, mentre reimpost
 rendere irrecuperabili dati DPAPI legati all'utente. Il gate controlla anche token e sessione di
 ogni `terminal64.exe`; un processo elevato preesistente non viene mai adottato.
 
+## Prova ad hoc su un solo account
+
+La prova ad hoc è distinta dalla manutenzione notturna e può essere avviata in qualunque momento.
+Richiede una release immutabile già prodotta con `-PrepareOnly`, ferma temporaneamente soltanto il
+servizio Agent per evitare concorrenza tra processi e lascia accesi tutti i terminali diversi dal
+canary richiesto:
+
+```powershell
+$releasePath = 'C:\TradeJournal\releases\agent-' + $revision.Substring(0, 12)
+powershell -ExecutionPolicy Bypass `
+  -File (Join-Path $releasePath 'scripts\windows\invoke-mt5-adhoc-canary.ps1') `
+  -Revision $revision `
+  -ReleasePath $releasePath `
+  -ConnectionId '<uuid-account-FPMTrading-Live>' `
+  -ExpectedServer 'FPMTrading-Live' `
+  -ExpectedTerminalCount 4 `
+  -DeploymentPython $pythonExe
+```
+
+Il launcher rifiuta l'esecuzione se un deploy completo è già in esecuzione, se l'Agent sta
+elaborando un job o se UUID, server, release, identità interattiva e numero di terminali non
+corrispondono.
+Durante questa prima fase il launcher e l'helper SYSTEM hanno una doppia allowlist compilata nel
+codice: accettano esclusivamente l'UUID `2f1647b4-035e-41be-b634-0cf785a70b07` sul server esatto
+`FPMTrading-Live`. Il primo collaudo richiede inoltre la release legacy verificata attualmente
+attiva: questo impedisce che il riavvio abiliti per errore lo scheduler nuovo e consumi la receipt
+con una cascata nella finestra notturna. Un task completo semplicemente pianificato non blocca la
+prova; mutex e gate reciproci impediscono invece la sovrapposizione quando un deploy o un altro
+helper è realmente in esecuzione.
+
+Il probe viene eseguito come `LocalSystem`, riavvia esclusivamente l'account indicato in
+`new_only`, richiede login, heartbeat e accesso investor-only e confronta PID e creation time di
+tutti gli altri terminali prima e dopo. Il servizio Agent viene riavviato soltanto dopo un risultato
+SYSTEM valido e completo, quindi deve rimanere stabile per almeno dieci secondi; quando la release
+attiva supporta il protocollo corrente viene richiesta anche la readiness legata al PID. Se
+l'helper parte ma fallisce, resta in esecuzione o non pubblica un risultato attendibile, il servizio
+rimane prudenzialmente fermo per non affidare uno stato incerto a una release incompatibile. In tal
+caso resta anche in avvio `Manual`, così un reboot della VPS non può far ripartire il vecchio Agent
+durante una LiveUpdate incerta. Non avviare un deploy: ispezionare prima il task
+`TradeJournal-MT5-AdHoc-*`, il result JSON e il log indicati dal launcher, quindi ripristinare
+`Automatic` e avviare il servizio soltanto dopo aver escluso processi di update ancora attivi.
+
+Un LiveUpdate valido viene conservato soltanto come receipt nel deposito pending. Questa modalità
+non chiama la promozione del golden, non apre o ricostruisce il pool, non ruota la flotta e non
+scrive lo stato dello scheduler. La successiva manutenzione completa delle 23:30 rimane l'unico
+percorso che può validare il candidato, pubblicare il template e aggiornare tutti gli account a
+cascata.
+
 ## Manutenzione MT5
 
 La manutenzione non aggiorna MT5 ogni sera: alle 23:30 verifica se esiste una release vendor nuova
