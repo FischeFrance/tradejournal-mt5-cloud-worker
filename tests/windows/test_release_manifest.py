@@ -367,6 +367,7 @@ def test_ad_hoc_canary_wrapper_is_single_account_and_time_gated() -> None:
         "TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES",
         "23:30",
         "Europe/Rome",
+        "$workerDeadline = (Get-Date).AddSeconds(180)",
     ):
         assert required in script
     for forbidden in (

@@ -386,7 +386,10 @@ function Start-AgentAndAssertStable {
     if ($activeSourceRevision -ne $legacyAdoptionRevision) {
       throw 'The active Agent release is not approved for canary adoption.'
     }
-    $workerDeadline = (Get-Date).AddSeconds(60)
+    # The legacy worker performs its startup reconciliation before opening the
+    # control-plane channel.  A fresh MT5 distribution can make that phase
+    # exceed one minute even though the service process is stable and healthy.
+    $workerDeadline = (Get-Date).AddSeconds(180)
     $legacyWorkerHealthy = $false
     do {
       $process = Get-Process -Id $servicePid -ErrorAction Stop
