@@ -1218,19 +1218,41 @@ class Mt5ProvisionedReleaseInventory:
                 return None
             trusted_files = self._code_files(trusted)
             actual_files = self._code_files(terminal_root)
+            public_files = self._code_files(baseline.terminal_root)
+            trusted_index = {
+                relative.casefold(): (relative, digest)
+                for relative, digest in trusted_files.items()
+            }
+            actual_index = {
+                relative.casefold(): (relative, digest)
+                for relative, digest in actual_files.items()
+            }
+            public_index = {
+                relative.casefold(): (relative, digest)
+                for relative, digest in public_files.items()
+            }
+            if (
+                len(trusted_index) != len(trusted_files)
+                or len(actual_index) != len(actual_files)
+                or len(public_index) != len(public_files)
+            ):
+                return None
+            managed = {relative.casefold() for relative in _MANAGED_RUNTIME_PATHS}
             changed = {
                 relative
-                for relative in trusted_files.keys() | actual_files.keys()
-                if relative not in _MANAGED_RUNTIME_PATHS
-                if trusted_files.get(relative) != actual_files.get(relative)
+                for relative in trusted_index.keys() | actual_index.keys()
+                if relative not in managed
+                if trusted_index.get(relative) != actual_index.get(relative)
             }
             if not changed or not changed <= _RECOVERABLE_PARTIAL_UPDATE_PATHS:
                 return None
             reconstructed = dict(actual_files)
             for relative in changed:
-                if relative not in trusted_files or relative not in actual_files:
+                trusted_item = trusted_index.get(relative)
+                actual_item = actual_index.get(relative)
+                if trusted_item is None or actual_item is None:
                     return None
-                reconstructed[relative] = trusted_files[relative]
+                reconstructed[actual_item[0]] = trusted_item[1]
             reconstructed_manifest = hashlib.sha256(
                 "\n".join(
                     f"{relative}:{digest}"
@@ -1241,12 +1263,16 @@ class Mt5ProvisionedReleaseInventory:
                 return None
             subjects: set[str] = set()
             for relative in changed:
-                actual = terminal_root / Path(relative)
-                public = baseline.terminal_root / Path(relative)
+                actual_item = actual_index[relative]
+                public_item = public_index.get(relative)
+                if public_item is None:
+                    return None
+                actual = terminal_root / Path(actual_item[0])
+                public = baseline.terminal_root / Path(public_item[0])
                 if (
                     not public.is_file()
                     or InstanceProvisioner._is_reparse_point(public)
-                    or actual_files[relative] != _sha256(public)
+                    or actual_item[1] != public_item[1]
                     or _validate_positive_build(self.build_reader(actual))
                     != baseline.build
                     or _validate_positive_build(self.build_reader(public))

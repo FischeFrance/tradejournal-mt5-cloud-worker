@@ -83,7 +83,7 @@ def _runner(
             (destination / "terminal64.exe").write_bytes(
                 f"terminal;build={terminal_build}".encode()
             )
-            (destination / "metaeditor64.exe").write_bytes(
+            (destination / "MetaEditor64.exe").write_bytes(
                 f"editor;build={terminal_build}".encode()
             )
             (destination / "metatester64.exe").write_bytes(
@@ -447,7 +447,7 @@ def test_read_only_inventory_classifies_build_and_integrity(tmp_path: Path) -> N
 def _write_trusted_template(root: Path, build: int) -> None:
     root.mkdir(parents=True)
     (root / "terminal64.exe").write_bytes(f"terminal;build={build}".encode())
-    (root / "metaeditor64.exe").write_bytes(f"editor;build={build}".encode())
+    (root / "MetaEditor64.exe").write_bytes(f"editor;build={build}".encode())
     (root / "metatester64.exe").write_bytes(f"tester;build={build}".encode())
     for relative, content in (
         (
@@ -480,7 +480,7 @@ def test_inventory_accepts_only_exact_signed_public_auxiliary_partial(
     root = instances / connection_id
     terminal_root = root / "terminal"
     shutil.copytree(trusted, terminal_root)
-    for name in ("metaeditor64.exe", "metatester64.exe"):
+    for name in ("MetaEditor64.exe", "metatester64.exe"):
         shutil.copy2(baseline.terminal_root / name, terminal_root / name)
     state_path = root / "state" / "instance.json"
     state_path.parent.mkdir()
@@ -528,7 +528,7 @@ def test_inventory_accepts_only_exact_signed_public_auxiliary_partial(
         InstanceProvisioner._code_manifest(terminal_root)
     )
 
-    (terminal_root / "metaeditor64.exe").write_bytes(b"evil;build=6140")
+    (terminal_root / "MetaEditor64.exe").write_bytes(b"evil;build=6140")
     blocked = inventory.scan(baseline)[0]
     assert blocked.classification == "unverifiable"
     assert blocked.failure == "code_manifest_mismatch"
