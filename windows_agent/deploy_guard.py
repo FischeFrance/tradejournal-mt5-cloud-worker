@@ -30,6 +30,7 @@ from worker.atomic_file import durable_replace, fsync_directory
 
 from .interactive_identity import (
     _windows_sids_equal,
+    InteractiveIdentityError,
     verify_interactive_process_identity,
     verify_interactive_task_identity,
 )
@@ -658,11 +659,15 @@ def _iter_terminal_processes(config: AgentRuntimeConfig) -> list[tuple[int, Path
                 observed.append((pid, executable))
             except DeployGuardError:
                 raise
+            except InteractiveIdentityError as exc:
+                raise DeployGuardError(exc.code) from exc
             except Exception as exc:
                 raise DeployGuardError("mt5_process_probe_failed") from exc
         return observed
     except DeployGuardError:
         raise
+    except InteractiveIdentityError as exc:
+        raise DeployGuardError(exc.code) from exc
     except Exception as exc:
         raise DeployGuardError("mt5_process_probe_failed") from exc
 
@@ -859,6 +864,8 @@ def _preflight(request: dict[str, Any]) -> dict[str, Any]:
         manager = Mt5TemplateManager(config.source_terminal, config.terminal_sha256)
         golden_digest = manager.validate_current_quiesced()
         verify_interactive_task_identity(config.mt5_interactive_user)
+    except InteractiveIdentityError as exc:
+        raise DeployGuardError(exc.code) from exc
     except Exception as exc:
         raise DeployGuardError("deployment_preflight_failed") from exc
     observed = _iter_terminal_processes(config)

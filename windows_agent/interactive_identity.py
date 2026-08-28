@@ -267,10 +267,10 @@ def verify_interactive_process_identity(
     session = verify_interactive_task_identity(interactive_user)
     try:
         import win32api
-        import win32process
         import win32security
+        import win32ts
 
-        if int(win32process.ProcessIdToSessionId(pid)) != session.session_id:
+        if int(win32ts.ProcessIdToSessionId(pid)) != session.session_id:
             raise InteractiveIdentityError(
                 "interactive_process_session_mismatch"
             )

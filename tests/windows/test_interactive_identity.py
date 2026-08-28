@@ -139,7 +139,7 @@ def test_process_gate_rejects_admin_token_in_the_verified_standard_session() -> 
     win32security.TOKEN_QUERY = 8
     win32security.OpenProcessToken = Mock(return_value=process_token)
     win32api = SimpleNamespace(OpenProcess=Mock(return_value=process_handle))
-    win32process = SimpleNamespace(ProcessIdToSessionId=Mock(return_value=2))
+    win32ts.ProcessIdToSessionId = Mock(return_value=2)
 
     with (
         patch("subprocess.run", return_value=_local_identity_result()),
@@ -147,7 +147,6 @@ def test_process_gate_rejects_admin_token_in_the_verified_standard_session() -> 
             sys.modules,
             {
                 "win32api": win32api,
-                "win32process": win32process,
                 "win32ts": win32ts,
                 "win32security": win32security,
             },
