@@ -103,6 +103,95 @@ def test_prepare_verified_update_does_not_publish_golden(tmp_path: Path) -> None
     assert (prepared.root / ".tradejournal-vendor-update.json").is_file()
 
 
+def test_prepare_verified_public_distribution_grafts_only_managed_assets(
+    tmp_path: Path,
+) -> None:
+    terminal = _template(tmp_path)
+    base_digest = InstanceProvisioner._sha256(terminal)
+    golden_manifest = InstanceProvisioner._tree_manifest(terminal.parent)
+    expected_assets = {
+        relative: (terminal.parent / relative).read_bytes()
+        for relative in _MANAGED_RUNTIME_ASSETS
+    }
+    public_root = tmp_path / "public-distribution"
+    public_root.mkdir()
+    public_terminal = public_root / "terminal64.exe"
+    public_terminal.write_bytes(b"terminal-public-v2")
+    vendor_library = public_root / "terminal64.dll"
+    vendor_library.write_bytes(b"vendor-library-v2")
+    untrusted = (
+        public_root
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "unexpected.ex5"
+    )
+    untrusted.parent.mkdir(parents=True)
+    untrusted.write_bytes(b"not-managed-by-tradejournal")
+    generated = (
+        public_root / "MQL5" / "Experts" / "Examples" / "sample.ex5"
+    )
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"vendor-example")
+    private = public_root / "Config" / "accounts.dat"
+    private.parent.mkdir()
+    private.write_bytes(b"must-not-survive")
+    public_digest = InstanceProvisioner._sha256(public_terminal)
+    public_manifest = InstanceProvisioner._tree_manifest(public_root)
+    manager = Mt5TemplateManager(terminal, base_digest)
+
+    with (
+        patch.object(manager, "_verify_metaquotes_signature", return_value=SIGNER),
+        patch(
+            "windows_agent.provisioning.mt5_template.WindowsSecretStore.restrict_acl"
+        ),
+    ):
+        prepared = manager.prepare_verified_distribution(
+            public_root,
+            expected_terminal_sha256=public_digest,
+            expected_distribution_manifest_sha256=public_manifest,
+        )
+
+    assert InstanceProvisioner._tree_manifest(terminal.parent) == golden_manifest
+    assert prepared.target_terminal_sha256 == public_digest
+    assert (prepared.root / "terminal64.dll").read_bytes() == b"vendor-library-v2"
+    assert not (prepared.root / "Config" / "accounts.dat").exists()
+    assert not (prepared.root / "MQL5" / "Experts" / "Examples").exists()
+    assert not (prepared.root / untrusted.relative_to(public_root)).exists()
+    for relative, expected in expected_assets.items():
+        assert (prepared.root / relative).read_bytes() == expected
+    manager.discard_prepared_update(prepared)
+
+
+def test_prepare_verified_public_distribution_is_bound_to_fresh_manifest(
+    tmp_path: Path,
+) -> None:
+    terminal = _template(tmp_path)
+    manager = Mt5TemplateManager(
+        terminal,
+        InstanceProvisioner._sha256(terminal),
+    )
+    public_root = tmp_path / "public-distribution"
+    public_root.mkdir()
+    public_terminal = public_root / "terminal64.exe"
+    public_terminal.write_bytes(b"terminal-public-v2")
+
+    with (
+        patch.object(manager, "_verify_metaquotes_signature", return_value=SIGNER),
+        pytest.raises(Mt5TemplateError, match="public distribution is invalid"),
+    ):
+        manager.prepare_verified_distribution(
+            public_root,
+            expected_terminal_sha256=InstanceProvisioner._sha256(public_terminal),
+            expected_distribution_manifest_sha256="f" * 64,
+        )
+
+    assert terminal.read_bytes() == b"terminal-v1"
+    assert not (
+        terminal.parent.parent / f".{terminal.parent.name}.vendor-staging"
+    ).exists()
+
+
 def test_prepare_consumes_a_working_copy_not_the_pending_receipt(
     tmp_path: Path,
 ) -> None:

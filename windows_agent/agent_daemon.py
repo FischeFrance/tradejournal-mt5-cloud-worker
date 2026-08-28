@@ -30,6 +30,10 @@ from .provisioning.mt5_instance_rotation import (
     Mt5InstanceRotationError,
     Mt5InstanceRotator,
 )
+from .provisioning.mt5_public_release import (
+    Mt5ProvisionedReleaseInventory,
+    Mt5PublicReleaseProbe,
+)
 from .provisioning.mt5_template import Mt5TemplateManager
 from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .real_handlers import (
@@ -331,6 +335,10 @@ def build_runner(
             instance_pool.recover_incomplete()
             background_workers = (instance_pool.replenish_forever,)
         if config.mt5_maintenance_enabled:
+            public_release_probe = Mt5PublicReleaseProbe(
+                config.mt5_maintenance_state_path.parent
+                / "mt5-public-releases"
+            )
             maintenance_coordinator = Mt5MaintenanceCoordinator(
                 instances_root=config.instances_root,
                 expert_binary=config.expert_binary,
@@ -340,6 +348,10 @@ def build_runner(
                 template_lock=template_lock,
                 instance_pool=instance_pool,
                 pending_update_store=pending_update_store,
+                public_release_probe=public_release_probe,
+                public_release_inventory=(
+                    Mt5ProvisionedReleaseInventory(config.instances_root)
+                ),
             )
             config.mt5_maintenance_state_path.parent.mkdir(
                 parents=True,

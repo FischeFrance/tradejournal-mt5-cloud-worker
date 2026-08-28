@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from threading import Event, RLock
 from types import SimpleNamespace
@@ -18,6 +19,11 @@ from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.mt5_instance_rotation import (
     Mt5FleetRotationReport,
     Mt5TemplateRelease,
+)
+from windows_agent.provisioning.mt5_public_release import (
+    AuthenticodeIdentity,
+    Mt5InstanceReleaseInventory,
+    Mt5PublicRelease,
 )
 from windows_agent.provisioning.mt5_template import PreparedMt5Template
 from windows_agent.provisioning.mt5_update_store import Mt5UpdateRelease
@@ -80,6 +86,31 @@ class FakeTemplateManager:
             == target.code_manifest_sha256
         )
         kwargs["cancel_check"]()
+        return PreparedMt5Template(
+            self.candidate_root,
+            source.terminal_sha256,
+            source.code_manifest_sha256,
+            target.terminal_sha256,
+            target.code_manifest_sha256,
+            "a" * 64,
+            "CN=MetaQuotes Ltd., O=MetaQuotes Ltd.",
+        )
+
+    def prepare_verified_distribution(
+        self,
+        distribution_root: Path,
+        **kwargs: object,
+    ) -> PreparedMt5Template:
+        target = self.target_release
+        assert Path(distribution_root) == self.candidate_root
+        assert kwargs["expected_terminal_sha256"] == target.terminal_sha256
+        assert kwargs["expected_distribution_manifest_sha256"] == (
+            InstanceProvisioner._tree_manifest(self.candidate_root)
+        )
+        cancel = kwargs["cancel_check"]
+        assert callable(cancel)
+        cancel()
+        source = self.source_release
         return PreparedMt5Template(
             self.candidate_root,
             source.terminal_sha256,
@@ -318,12 +349,23 @@ def _fixture(tmp_path: Path, servers: tuple[str, ...] = ("Broker-A",)):
         root = instances / connection_id
         (root / "state").mkdir(parents=True)
         (root / "terminal").mkdir()
-        (root / "terminal" / "terminal64.exe").write_bytes(b"instance")
+        instance_terminal = root / "terminal" / "terminal64.exe"
+        instance_terminal.write_bytes(b"instance")
+        terminal_sha256 = InstanceProvisioner._sha256(instance_terminal)
+        code_manifest_sha256 = InstanceProvisioner._code_manifest(
+            instance_terminal.parent
+        )
+        release_id = hashlib.sha256(
+            f"{terminal_sha256}:{code_manifest_sha256}".encode("ascii")
+        ).hexdigest()
         atomic_json(
             root / "state" / "instance.json",
             {
                 "connection_id": connection_id,
                 "status": "provisioned",
+                "terminal_sha256": terminal_sha256,
+                "template_code_manifest_sha256": code_manifest_sha256,
+                "template_release_id": release_id,
             },
         )
         values[connection_id] = (40 + index, server)
@@ -342,6 +384,8 @@ def _coordinator(
     runtime: RuntimeController,
     pool: FakePool,
     pending_store: FakePendingStore | None = None,
+    public_probe: object | None = None,
+    public_inventory: object | None = None,
 ) -> Mt5MaintenanceCoordinator:
     lifecycle = Mt5LifecycleCoordinator()
     return Mt5MaintenanceCoordinator(
@@ -356,7 +400,94 @@ def _coordinator(
         runtime_factory=runtime.factory,
         process_factory=FakeProcess,
         secret_store=secrets,
+        public_release_probe=public_probe,
+        public_release_inventory=public_inventory,
     )
+
+
+def _public_release(manager: FakeTemplateManager) -> Mt5PublicRelease:
+    target = manager.target_release
+    signer = AuthenticodeIdentity(
+        "CN=MetaQuotes Ltd., O=MetaQuotes Ltd.",
+        "MetaQuotes Ltd.",
+        ("MetaQuotes Ltd.",),
+        "d" * 64,
+    )
+    return Mt5PublicRelease(
+        release_id="e" * 64,
+        root=manager.candidate_root,
+        installer=manager.candidate_root / "mt5setup.exe",
+        terminal_root=manager.candidate_root,
+        build=6140,
+        installer_sha256="f" * 64,
+        terminal_sha256=target.terminal_sha256,
+        code_manifest_sha256=target.code_manifest_sha256,
+        distribution_manifest_sha256=InstanceProvisioner._tree_manifest(
+            manager.candidate_root
+        ),
+        installer_signer=signer,
+        terminal_signer=signer,
+        published_at_unix_ms=1,
+    )
+
+
+class FakePublicProbe:
+    def __init__(self, release: Mt5PublicRelease) -> None:
+        self.release = release
+        self.refresh_calls = 0
+        self.build_reader = self._build
+
+    @staticmethod
+    def _build(path: Path) -> int:
+        return 6140 if Path(path).read_bytes() == b"terminal-v2" else 6090
+
+    def refresh(self) -> Mt5PublicRelease:
+        self.refresh_calls += 1
+        return self.release
+
+    def load_current(self) -> Mt5PublicRelease:
+        return self.release
+
+
+class FakePublicInventory:
+    def __init__(self, instances: Path, rotator: FakeRotator) -> None:
+        self.instances = instances
+        self.rotator = rotator
+        self.calls = 0
+
+    def scan(
+        self,
+        baseline: Mt5PublicRelease,
+    ) -> tuple[Mt5InstanceReleaseInventory, ...]:
+        self.calls += 1
+        records: list[Mt5InstanceReleaseInventory] = []
+        for root in sorted(self.instances.iterdir(), key=lambda value: value.name):
+            connection_id = root.name
+            is_current = connection_id in self.rotator.current
+            records.append(
+                Mt5InstanceReleaseInventory(
+                    connection_id=connection_id,
+                    root=root,
+                    build=baseline.build if is_current else 6090,
+                    terminal_sha256=(
+                        baseline.terminal_sha256
+                        if is_current
+                        else "1" * 64
+                    ),
+                    recorded_terminal_sha256=(
+                        baseline.terminal_sha256
+                        if is_current
+                        else "1" * 64
+                    ),
+                    state_integrity=True,
+                    hash_integrity=True,
+                    code_integrity=True,
+                    signature_valid=True,
+                    classification="current" if is_current else "older",
+                    failure=None,
+                )
+            )
+        return tuple(records)
 
 
 def test_canary_only_targets_exact_fpm_account_without_shared_mutations(
@@ -668,6 +799,102 @@ def test_failed_canary_only_probe_restores_only_requested_account(
     assert manager.promotions == 0
     assert pool.calls == []
     assert rotator.rotate_all_calls == []
+
+
+def test_public_canary_refreshes_baseline_and_updates_only_fpm(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("FPMTrading-Live", "FPMTrading-Live", "Other-Broker"),
+    )
+    public = _public_release(manager)
+    public_probe = FakePublicProbe(public)
+    public_inventory = FakePublicInventory(instances, rotator)
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        pool,
+        FakePendingStore(manager),
+        public_probe,
+        public_inventory,
+    )
+
+    with patch.object(
+        InstanceProvisioner,
+        "record_verified_vendor_update",
+        return_value="a" * 64,
+    ) as seal:
+        report = coordinator.run_public_canary_only(
+            ids[1],
+            "FPMTrading-Live",
+            Event(),
+        )
+
+    assert public_probe.refresh_calls == 1
+    assert report.updated is True
+    assert report.public_build == 6140
+    assert report.observed_build_before == 6090
+    assert report.observed_build_after == 6140
+    assert report.classification_before == "older"
+    assert report.classification_after == "current"
+    assert report.inventory_counts == (
+        ("older", 3),
+        ("current", 0),
+        ("ahead", 0),
+        ("same_build_divergent", 0),
+        ("unverifiable", 0),
+    )
+    assert rotator.rotate_one_calls == [(ids[1], True)]
+    assert ids[0] not in rotator.current
+    assert ids[2] not in rotator.current
+    assert manager.commits == 0
+    assert manager.discards == 1
+    assert pool.calls == []
+    assert rotator.rotate_all_calls == []
+    seal.assert_called_once()
+
+
+def test_nightly_public_baseline_promotes_pool_then_only_older_instances(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("Broker-A", "Broker-A", "Broker-B"),
+    )
+    public = _public_release(manager)
+    public_probe = FakePublicProbe(public)
+    public_inventory = FakePublicInventory(instances, rotator)
+    pool = FakePool()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        pool,
+        None,
+        public_probe,
+        public_inventory,
+    )
+
+    report = coordinator.run_once(Event())
+
+    assert public_probe.refresh_calls == 1
+    assert manager.commits == 1
+    assert manager.source_terminal.read_bytes() == b"terminal-v2"
+    assert pool.calls == [(report.current_release.terminal_sha256, True)]
+    assert rotator.rotate_all_calls == []
+    assert rotator.current == set(ids)
+    assert len(report.checked_connections) == 2
+    assert len(report.migrated_connections) == 1
+    assert report.release_changed is True
 
 
 def test_new_release_is_verified_then_rebuilds_pool_and_rotates_fleet(

@@ -707,6 +707,180 @@ class Mt5TemplateManager:
             cls._remove_tree(working)
             raise
 
+    def prepare_verified_distribution(
+        self,
+        distribution_root: Path,
+        *,
+        expected_terminal_sha256: str,
+        expected_distribution_manifest_sha256: str,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> PreparedMt5Template:
+        """Build an unpublished golden candidate from a public distribution.
+
+        The official web installer produces a vendor-only tree, whereas every
+        TradeJournal template must contain the three pinned bridge assets.  A
+        fresh distribution is therefore copied into the normal private
+        staging path, stripped of private/default data, and grafted with the
+        *current golden's* managed assets before the candidate is sealed.
+        Nothing in this method publishes the candidate or touches a live
+        account; broker canaries remain the mandatory next gate.
+        """
+
+        # Keep the lexical path for the reparse-point check. ``resolve()``
+        # here would follow a junction first and could hide the unsafe source
+        # that the public-release cache is required to reject.
+        distribution_root = Path(
+            os.path.abspath(os.fspath(distribution_root))
+        )
+        expected_terminal = self._required_digest(
+            expected_terminal_sha256,
+            "public terminal",
+        )
+        expected_distribution = self._required_digest(
+            expected_distribution_manifest_sha256,
+            "public distribution manifest",
+        )
+        if expected_terminal is None or expected_distribution is None:
+            raise Mt5TemplateError("MT5 public distribution binding is incomplete")
+
+        with self.lock:
+            if self._recovery_required:
+                raise Mt5TemplateRecoveryRequired(
+                    "MT5 template rotation requires recovery"
+                )
+            if self._prepared is not None:
+                raise Mt5TemplateError("MT5 template candidate already exists")
+            current = self._validate_current_locked()
+            try:
+                current_code = InstanceProvisioner._code_manifest(
+                    self.template_root
+                )
+                managed_assets = (
+                    InstanceProvisioner._managed_runtime_assets_manifest(
+                        self.template_root
+                    )
+                )
+                if (
+                    InstanceProvisioner._is_reparse_point(distribution_root)
+                    or not distribution_root.is_dir()
+                    or distribution_root == self.template_root
+                ):
+                    raise ValueError("public distribution root invalid")
+                InstanceProvisioner._validate_source_tree(distribution_root)
+                distribution_terminal = distribution_root / "terminal64.exe"
+                if (
+                    InstanceProvisioner._is_reparse_point(distribution_terminal)
+                    or not distribution_terminal.is_file()
+                    or InstanceProvisioner._sha256(distribution_terminal)
+                    != expected_terminal
+                    or InstanceProvisioner._tree_manifest(distribution_root)
+                    != expected_distribution
+                ):
+                    raise ValueError("public distribution binding mismatch")
+                signer = self._verify_metaquotes_signature(distribution_terminal)
+            except Mt5TemplateError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise Mt5TemplateError(
+                    "MT5 public distribution is invalid"
+                ) from exc
+
+            parent = self.template_root.parent
+            staging = parent / f".{self.template_root.name}.vendor-staging"
+            backup = parent / f".{self.template_root.name}.vendor-backup"
+            working = parent / f".{self.template_root.name}.vendor-working"
+            self._remove_tree(staging)
+            self._remove_tree(backup)
+            self._remove_tree(working)
+            try:
+                if cancel_check is not None:
+                    cancel_check()
+                manifest_before = InstanceProvisioner._tree_manifest(
+                    distribution_root
+                )
+                shutil.copytree(distribution_root, staging, symlinks=False)
+                if cancel_check is not None:
+                    cancel_check()
+                if (
+                    InstanceProvisioner._tree_manifest(distribution_root)
+                    != manifest_before
+                    or InstanceProvisioner._tree_manifest(staging)
+                    != manifest_before
+                ):
+                    raise Mt5TemplateError(
+                        "MT5 public distribution changed during staging"
+                    )
+
+                # The public distribution must not get to introduce files in
+                # the private TradeJournal namespaces.  Recreate those two
+                # directories exclusively from the already pinned golden.
+                managed_parents = {
+                    relative.parent for relative in _MANAGED_RUNTIME_ASSETS
+                }
+                for relative in managed_parents:
+                    self._remove_tree(staging / relative)
+                for relative in _MANAGED_RUNTIME_ASSETS:
+                    source = self.template_root / relative
+                    destination = staging / relative
+                    if (
+                        InstanceProvisioner._is_reparse_point(source)
+                        or not source.is_file()
+                    ):
+                        raise Mt5TemplateError(
+                            "MT5 managed runtime asset is unavailable"
+                        )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+
+                self._sanitize_template(staging)
+                if (
+                    InstanceProvisioner._managed_runtime_assets_manifest(staging)
+                    != managed_assets
+                ):
+                    raise Mt5TemplateError(
+                        "MT5 public distribution changed managed runtime assets"
+                    )
+                staged_terminal = staging / "terminal64.exe"
+                if (
+                    InstanceProvisioner._sha256(staged_terminal)
+                    != expected_terminal
+                    or self._verify_metaquotes_signature(staged_terminal) != signer
+                ):
+                    raise Mt5TemplateError(
+                        "MT5 public distribution signer changed"
+                    )
+                next_code = InstanceProvisioner._code_manifest(staging)
+                atomic_json(
+                    staging / _MARKER_NAME,
+                    {
+                        "schema_version": 2,
+                        "base_terminal_sha256": self.configured_sha256,
+                        "previous_terminal_sha256": current,
+                        "terminal_sha256": expected_terminal,
+                        "code_manifest_sha256": next_code,
+                        "signer_subject": signer,
+                        "verified_at_unix_ms": int(time.time() * 1000),
+                    },
+                )
+                WindowsSecretStore.restrict_acl(staging / _MARKER_NAME)
+                InstanceProvisioner._sync_tree(staging)
+                prepared = PreparedMt5Template(
+                    root=staging,
+                    source_terminal_sha256=current,
+                    source_code_manifest_sha256=current_code,
+                    target_terminal_sha256=expected_terminal,
+                    target_code_manifest_sha256=next_code,
+                    candidate_manifest_sha256=(
+                        InstanceProvisioner._tree_manifest(staging)
+                    ),
+                    signer_subject=signer,
+                )
+                self._prepared = prepared
+                return prepared
+            except Exception:
+                self._remove_tree(staging)
+                raise
+
     def prepare_verified_update(
         self,
         bundle_root: Path,

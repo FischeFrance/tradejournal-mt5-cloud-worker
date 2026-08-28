@@ -495,6 +495,7 @@ try {
     (Join-Path $SourceRoot 'tests\windows\test_mt5_instance_pool_rotation.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_maintenance.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_adhoc_probe.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_mt5_public_release.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_maintenance_scheduler.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_lifecycle_coordinator.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_update_store.py') `

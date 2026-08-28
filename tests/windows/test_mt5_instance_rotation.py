@@ -232,6 +232,108 @@ def test_rotation_preserves_only_required_private_state_and_resumes_new_only(
     assert not (root / "state" / "mt5-rotation.json").exists()
 
 
+def test_rotation_expected_source_rejects_changed_release_before_mutation(
+    tmp_path: Path,
+) -> None:
+    old_terminal, _ = _template(tmp_path / "old", b"terminal-v1")
+    new_terminal, expert = _template(tmp_path / "new", b"terminal-v2")
+    connection_id = str(uuid4())
+    root = _instance(tmp_path, old_terminal, connection_id)
+    expected_source = Mt5TemplateRelease.from_template(
+        old_terminal,
+        InstanceProvisioner._sha256(old_terminal),
+    )
+
+    # Model another verified writer winning the race after inventory: both
+    # files and state are internally consistent, but no longer identify the
+    # release the caller authorized as the rotation source.
+    live_terminal = root / "terminal" / "terminal64.exe"
+    live_terminal.write_bytes(b"terminal-intermediate")
+    state_path = root / "state" / "instance.json"
+    changed_state = read_json(state_path)
+    changed_state["terminal_sha256"] = InstanceProvisioner._sha256(live_terminal)
+    changed_state["template_code_manifest_sha256"] = (
+        InstanceProvisioner._code_manifest(root / "terminal")
+    )
+    rotation_module.atomic_json(state_path, changed_state)
+    terminal_before = live_terminal.read_bytes()
+    state_before = state_path.read_bytes()
+
+    controller = RuntimeController()
+    rotator = _rotator(tmp_path, new_terminal, expert, controller)
+    target = Mt5TemplateRelease.from_template(
+        new_terminal,
+        InstanceProvisioner._sha256(new_terminal),
+    )
+
+    with pytest.raises(
+        Mt5InstanceRotationError,
+        match="source release changed",
+    ):
+        rotator.rotate_one(
+            connection_id,
+            target,
+            expected_source=expected_source,
+        )
+
+    assert controller.stop_calls == 0
+    assert controller.resume_calls == []
+    assert FakeProcess.adopted == []
+    assert live_terminal.read_bytes() == terminal_before
+    assert state_path.read_bytes() == state_before
+    assert not (root / "state" / "mt5-rotation.json").exists()
+    assert not (root / ".terminal-maintenance-staging").exists()
+    assert not (root / ".terminal-maintenance-backup").exists()
+
+
+def test_rotation_expected_source_allows_exact_observed_release(
+    tmp_path: Path,
+) -> None:
+    old_terminal, _ = _template(tmp_path / "old", b"terminal-v1")
+    new_terminal, expert = _template(tmp_path / "new", b"terminal-v2")
+    connection_id = str(uuid4())
+    root = _instance(tmp_path, old_terminal, connection_id)
+    controller = RuntimeController()
+    rotator = _rotator(tmp_path, new_terminal, expert, controller)
+    expected_source = Mt5TemplateRelease.from_template(
+        old_terminal,
+        InstanceProvisioner._sha256(old_terminal),
+    )
+    target = Mt5TemplateRelease.from_template(
+        new_terminal,
+        InstanceProvisioner._sha256(new_terminal),
+    )
+
+    assert rotator.rotate_one(
+        connection_id,
+        target,
+        expected_source=expected_source,
+    ) is True
+
+    assert controller.stop_calls == 1
+    assert (root / "terminal" / "terminal64.exe").read_bytes() == b"terminal-v2"
+
+
+def test_rotation_without_expected_source_remains_backward_compatible(
+    tmp_path: Path,
+) -> None:
+    old_terminal, _ = _template(tmp_path / "old", b"terminal-v1")
+    new_terminal, expert = _template(tmp_path / "new", b"terminal-v2")
+    connection_id = str(uuid4())
+    root = _instance(tmp_path, old_terminal, connection_id)
+    controller = RuntimeController()
+    rotator = _rotator(tmp_path, new_terminal, expert, controller)
+    target = Mt5TemplateRelease.from_template(
+        new_terminal,
+        InstanceProvisioner._sha256(new_terminal),
+    )
+
+    assert rotator.rotate_one(connection_id, target) is True
+
+    assert controller.stop_calls == 1
+    assert (root / "terminal" / "terminal64.exe").read_bytes() == b"terminal-v2"
+
+
 def test_rotation_retries_transient_windows_directory_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

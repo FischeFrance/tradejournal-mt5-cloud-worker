@@ -795,6 +795,7 @@ class Mt5InstanceRotator:
         connection_id: str,
         target: Mt5TemplateRelease,
         *,
+        expected_source: Mt5TemplateRelease | None = None,
         force: bool = False,
         history_from: datetime | None = None,
         verified_update_callback: VerifiedUpdateCallback | None = None,
@@ -813,6 +814,13 @@ class Mt5InstanceRotator:
             ):
                 raise Mt5InstanceRotationError("MT5 instance state is invalid")
             self._validate_terminal_against_state(root / "terminal", previous_state)
+            if (
+                expected_source is not None
+                and self._release_from_state(previous_state) != expected_source
+            ):
+                raise Mt5InstanceRotationError(
+                    "MT5 instance source release changed"
+                )
             if not force and self._matches_target(root, previous_state, target):
                 return False
             try:

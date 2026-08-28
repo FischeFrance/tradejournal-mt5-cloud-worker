@@ -245,10 +245,11 @@ ogni `terminal64.exe`; un processo elevato preesistente non viene mai adottato.
 
 ## Prova ad hoc su un solo account
 
-La prova ad hoc è distinta dalla manutenzione notturna e può essere avviata in qualunque momento.
-Richiede una release immutabile già prodotta con `-PrepareOnly`, ferma temporaneamente soltanto il
-servizio Agent per evitare concorrenza tra processi e lascia accesi tutti i terminali diversi dal
-canary richiesto:
+La prova ad hoc è distinta dalla manutenzione notturna e può essere avviata soltanto fuori dalla
+finestra configurata della manutenzione. Con i valori di produzione viene rifiutata dalle 23:30
+alle 01:30 `Europe/Rome`, estremi inclusi. Richiede una release immutabile già prodotta con
+`-PrepareOnly`, ferma temporaneamente soltanto il servizio Agent per evitare concorrenza tra
+processi e lascia accesi tutti i terminali diversi dal canary richiesto:
 
 ```powershell
 $releasePath = 'C:\TradeJournal\releases\agent-' + $revision.Substring(0, 12)
@@ -262,9 +263,10 @@ powershell -ExecutionPolicy Bypass `
   -DeploymentPython $pythonExe
 ```
 
-Il launcher rifiuta l'esecuzione se un deploy completo è già in esecuzione, se l'Agent sta
-elaborando un job o se UUID, server, release, identità interattiva e numero di terminali non
-corrispondono.
+Il launcher rifiuta l'esecuzione se si trova nella finestra notturna, se un deploy completo è già in
+esecuzione, se l'Agent sta elaborando un job o se UUID, server, release, identità interattiva e
+numero di terminali non corrispondono. Il controllo temporale viene ripetuto immediatamente prima
+dello stop dell'Agent e dall'helper `LocalSystem` prima del probe.
 Durante questa prima fase il launcher e l'helper SYSTEM hanno una doppia allowlist compilata nel
 codice: accettano esclusivamente l'UUID `2f1647b4-035e-41be-b634-0cf785a70b07` sul server esatto
 `FPMTrading-Live`. Il primo collaudo richiede inoltre la release legacy verificata attualmente
@@ -273,9 +275,13 @@ con una cascata nella finestra notturna. Un task completo semplicemente pianific
 prova; mutex e gate reciproci impediscono invece la sovrapposizione quando un deploy o un altro
 helper è realmente in esecuzione.
 
-Il probe viene eseguito come `LocalSystem`, riavvia esclusivamente l'account indicato in
-`new_only`, richiede login, heartbeat e accesso investor-only e confronta PID e creation time di
-tutti gli altri terminali prima e dopo. Il servizio Agent viene riavviato soltanto dopo un risultato
+Il probe viene eseguito come `LocalSystem` e scarica sempre una copia nuova dell'installer stabile
+ufficiale MetaQuotes. Verifica Authenticode, materializza la distribuzione in una directory isolata,
+legge la build PE e inventaria in sola lettura tutte le istanze. Durante il collaudo soltanto
+l'account FPM allowlisted può essere riavviato e solo se la sua build è `older`; `ahead`,
+`same_build_divergent` e `unverifiable` bloccano qualsiasi mutazione. Il riavvio usa `new_only`,
+richiede login, heartbeat e accesso investor-only e confronta PID e creation time di tutti gli
+altri terminali prima e dopo. Il servizio Agent viene riavviato soltanto dopo un risultato
 SYSTEM valido e completo, quindi deve rimanere stabile per almeno dieci secondi; quando la release
 attiva supporta il protocollo corrente viene richiesta anche la readiness legata al PID. Se
 l'helper parte ma fallisce, resta in esecuzione o non pubblica un risultato attendibile, il servizio
@@ -285,25 +291,30 @@ durante una LiveUpdate incerta. Non avviare un deploy: ispezionare prima il task
 `TradeJournal-MT5-AdHoc-*`, il result JSON e il log indicati dal launcher, quindi ripristinare
 `Automatic` e avviare il servizio soltanto dopo aver escluso processi di update ancora attivi.
 
-Un LiveUpdate valido viene conservato soltanto come receipt nel deposito pending. Questa modalità
-non chiama la promozione del golden, non apre o ricostruisce il pool, non ruota la flotta e non
-scrive lo stato dello scheduler. La successiva manutenzione completa delle 23:30 rimane l'unico
-percorso che può validare il candidato, pubblicare il template e aggiornare tutti gli account a
-cascata.
+L'eventuale LiveUpdate valido resta conservato come receipt nel deposito pending, ma non è la prova
+che il terminale fosse già allineato all'ultima release pubblica. Questa modalità non promuove il
+golden, non apre o ricostruisce il pool, non ruota la flotta e non scrive lo stato dello scheduler.
+La successiva manutenzione completa delle 23:30 rimane l'unico percorso che può pubblicare il
+template e aggiornare pool e account a cascata.
 
 ## Manutenzione MT5
 
-La manutenzione non aggiorna MT5 ogni sera: alle 23:30 verifica se esiste una release vendor nuova
-e usa una connessione già autenticata per ogni server broker. Durante una nuova connessione o un
-recovery diurno, il LiveUpdate firmato può completarsi esclusivamente dentro la directory isolata
-di quell'istanza; l'Agent ne salva la ricevuta nel deposito protetto, ma non modifica golden, pool
-o altri account. Nella finestra notturna la release viene prima applicata a un candidato non
-pubblicato e verificata su un canary per ogni server; solo dopo login, heartbeat e verifica
-investor-only di tutti i canary il servizio pubblica atomicamente il template, ricostruisce in
-modo sincrono tutti gli slot READY del pool e migra le istanze una alla volta. Se una verifica
-fallisce prima della pubblicazione, golden e pool restano sulla release precedente; dopo la
-barriera il recupero è esclusivamente in avanti e il servizio resta bloccato finché la convergenza
-non è attestata.
+Ogni sera alle 23:30 la manutenzione scarica nuovamente l'installer stabile ufficiale MetaQuotes,
+ne verifica firma, build e distribuzione isolata e confronta quella build con golden, pool e tutte
+le connessioni provisioned. Non presume che l'assenza di un'offerta LiveUpdate significhi
+"aggiornato". Se la build pubblica è più nuova del golden, costruisce un candidato non pubblicato
+con i tre asset TradeJournal già fissati e lo verifica su una connessione autenticata per ogni
+server broker. Solo dopo login, heartbeat e verifica investor-only di tutti i canary pubblica
+atomicamente il template, ricostruisce in modo sincrono gli slot READY del pool e migra, una alla
+volta, esclusivamente le istanze `older`. Una build `ahead` non viene mai retrocessa; una release
+`same_build_divergent` non viene sostituita in base al solo numero; uno stato `unverifiable` blocca
+il pass prima delle mutazioni. Se una verifica fallisce prima della pubblicazione, golden e pool
+restano sulla release precedente; dopo la barriera il recupero è esclusivamente in avanti.
+
+Durante una nuova connessione o un recovery diurno, il LiveUpdate firmato può ancora completarsi
+esclusivamente dentro la directory isolata di quell'istanza. L'Agent ne salva la ricevuta nel
+deposito protetto per sopprimere popup/UAC e conservare evidenza, ma nel flusso con baseline
+pubblica non usa quel delta broker come autorità per una cascata.
 
 Ogni riavvio usa `history_mode=new_only`. Prima dello stop viene però salvato l'ultimo heartbeat e,
 al riavvio, il bridge rilegge soltanto il piccolo intervallo scoperto (un minuto di sovrapposizione,

@@ -329,7 +329,7 @@ def test_convergence_evidence_precedes_service_start_and_has_full_window_timeout
     assert catch_gate < recovery_start
 
 
-def test_ad_hoc_canary_wrapper_is_single_account_and_not_time_gated() -> None:
+def test_ad_hoc_canary_wrapper_is_single_account_and_time_gated() -> None:
     script = (
         REPOSITORY_ROOT
         / "scripts"
@@ -361,16 +361,25 @@ def test_ad_hoc_canary_wrapper_is_single_account_and_not_time_gated() -> None:
         "Set-Service -Name $serviceName -StartupType Manual",
         "Set-Service -Name $serviceName -StartupType Automatic",
         "temporary FPM canary requires the approved legacy Agent release",
+        "Assert-OutsideScheduledMaintenanceWindow",
+        "TRADEJOURNAL_MT5_MAINTENANCE_LOCAL_TIME",
+        "TRADEJOURNAL_MT5_MAINTENANCE_TIMEZONE",
+        "TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES",
+        "23:30",
+        "Europe/Rome",
     ):
         assert required in script
     for forbidden in (
-        "23:30",
-        "Europe/Rome",
         "Invoke-DeployGuard -Action converge",
         "rotate_all",
         "accept_template_rotation",
     ):
         assert forbidden not in script
+    gate_call = "Assert-OutsideScheduledMaintenanceWindow -PythonExe $pythonExe"
+    assert script.count(gate_call) == 2
+    stop = script.index("Stop-Service -Name $serviceName")
+    final_gate = script.rindex(gate_call, 0, stop)
+    assert final_gate > script.index("$taskCreated = $true")
 
 
 def test_windows_release_preflight_runs_ad_hoc_probe_tests() -> None:
@@ -379,6 +388,7 @@ def test_windows_release_preflight_runs_ad_hoc_probe_tests() -> None:
     ).read_text(encoding="utf-8")
 
     assert "tests\\windows\\test_mt5_adhoc_probe.py" in script
+    assert "tests\\windows\\test_mt5_public_release.py" in script
     assert "Get-ScheduledTask -ErrorAction Stop" in script
     assert "TradeJournal-MT5-AdHoc-*" in script
     assert "TradeJournal-DeployGuard-*" in script

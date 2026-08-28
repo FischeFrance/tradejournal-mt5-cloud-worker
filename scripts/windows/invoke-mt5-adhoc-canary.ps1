@@ -33,6 +33,9 @@ $logRoot = 'C:\TradeJournal\logs'
 $defaultInstancesRoot = 'C:\TradeJournal\instances'
 $defaultSecretsRoot = 'C:\TradeJournal\secrets'
 $defaultMaintenanceStatePath = 'C:\TradeJournal\state\mt5-maintenance.json'
+$defaultMaintenanceLocalTime = '23:30'
+$defaultMaintenanceTimezone = 'Europe/Rome'
+$defaultMaintenanceGraceMinutes = 120
 $readinessPath = 'C:\TradeJournal\state\agent-readiness.json'
 $releaseRoot = 'C:\TradeJournal\releases'
 $fpmTestConnectionId = '2f1647b4-035e-41be-b634-0cf785a70b07'
@@ -174,6 +177,66 @@ function Resolve-EffectiveMaintenanceStatePath {
   }
   $fullPath = [IO.Path]::GetFullPath($configured)
   return $fullPath
+}
+
+function Assert-OutsideScheduledMaintenanceWindow {
+  param([Parameter(Mandatory = $true)][string]$PythonExe)
+
+  $scheduledTime = Get-EffectiveServiceSetting `
+    -Name 'TRADEJOURNAL_MT5_MAINTENANCE_LOCAL_TIME'
+  if ([string]::IsNullOrWhiteSpace($scheduledTime)) {
+    $scheduledTime = $defaultMaintenanceLocalTime
+  }
+  $scheduledTime = $scheduledTime.Trim()
+  if ($scheduledTime -notmatch '^(?:[01][0-9]|2[0-3]):[0-5][0-9]$') {
+    throw 'The effective MT5 maintenance time is invalid.'
+  }
+
+  $timezoneName = Get-EffectiveServiceSetting `
+    -Name 'TRADEJOURNAL_MT5_MAINTENANCE_TIMEZONE'
+  if ([string]::IsNullOrWhiteSpace($timezoneName)) {
+    $timezoneName = $defaultMaintenanceTimezone
+  }
+  $timezoneName = $timezoneName.Trim()
+  if ($timezoneName -notmatch '^[A-Za-z0-9._+/-]{1,128}$') {
+    throw 'The effective MT5 maintenance timezone is invalid.'
+  }
+
+  $graceText = Get-EffectiveServiceSetting `
+    -Name 'TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES'
+  if ([string]::IsNullOrWhiteSpace($graceText)) {
+    $graceText = [string]$defaultMaintenanceGraceMinutes
+  }
+  $graceText = $graceText.Trim()
+  if ($graceText -notmatch '^[0-9]{1,4}$') {
+    throw 'The effective MT5 maintenance grace window is invalid.'
+  }
+  $graceMinutes = [int]$graceText
+  if ($graceMinutes -lt 5 -or $graceMinutes -gt (12 * 60)) {
+    throw 'The effective MT5 maintenance grace window is invalid.'
+  }
+
+  $gateCode = (
+    'import sys;from datetime import datetime,time,timedelta,timezone;' +
+    'from zoneinfo import ZoneInfo;' +
+    'hour,minute=(int(v) for v in sys.argv[1].split('':''));' +
+    'zone=ZoneInfo(sys.argv[2]);slot=time(hour,minute);' +
+    'now=datetime.now(timezone.utc).astimezone(zone);' +
+    'start=datetime.combine(now.date(),slot,tzinfo=zone);' +
+    'start=datetime.combine(now.date()-timedelta(days=1),slot,tzinfo=zone)' +
+    ' if now<start else start;' +
+    'end=start+timedelta(minutes=int(sys.argv[3]));' +
+    'sys.exit(23 if start<=now<=end else 0)'
+  )
+  & $PythonExe -I -B -c $gateCode `
+    $scheduledTime $timezoneName ([string]$graceMinutes)
+  $gateExitCode = $LASTEXITCODE
+  if ($gateExitCode -eq 23) {
+    throw 'The ad-hoc MT5 probe is not allowed during scheduled maintenance.'
+  }
+  if ($gateExitCode -ne 0) {
+    throw 'The effective MT5 maintenance window could not be evaluated.'
+  }
 }
 
 function Get-ActiveReleaseIdentity {
@@ -463,6 +526,7 @@ try {
     throw 'The immutable Agent release verification failed.'
   }
 
+  Assert-OutsideScheduledMaintenanceWindow -PythonExe $pythonExe
   $instancesRoot = Resolve-EffectiveInstancesRoot
   $secretsRoot = Resolve-EffectiveSecretsRoot
   $maintenanceStatePath = Resolve-EffectiveMaintenanceStatePath
@@ -613,6 +677,7 @@ try {
     -Settings $settings | Out-Null
   $taskCreated = $true
 
+  Assert-OutsideScheduledMaintenanceWindow -PythonExe $pythonExe
   Assert-NoActiveAgentWork
   $serviceWasStopped = $true
   if ($originalServiceStartMode -eq 'Auto') {
@@ -716,7 +781,10 @@ try {
   }
   $expectedDetailFields = @(
     'connection_id', 'server', 'update_captured',
-    'pending_update_receipt_ids'
+    'pending_update_receipt_ids', 'public_build',
+    'observed_build_before', 'observed_build_after',
+    'classification_before', 'classification_after', 'updated',
+    'inventory_counts'
   )
   $actualDetailFields = @($resultDocument.details.PSObject.Properties.Name)
   $receiptIds = @($resultDocument.details.pending_update_receipt_ids)
@@ -725,6 +793,31 @@ try {
       $_ -isnot [string] -or $_ -notmatch '^[0-9a-f]{64}$'
     }
   )
+  $classificationNames = @(
+    'older', 'current', 'ahead', 'same_build_divergent', 'unverifiable'
+  )
+  $inventoryFields = @(
+    $resultDocument.details.inventory_counts.PSObject.Properties.Name
+  )
+  $inventoryTotal = 0
+  $inventoryInvalid = $false
+  foreach ($name in $classificationNames) {
+    $value = $resultDocument.details.inventory_counts.$name
+    if (
+      ($value -isnot [int] -and $value -isnot [int64]) -or
+      [int64]$value -lt 0
+    ) {
+      $inventoryInvalid = $true
+    } else {
+      $inventoryTotal += [int64]$value
+    }
+  }
+  $publicBuild = $resultDocument.details.public_build
+  $observedBuildBefore = $resultDocument.details.observed_build_before
+  $observedBuildAfter = $resultDocument.details.observed_build_after
+  $classificationBefore = [string]$resultDocument.details.classification_before
+  $classificationAfter = [string]$resultDocument.details.classification_after
+  $updated = $resultDocument.details.updated
   if (
     [string]$resultDocument.code -ne 'ok' -or
     $actualDetailFields.Count -ne $expectedDetailFields.Count -or
@@ -734,7 +827,35 @@ try {
     $resultDocument.details.update_captured -isnot [bool] -or
     $invalidReceiptIds.Count -ne 0 -or
     @($receiptIds | Select-Object -Unique).Count -ne $receiptIds.Count -or
-    [bool]$resultDocument.details.update_captured -ne ($receiptIds.Count -gt 0)
+    [bool]$resultDocument.details.update_captured -ne ($receiptIds.Count -gt 0) -or
+    ($publicBuild -isnot [int] -and $publicBuild -isnot [int64]) -or
+    [int64]$publicBuild -le 0 -or
+    [int64]$publicBuild -gt 65535 -or
+    ($observedBuildBefore -isnot [int] -and $observedBuildBefore -isnot [int64]) -or
+    [int64]$observedBuildBefore -le 0 -or
+    ($observedBuildAfter -isnot [int] -and $observedBuildAfter -isnot [int64]) -or
+    [int64]$observedBuildAfter -le 0 -or
+    $updated -isnot [bool] -or
+    $classificationBefore -notin @('older', 'current') -or
+    $classificationAfter -ne 'current' -or
+    $inventoryFields.Count -ne $classificationNames.Count -or
+    @(Compare-Object $classificationNames $inventoryFields).Count -ne 0 -or
+    $inventoryInvalid -or
+    $inventoryTotal -ne $ExpectedTerminalCount -or
+    (
+      [bool]$updated -and (
+        $classificationBefore -ne 'older' -or
+        [int64]$observedBuildBefore -ge [int64]$publicBuild -or
+        [int64]$observedBuildAfter -ne [int64]$publicBuild
+      )
+    ) -or
+    (
+      -not [bool]$updated -and (
+        $classificationBefore -ne 'current' -or
+        [int64]$observedBuildBefore -ne [int64]$publicBuild -or
+        [int64]$observedBuildAfter -ne [int64]$publicBuild
+      )
+    )
   ) {
     throw 'The isolated MT5 helper details are invalid.'
   }
@@ -867,6 +988,13 @@ if (-not $probeSucceeded -or $null -eq $after -or $null -eq $serviceStateAfter) 
   connection_id = $connectionId
   expected_server = $ExpectedServer
   update_captured = [bool]$resultDocument.details.update_captured
+  updated = [bool]$resultDocument.details.updated
+  public_build = [int64]$resultDocument.details.public_build
+  observed_build_before = [int64]$resultDocument.details.observed_build_before
+  observed_build_after = [int64]$resultDocument.details.observed_build_after
+  classification_before = [string]$resultDocument.details.classification_before
+  classification_after = [string]$resultDocument.details.classification_after
+  inventory_counts = $resultDocument.details.inventory_counts
   pending_update_receipt_ids = @(
     $resultDocument.details.pending_update_receipt_ids
   )

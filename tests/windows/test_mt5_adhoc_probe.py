@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, time, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -11,13 +12,17 @@ from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.state_store import read_json
 
 
-def test_run_probe_targets_exact_connection_without_a_time_window(
+def test_run_probe_targets_exact_connection_outside_maintenance_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection_id = probe.FPM_TEST_CONNECTION_ID
     nonce = str(uuid4())
     calls: list[object] = []
-    config = object()
+    config = SimpleNamespace(
+        mt5_maintenance_local_time=time(23, 30),
+        mt5_maintenance_timezone="Europe/Rome",
+        mt5_maintenance_grace_minutes=120,
+    )
 
     monkeypatch.setattr(
         probe,
@@ -35,15 +40,33 @@ def test_run_probe_targets_exact_connection_without_a_time_window(
         lambda revision: calls.append(("release", revision)),
     )
     monkeypatch.setattr(probe, "_load_service_config", lambda: config)
+    monkeypatch.setattr(
+        probe,
+        "_assert_outside_maintenance_window",
+        lambda observed: calls.append(("time_gate", observed)),
+    )
 
     class Coordinator:
-        def run_canary_only(self, cid, server, stop_event):
+        def run_public_canary_only(self, cid, server, stop_event):
             calls.append((cid, server, stop_event.is_set()))
             return SimpleNamespace(
                 connection_id=cid,
                 server="FPMTrading-Live",
                 update_captured=True,
                 pending_update_receipt_ids=("a" * 64,),
+                public_build=6140,
+                observed_build_before=6090,
+                observed_build_after=6140,
+                classification_before="older",
+                classification_after="current",
+                updated=True,
+                inventory_counts=(
+                    ("older", 4),
+                    ("current", 0),
+                    ("ahead", 0),
+                    ("same_build_divergent", 0),
+                    ("unverifiable", 0),
+                ),
             )
 
     monkeypatch.setattr(
@@ -65,6 +88,7 @@ def test_run_probe_targets_exact_connection_without_a_time_window(
         "local_system",
         "service_stopped",
         ("release", "b" * 40),
+        ("time_gate", config),
         (connection_id, "FPMTrading-Live", False),
     ]
     assert result == {
@@ -72,7 +96,70 @@ def test_run_probe_targets_exact_connection_without_a_time_window(
         "server": "FPMTrading-Live",
         "update_captured": True,
         "pending_update_receipt_ids": ["a" * 64],
+        "public_build": 6140,
+        "observed_build_before": 6090,
+        "observed_build_after": 6140,
+        "classification_before": "older",
+        "classification_after": "current",
+        "updated": True,
+        "inventory_counts": {
+            "older": 4,
+            "current": 0,
+            "ahead": 0,
+            "same_build_divergent": 0,
+            "unverifiable": 0,
+        },
     }
+
+
+@pytest.mark.parametrize(
+    ("observed", "blocked"),
+    [
+        (datetime(2026, 8, 28, 21, 29, 59, tzinfo=timezone.utc), False),
+        (datetime(2026, 8, 28, 21, 30, 0, tzinfo=timezone.utc), True),
+        (datetime(2026, 8, 28, 22, 45, 0, tzinfo=timezone.utc), True),
+        (datetime(2026, 8, 28, 23, 30, 0, tzinfo=timezone.utc), True),
+        (datetime(2026, 8, 28, 23, 30, 0, 1, tzinfo=timezone.utc), False),
+    ],
+)
+def test_ad_hoc_maintenance_window_uses_configured_rome_time(
+    observed: datetime,
+    blocked: bool,
+) -> None:
+    config = SimpleNamespace(
+        mt5_maintenance_local_time=time(23, 30),
+        mt5_maintenance_timezone="Europe/Rome",
+        mt5_maintenance_grace_minutes=120,
+    )
+
+    if blocked:
+        with pytest.raises(probe.Mt5AdHocProbeError) as raised:
+            probe._assert_outside_maintenance_window(
+                config,
+                clock=lambda: observed,
+            )
+        assert raised.value.code == "maintenance_window_active"
+    else:
+        probe._assert_outside_maintenance_window(
+            config,
+            clock=lambda: observed,
+        )
+
+
+def test_ad_hoc_maintenance_window_fails_closed_on_invalid_clock() -> None:
+    config = SimpleNamespace(
+        mt5_maintenance_local_time=time(23, 30),
+        mt5_maintenance_timezone="Europe/Rome",
+        mt5_maintenance_grace_minutes=120,
+    )
+
+    with pytest.raises(probe.Mt5AdHocProbeError) as raised:
+        probe._assert_outside_maintenance_window(
+            config,
+            clock=lambda: datetime(2026, 8, 28, 21, 0),
+        )
+
+    assert raised.value.code == "maintenance_window_invalid"
 
 
 @pytest.mark.parametrize(
@@ -271,7 +358,6 @@ def test_ad_hoc_entrypoint_has_no_cascade_or_scheduler_path() -> None:
     source = Path(probe.__file__).read_text(encoding="utf-8")
 
     for forbidden in (
-        "_maintenance_window",
         ".run_once(",
         "rotate_all(",
         "Mt5InstancePool",
@@ -279,3 +365,4 @@ def test_ad_hoc_entrypoint_has_no_cascade_or_scheduler_path() -> None:
         "accept_template_rotation",
     ):
         assert forbidden not in source
+    assert "_assert_outside_maintenance_window(config)" in source

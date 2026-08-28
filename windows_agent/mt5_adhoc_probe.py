@@ -15,7 +15,10 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
+from zoneinfo import ZoneInfo
 
 from .deploy_guard import (
     RELEASE_ROOT,
@@ -29,6 +32,10 @@ from .interactive_identity import verify_interactive_task_identity
 from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .mt5_maintenance import Mt5MaintenanceCoordinator
 from .provisioning.mt5_instance_rotation import Mt5InstanceRotator
+from .provisioning.mt5_public_release import (
+    Mt5ProvisionedReleaseInventory,
+    Mt5PublicReleaseProbe,
+)
 from .provisioning.mt5_template import Mt5TemplateManager
 from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .provisioning.secret_store import WindowsSecretStore
@@ -95,6 +102,47 @@ def _assert_service_stopped() -> None:
         raise Mt5AdHocProbeError("agent_service_must_be_stopped")
 
 
+def _assert_outside_maintenance_window(
+    config: AgentRuntimeConfig,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    """Reject an ad-hoc start during the configured nightly maintenance slot."""
+
+    try:
+        observed = (clock or (lambda: datetime.now(timezone.utc)))()
+        scheduled_time = config.mt5_maintenance_local_time
+        timezone_name = config.mt5_maintenance_timezone
+        grace_minutes = config.mt5_maintenance_grace_minutes
+        if (
+            not isinstance(observed, datetime)
+            or observed.tzinfo is None
+            or not isinstance(timezone_name, str)
+            or not timezone_name.strip()
+            or scheduled_time.tzinfo is not None
+            or type(grace_minutes) is not int
+            or not 5 <= grace_minutes <= 12 * 60
+        ):
+            raise ValueError("invalid maintenance window")
+        local_timezone = ZoneInfo(timezone_name.strip())
+        local_now = observed.astimezone(local_timezone)
+        scheduled = datetime.combine(
+            local_now.date(),
+            scheduled_time,
+            tzinfo=local_timezone,
+        )
+        if local_now < scheduled:
+            scheduled = datetime.combine(
+                local_now.date() - timedelta(days=1),
+                scheduled_time,
+                tzinfo=local_timezone,
+            )
+    except Exception as exc:
+        raise Mt5AdHocProbeError("maintenance_window_invalid") from exc
+    if scheduled <= local_now <= scheduled + timedelta(minutes=grace_minutes):
+        raise Mt5AdHocProbeError("maintenance_window_active")
+
+
 def _build_coordinator(config: AgentRuntimeConfig) -> Mt5MaintenanceCoordinator:
     lock = threading.RLock()
     lifecycle = Mt5LifecycleCoordinator()
@@ -110,6 +158,12 @@ def _build_coordinator(config: AgentRuntimeConfig) -> Mt5MaintenanceCoordinator:
         raise Mt5AdHocProbeError("mt5_adhoc_preflight_failed") from exc
     pending = Mt5PendingUpdateStore(
         config.mt5_maintenance_state_path.parent / "mt5-update-pending"
+    )
+    public_probe = Mt5PublicReleaseProbe(
+        config.mt5_maintenance_state_path.parent / "mt5-public-releases"
+    )
+    public_inventory = Mt5ProvisionedReleaseInventory(
+        config.instances_root
     )
     rotator = Mt5InstanceRotator(
         instances_root=config.instances_root,
@@ -129,6 +183,8 @@ def _build_coordinator(config: AgentRuntimeConfig) -> Mt5MaintenanceCoordinator:
         template_lock=lock,
         instance_pool=None,
         pending_update_store=pending,
+        public_release_probe=public_probe,
+        public_release_inventory=public_inventory,
     )
 
 
@@ -185,8 +241,10 @@ def run_probe(
     ):
         raise Mt5AdHocProbeError("canary_scope_restricted")
 
-    coordinator = _build_coordinator(_load_service_config())
-    report = coordinator.run_canary_only(
+    config = _load_service_config()
+    _assert_outside_maintenance_window(config)
+    coordinator = _build_coordinator(config)
+    report = coordinator.run_public_canary_only(
         connection_id,
         expected_server,
         threading.Event(),
@@ -198,6 +256,15 @@ def run_probe(
         "pending_update_receipt_ids": list(
             report.pending_update_receipt_ids
         ),
+        "public_build": report.public_build,
+        "observed_build_before": report.observed_build_before,
+        "observed_build_after": report.observed_build_after,
+        "classification_before": report.classification_before,
+        "classification_after": report.classification_after,
+        "updated": report.updated,
+        "inventory_counts": {
+            name: count for name, count in report.inventory_counts
+        },
     }
 
 

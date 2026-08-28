@@ -42,6 +42,10 @@ from .provisioning.mt5_instance_rotation import (
     Mt5InstanceRotator,
     Mt5TemplateRelease,
 )
+from .provisioning.mt5_public_release import (
+    Mt5ProvisionedReleaseInventory,
+    Mt5PublicReleaseProbe,
+)
 from .provisioning.mt5_template import Mt5TemplateManager
 from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .provisioning.secret_store import WindowsSecretStore
@@ -1373,6 +1377,9 @@ def _build_activation_coordinator(
             template_lock=template_lock,
         )
         pool.recover_incomplete()
+    public_release_probe = Mt5PublicReleaseProbe(
+        config.mt5_maintenance_state_path.parent / "mt5-public-releases"
+    )
     return (
         Mt5MaintenanceCoordinator(
             instances_root=config.instances_root,
@@ -1383,6 +1390,10 @@ def _build_activation_coordinator(
             template_lock=template_lock,
             instance_pool=pool,
             pending_update_store=pending,
+            public_release_probe=public_release_probe,
+            public_release_inventory=(
+                Mt5ProvisionedReleaseInventory(config.instances_root)
+            ),
         ),
         pool,
     )
