@@ -504,6 +504,13 @@ def test_inventory_accepts_only_exact_signed_public_auxiliary_partial(
         ),
         encoding="utf-8",
     )
+    # A later bridge deployment may legitimately make the current golden's
+    # managed assets differ from this older instance.  The instance's own
+    # recorded managed-assets digest remains the authority for those files.
+    (
+        trusted
+        / "MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"
+    ).write_bytes(b"current-bridge")
     inventory = Mt5ProvisionedReleaseInventory(
         instances,
         build_reader=_build_reader,

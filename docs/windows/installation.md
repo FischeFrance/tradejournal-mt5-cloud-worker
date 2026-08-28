@@ -299,8 +299,9 @@ template e aggiornare pool e account a cascata.
 
 MetaQuotes può lasciare temporaneamente una distribuzione divisa, con `terminal64.exe` sulla build
 precedente ma `metaeditor64.exe` e `metatester64.exe` già sulla build pubblica corrente. Il probe
-accetta questo caso soltanto se il terminale, gli asset TradeJournal e tutto il resto del manifest
-corrispondono ancora al template fidato, se le sole differenze sono quei due file nella root e se
+accetta questo caso soltanto se il terminale e tutti gli altri file vendor corrispondono ancora al
+template fidato, se gli asset TradeJournal corrispondono al pin registrato per quella istanza, se
+le sole differenze vendor sono quei due file nella root e se
 entrambi sono byte per byte uguali alla distribuzione appena scaricata, firmati da MetaQuotes e con
 la stessa build pubblica. Prima della rotazione lo stato viene risigillato sui digest verificati;
 qualsiasi altra differenza resta `unverifiable` e blocca il pass.

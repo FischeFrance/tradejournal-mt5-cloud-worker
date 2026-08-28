@@ -76,6 +76,13 @@ _RECOVERABLE_PARTIAL_UPDATE_PATHS = frozenset(
         "metatester64.exe",
     }
 )
+_MANAGED_RUNTIME_PATHS = frozenset(
+    {
+        "MQL5/Experts/TradeJournal/TradeJournalBridge.ex5",
+        "MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5",
+        "MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5",
+    }
+)
 
 
 class Mt5PublicReleaseError(RuntimeError):
@@ -1171,7 +1178,7 @@ class Mt5ProvisionedReleaseInventory:
                 ".ex5",
             }:
                 continue
-            relative = path.relative_to(root).as_posix().casefold()
+            relative = path.relative_to(root).as_posix()
             files[relative] = _sha256(path)
         return files
 
@@ -1207,9 +1214,6 @@ class Mt5ProvisionedReleaseInventory:
                 InstanceProvisioner._is_reparse_point(trusted)
                 or not trusted.is_dir()
                 or _sha256(trusted / "terminal64.exe") != recorded_terminal
-                or InstanceProvisioner._code_manifest(trusted) != recorded_code
-                or InstanceProvisioner._managed_runtime_assets_manifest(trusted)
-                != recorded_assets
             ):
                 return None
             trusted_files = self._code_files(trusted)
@@ -1217,18 +1221,30 @@ class Mt5ProvisionedReleaseInventory:
             changed = {
                 relative
                 for relative in trusted_files.keys() | actual_files.keys()
+                if relative not in _MANAGED_RUNTIME_PATHS
                 if trusted_files.get(relative) != actual_files.get(relative)
             }
             if not changed or not changed <= _RECOVERABLE_PARTIAL_UPDATE_PATHS:
+                return None
+            reconstructed = dict(actual_files)
+            for relative in changed:
+                if relative not in trusted_files or relative not in actual_files:
+                    return None
+                reconstructed[relative] = trusted_files[relative]
+            reconstructed_manifest = hashlib.sha256(
+                "\n".join(
+                    f"{relative}:{digest}"
+                    for relative, digest in sorted(reconstructed.items())
+                ).encode("utf-8")
+            ).hexdigest()
+            if reconstructed_manifest != recorded_code:
                 return None
             subjects: set[str] = set()
             for relative in changed:
                 actual = terminal_root / Path(relative)
                 public = baseline.terminal_root / Path(relative)
                 if (
-                    relative not in trusted_files
-                    or relative not in actual_files
-                    or not public.is_file()
+                    not public.is_file()
                     or InstanceProvisioner._is_reparse_point(public)
                     or actual_files[relative] != _sha256(public)
                     or _validate_positive_build(self.build_reader(actual))
