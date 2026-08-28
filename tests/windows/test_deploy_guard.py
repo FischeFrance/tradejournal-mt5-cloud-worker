@@ -622,6 +622,8 @@ def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
                 "started_at_unix_ms": 1,
                 "finished_at_unix_ms": None,
                 "attempts": 1,
+                "failure_code": None,
+                "failure_detail": None,
             },
         ),
     )
@@ -687,6 +689,8 @@ def test_converge_explicitly_probes_requested_fpm_when_same_server_selected_othe
                 "started_at_unix_ms": 1,
                 "finished_at_unix_ms": None,
                 "attempts": 1,
+                "failure_code": None,
+                "failure_detail": None,
             },
         ),
     )

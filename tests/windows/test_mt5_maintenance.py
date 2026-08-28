@@ -927,6 +927,38 @@ def test_nightly_public_baseline_promotes_pool_then_only_older_instances(
     assert report.release_changed is True
 
 
+def test_public_promotion_reuses_exact_current_canary_without_downgrade(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("Broker-A", "FPMTrading-Live"),
+    )
+    rotator.current.add(ids[1])
+    public = _public_release(manager)
+    runtime = RuntimeController()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        FakePool(),
+        None,
+        FakePublicProbe(public),
+        FakePublicInventory(instances, rotator),
+    )
+
+    report = coordinator.run_once(Event())
+
+    assert report.release_changed is True
+    assert set(report.checked_connections) == set(ids)
+    assert (ids[1], True) not in rotator.rotate_one_calls
+    assert (instances / ids[1], ids[1]) in runtime.factory_calls
+    assert ids[1] in rotator.current
+
+
 def test_new_release_is_verified_then_rebuilds_pool_and_rotates_fleet(
     tmp_path: Path,
 ) -> None:

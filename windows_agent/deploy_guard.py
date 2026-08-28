@@ -35,7 +35,7 @@ from .interactive_identity import (
     verify_interactive_task_identity,
 )
 from .mt5_lifecycle import Mt5LifecycleCoordinator
-from .mt5_maintenance import Mt5MaintenanceCoordinator
+from .mt5_maintenance import Mt5MaintenanceCoordinator, Mt5MaintenanceError
 from .provisioning.mt5_instance_pool import Mt5InstancePool
 from .provisioning.mt5_instance import InstanceProvisioner
 from .provisioning.mt5_instance_rotation import (
@@ -817,6 +817,8 @@ _CONVERGE_ATTEMPT_FIELDS = frozenset(
         "started_at_unix_ms",
         "finished_at_unix_ms",
         "attempts",
+        "failure_code",
+        "failure_detail",
     }
 )
 
@@ -1544,6 +1546,8 @@ def _convergence_attempt(
         "started_at_unix_ms": int(time.time() * 1000),
         "finished_at_unix_ms": None,
         "attempts": 1,
+        "failure_code": None,
+        "failure_detail": None,
     }
     if path.exists():
         previous = _read_json_exact(
@@ -1567,6 +1571,8 @@ def _convergence_attempt(
             "status": "running",
             "finished_at_unix_ms": None,
             "attempts": attempts + 1,
+            "failure_code": None,
+            "failure_detail": None,
         }
         _write_system_record(path, record)
         return path, record
@@ -1602,7 +1608,7 @@ def _fleet_postconditions(
                 continue
             _validate_instance_release(child, target)
             fleet_count += 1
-    except DeployGuardError:
+    except DeployGuardError as exc:
         raise
     except (OSError, ValueError) as exc:
         raise DeployGuardError("fleet_state_invalid") from exc
@@ -1766,6 +1772,8 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
                     **attempt,
                     "status": "failed",
                     "finished_at_unix_ms": int(time.time() * 1000),
+                    "failure_code": exc.code,
+                    "failure_detail": None,
                 },
             )
         except DeployGuardError:
@@ -1776,6 +1784,11 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
             pass
         raise
     except Exception as exc:
+        failure_detail = (
+            str(exc)[:200]
+            if isinstance(exc, Mt5MaintenanceError)
+            else None
+        )
         try:
             _write_system_record(
                 attempt_path,
@@ -1783,6 +1796,8 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
                     **attempt,
                     "status": "failed",
                     "finished_at_unix_ms": int(time.time() * 1000),
+                    "failure_code": "deployment_convergence_failed",
+                    "failure_detail": failure_detail,
                 },
             )
         except DeployGuardError:

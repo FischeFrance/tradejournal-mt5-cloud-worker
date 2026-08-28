@@ -899,6 +899,8 @@ class Mt5MaintenanceCoordinator:
         prepared: PreparedMt5Template,
         canaries: tuple[_Canary, ...],
         stop_event: Event,
+        *,
+        allow_exact_current: bool = False,
     ) -> None:
         if not canaries:
             raise Mt5MaintenanceError(
@@ -914,6 +916,17 @@ class Mt5MaintenanceCoordinator:
         try:
             for canary in canaries:
                 self._require_not_stopped(stop_event)
+                if allow_exact_current and candidate_rotator.matches_target(
+                    canary.connection_id,
+                    candidate_release,
+                ):
+                    # A previous isolated rollout may already have placed this
+                    # broker canary on the exact freshly downloaded public
+                    # candidate. Re-probe login, heartbeat and investor-only
+                    # state in place; never downgrade it to prove the same
+                    # candidate again.
+                    self._probe(canary, stop_event)
+                    continue
                 source_state = read_json(
                     canary.root / "state" / "instance.json",
                     {},
@@ -1000,6 +1013,7 @@ class Mt5MaintenanceCoordinator:
                 prepared,
                 canaries,
                 stop_event,
+                allow_exact_current=True,
             )
             self._require_not_stopped(stop_event)
             with self.template_lock:
@@ -1344,18 +1358,18 @@ class Mt5MaintenanceCoordinator:
                     for canary in canaries
                     if by_connection.get(canary.connection_id) is not None
                     and by_connection[canary.connection_id].classification
-                    == "older"
+                    in {"older", "current"}
                 )
                 if {
                     canary.server.casefold() for canary in public_canaries
                 } != {canary.server.casefold() for canary in canaries}:
                     raise Mt5MaintenanceError(
-                        "MT5 public update lacks an older canary for every broker"
+                        "MT5 public update lacks a verified canary for every broker"
                     )
                 for canary in public_canaries:
-                    self._seal_verified_partial_source(
-                        by_connection[canary.connection_id]
-                    )
+                    record = by_connection[canary.connection_id]
+                    if record.classification == "older":
+                        self._seal_verified_partial_source(record)
                 current, discarded, pool_synchronized = (
                     self._promote_public_baseline(
                         baseline,
