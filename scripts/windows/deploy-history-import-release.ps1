@@ -386,8 +386,8 @@ Assert-CleanSourceCheckout `
   -ExpectedRevision $Revision `
   -PackagePaths $releaseSourcePaths
 
-$tzdataCheck = 'import importlib.metadata,sys; from datetime import datetime; from zoneinfo import ZoneInfo; zone=ZoneInfo("Europe/Rome"); valid=sys.version_info[:2]==(3,12) and sys.maxsize>2**32 and importlib.metadata.version("tzdata")=="2026.3" and datetime(2026,1,15,tzinfo=zone).utcoffset().total_seconds()==3600 and datetime(2026,7,15,tzinfo=zone).utcoffset().total_seconds()==7200; sys.exit(0 if valid else 1)'
-& $pythonExe -I -B -c $tzdataCheck
+$tzdataCheck = 'import importlib.metadata,sys; from datetime import datetime; from zoneinfo import ZoneInfo; zone=ZoneInfo(sys.argv[1]); valid=sys.version_info[:2]==(3,12) and sys.maxsize>2**32 and importlib.metadata.version(sys.argv[2])==sys.argv[3] and datetime(2026,1,15,tzinfo=zone).utcoffset().total_seconds()==3600 and datetime(2026,7,15,tzinfo=zone).utcoffset().total_seconds()==7200; sys.exit(0 if valid else 1)'
+& $pythonExe -I -B -c $tzdataCheck 'Europe/Rome' 'tzdata' '2026.3'
 if ($LASTEXITCODE -ne 0) {
   throw 'Python 3.12 x64 and tzdata==2026.3 with valid Europe/Rome rules are required.'
 }

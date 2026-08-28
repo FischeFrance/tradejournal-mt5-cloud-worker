@@ -245,6 +245,20 @@ def test_deployment_uses_a_system_guard_and_forward_only_barrier() -> None:
     assert 'New-Item -ItemType Junction -Path $currentPath' not in script
 
 
+def test_tzdata_probe_passes_windows_sensitive_values_as_argv() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "ZoneInfo(sys.argv[1])" in script
+    assert "importlib.metadata.version(sys.argv[2])==sys.argv[3]" in script
+    assert (
+        "& $pythonExe -I -B -c $tzdataCheck "
+        "'Europe/Rome' 'tzdata' '2026.3'"
+    ) in script
+    assert 'ZoneInfo("Europe/Rome")' not in script
+
+
 def test_deployment_binds_readiness_and_fpm_health_to_the_release() -> None:
     script = (
         REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
