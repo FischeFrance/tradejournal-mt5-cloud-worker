@@ -1181,6 +1181,58 @@ def test_resume_recovers_applied_orphan_and_required_callback_is_retryable(
     )
 
 
+def test_resume_restarts_once_after_fresh_distribution_generates_examples(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "resume.ini"
+
+    def write_config(*_args: object, **_kwargs: object) -> Path:
+        config.write_text("[Common]\nKeepPrivate=1\n", encoding="utf-8")
+        return config
+
+    status = NativeMt5Status(
+        88,
+        {"trade_allowed": False},
+        {
+            "terminal_connected": True,
+            "account_trade_allowed": False,
+        },
+        runtime.files,
+    )
+    with (
+        patch.object(runtime, "_recover_pending_verified_vendor_updates"),
+        patch.object(runtime, "_bridge_template_symbol", return_value="EURUSD"),
+        patch.object(runtime, "install_expert"),
+        patch.object(runtime, "_remove_readiness_files") as readiness,
+        patch.object(runtime, "_reset_managed_chart_profile") as profile,
+        patch.object(runtime, "_write_startup_config", side_effect=write_config),
+        patch.object(runtime, "_start_and_wait_for_authorization") as start,
+        patch.object(runtime, "_wait_for_heartbeat", return_value=status) as wait,
+        patch.object(
+            runtime,
+            "_generated_example_code_present",
+            return_value=True,
+        ),
+        patch.object(runtime, "_remove_generated_example_code") as remove,
+        patch.object(runtime, "_publish_pending_verified_vendor_updates"),
+        patch.object(runtime, "stop", return_value=True) as stop,
+    ):
+        observed = runtime.resume(
+            login=42,
+            server="Demo",
+            expert_binary=tmp_path / "unused.ex5",
+        )
+
+    assert observed == status
+    assert start.call_count == 2
+    assert wait.call_count == 2
+    assert readiness.call_count == 2
+    assert profile.call_count == 2
+    stop.assert_called_once_with()
+    remove.assert_called_once_with()
+
+
 def test_startup_recovery_accepts_duplicate_identical_applied_receipts(
     tmp_path: Path,
 ) -> None:

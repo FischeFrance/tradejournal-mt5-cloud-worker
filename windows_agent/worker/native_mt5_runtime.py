@@ -1444,6 +1444,12 @@ class NativeMt5Runtime:
             removed.append(relative.as_posix())
         return tuple(removed)
 
+    def _generated_example_code_present(self) -> bool:
+        return any(
+            (self.terminal_root / relative).exists()
+            for relative in MT5_GENERATED_EXAMPLE_DIRS
+        )
+
     def _write_startup_config(
         self,
         login: int | None,
@@ -3292,6 +3298,32 @@ class NativeMt5Runtime:
                 min(timeout, 90.0),
             )
             status = self._wait_for_heartbeat(min(timeout, 60.0), login, server)
+            # A freshly materialized MetaQuotes distribution can recreate its
+            # bundled example EX5 directories during the first authenticated
+            # launch.  Those files are intentionally absent from the sealed
+            # template, so leave the terminal stopped only long enough to
+            # remove the fixed vendor-example paths and perform one clean
+            # restart.  The second launch uses the now-initialized private
+            # profile and must preserve the target code manifest.
+            if self._generated_example_code_present():
+                if not self.stop():
+                    raise NativeMt5Error(
+                        "generated_example_cleanup_stop_failed"
+                    )
+                self._remove_generated_example_code()
+                self._remove_readiness_files()
+                self._reset_managed_chart_profile()
+                self._start_and_wait_for_authorization(
+                    config,
+                    login,
+                    server,
+                    min(timeout, 90.0),
+                )
+                status = self._wait_for_heartbeat(
+                    min(timeout, 60.0),
+                    login,
+                    server,
+                )
             self._publish_pending_verified_vendor_updates()
             return status
         except Exception:
