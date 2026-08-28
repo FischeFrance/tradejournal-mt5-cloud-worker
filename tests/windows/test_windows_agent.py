@@ -214,7 +214,12 @@ def test_fake_provision_deprovision_idempotent(tmp_path, monkeypatch):
     root = provisioner.provision(cid)
     provisioner.deprovision(cid)
     provisioner.deprovision(cid)
-    assert not root.exists()
+    assert root.exists()
+    assert read_json(root / "state" / "instance.json") == {
+        "connection_id": cid,
+        "status": "deprovisioned",
+    }
+    assert not (root / "terminal").exists()
 
 
 def test_research_requires_server_allowlist(tmp_path):

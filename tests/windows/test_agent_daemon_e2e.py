@@ -84,6 +84,10 @@ class FakeProcessManager:
     def cleanup_path(self, executable) -> bool:
         return True
 
+    @staticmethod
+    def find(_executable) -> list[int]:
+        return []
+
 
 class MockControlPlane:
     """Fake trading-agent Edge Function: a fixed queue of jobs for one connection_id, served in
@@ -92,6 +96,7 @@ class MockControlPlane:
     def __init__(self, jobs: list[dict]) -> None:
         self._queue = list(jobs)
         self.transitions: list[tuple[str, str, dict | None]] = []
+        self._history_counts: dict[str, int] = {}
 
     def claim(self) -> dict:
         return self._queue.pop(0) if self._queue else {}
@@ -103,8 +108,67 @@ class MockControlPlane:
         self.transitions.append((job_id, status, result))
         return {"api_version": "1", "status": status}
 
+    @staticmethod
+    def progress(*_args: object, **_kwargs: object) -> dict[str, bool]:
+        return {"event_recorded": True}
 
-def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp_path):
+    def history_file_prepare(
+        self,
+        job_id: str,
+        _lease_id: str,
+        **metadata: object,
+    ) -> dict[str, object]:
+        self._history_counts[job_id] = int(metadata["event_count"])
+        return {
+            "already_imported": False,
+            "upload_url": "https://upload.invalid/history",
+            "accepted": 0,
+            "inserted": 0,
+            "duplicates": 0,
+        }
+
+    @staticmethod
+    def upload_history_file(_url: str, _payload: bytes) -> None:
+        return None
+
+    def history_file_import(
+        self,
+        job_id: str,
+        _lease_id: str,
+        expected_count: int,
+    ) -> dict[str, object]:
+        assert expected_count == self._history_counts[job_id]
+        return {
+            "accepted": expected_count,
+            "inserted": expected_count,
+            "duplicates": 0,
+            "object_deleted": True,
+        }
+
+
+def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_protect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_unprotect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda _path: None),
+    )
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.ProcessManager.find",
+        FakeProcessManager.find,
+    )
     cid = str(uuid4())
     instances_root = tmp_path / "instances"
     secrets_root = tmp_path / "secrets"
@@ -161,6 +225,10 @@ def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp
         source_terminal=source_terminal,
         adapter_factory=adapter_factory,
         process_factory=FakeProcessManager,
+        broker_identity_resolver=lambda _server: SimpleNamespace(
+            broker_label="Fixture Broker",
+            search_text="Fixture Broker",
+        ),
     )
     runner = JobRunner(tmp_path / "agent-job.json", control_plane, handlers)
 
@@ -183,7 +251,9 @@ def test_full_provision_historical_sync_deprovision_lifecycle_through_daemon(tmp
     failed = [job_id for job_id, status, _ in control_plane.transitions if status == "fail"]
     assert failed == []
     assert completed == ["job-provision", "job-historical-sync", "job-deprovision"]
-    assert not InstanceLayout(instances_root, cid).path.exists()
+    root = InstanceLayout(instances_root, cid).path
+    assert root.exists()
+    assert not (root / "terminal").exists()
     assert not (secrets_root / cid).exists()
 
     store = WindowsSecretStore(secrets_root)

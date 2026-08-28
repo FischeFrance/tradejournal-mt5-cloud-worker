@@ -14,7 +14,11 @@ from .instance_layout import SUBDIRS, InstanceLayout
 from .secret_store import WindowsSecretStore
 
 
-_MT5_GENERATED_EXAMPLE_DIRS = (
+# MT5 can materialize these bundled examples on a first authenticated or
+# LiveUpdate start.  Keep the allow-list in one provisioning module so runtime
+# instance cleanup and golden-template rotation cannot disagree about which
+# vendor-generated executable directories are safe to remove.
+MT5_GENERATED_EXAMPLE_DIRS = (
     Path("MQL5/Experts/Advisors"),
     Path("MQL5/Experts/Examples"),
     Path("MQL5/Experts/Free Robots"),
@@ -177,7 +181,7 @@ class InstanceProvisioner:
         if self._is_reparse_point(terminal_root) or not terminal_root.is_dir():
             raise ValueError("published terminal root invalid")
         removed: list[str] = []
-        for relative in _MT5_GENERATED_EXAMPLE_DIRS:
+        for relative in MT5_GENERATED_EXAMPLE_DIRS:
             target = terminal_root / relative
             if not target.exists():
                 continue
@@ -310,7 +314,11 @@ class InstanceProvisioner:
             or state.get("status") != "provisioned"
         ):
             raise ValueError("vendor-updated instance state is invalid")
-        if not isinstance(signer_subject, str) or "MetaQuotes Ltd." not in signer_subject:
+        if (
+            not isinstance(signer_subject, str)
+            or "CN=MetaQuotes Ltd." not in signer_subject
+            or "O=MetaQuotes Ltd." not in signer_subject
+        ):
             raise ValueError("vendor update signer is invalid")
 
         recorded_assets = state.get("runtime_assets_manifest_sha256")

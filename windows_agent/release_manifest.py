@@ -5,6 +5,7 @@ working copy.  This module intentionally knows nothing about credentials, MT5
 instances, or deployment; it only copies a small allowlisted source set and
 binds every file to a manifest before the directory is published atomically.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -32,6 +33,7 @@ RELEASE_CONTENTS = (
     "mt5/experts",
     "scripts/windows",
     "requirements.txt",
+    "requirements-ai.txt",
     "requirements-windows.txt",
 )
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -91,12 +93,22 @@ def _safe_source(root: Path, relative: str) -> Path:
 def _iter_files(root: Path, relative: str) -> Iterable[tuple[str, Path]]:
     source = _safe_source(root, relative)
     if source.is_file():
-        yield _safe_relative(relative), source
+        safe_relative = _safe_relative(relative)
+        if (
+            any(part.casefold() == "__pycache__" for part in safe_relative.split("/"))
+            or source.suffix.casefold() == ".pyc"
+        ):
+            return
+        yield safe_relative, source
         return
     if not source.is_dir():
         raise ReleaseManifestError("release source is unavailable")
     for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
-        if path.name == "__pycache__" or path.suffix == ".pyc":
+        relative_path = path.relative_to(root)
+        if (
+            any(part.casefold() == "__pycache__" for part in relative_path.parts)
+            or path.suffix.casefold() == ".pyc"
+        ):
             continue
         if _is_reparse_point(path):
             raise ReleaseManifestError("release source reparse point is forbidden")
@@ -104,7 +116,7 @@ def _iter_files(root: Path, relative: str) -> Iterable[tuple[str, Path]]:
             continue
         if not path.is_file():
             raise ReleaseManifestError("release source contains a non-regular file")
-        yield _safe_relative(path.relative_to(root).as_posix()), path
+        yield _safe_relative(relative_path.as_posix()), path
 
 
 def _write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
@@ -198,6 +210,56 @@ def build_release(
         shutil.rmtree(stage, ignore_errors=True)
         raise
     return destination
+
+
+def verify_release_matches_source(
+    release_root: str | Path,
+    source_root: str | Path,
+    *,
+    revision: str,
+    contents: tuple[str, ...] = RELEASE_CONTENTS,
+) -> dict[str, Any]:
+    """Verify an existing release against its clean, revision-bound source tree.
+
+    ``verify_release`` proves that a published directory still matches its own
+    manifest.  A retry additionally needs to prove that the immutable directory
+    contains the exact bytes selected from the current source checkout; otherwise
+    a previously mislabelled or partially staged release could be reused solely
+    because its directory name shares the requested revision prefix.
+
+    The caller remains responsible for proving that ``source_root`` is a clean Git
+    checkout whose ``HEAD`` is ``revision``.  The Windows deployment script does
+    that before it imports or executes any code from the checkout.
+    """
+
+    if not isinstance(revision, str) or not _REVISION.fullmatch(revision):
+        raise ReleaseManifestError("release revision is invalid")
+    source = Path(source_root)
+    if _is_reparse_point(source) or not source.is_dir():
+        raise ReleaseManifestError("release source root is invalid")
+
+    document = verify_release(release_root)
+    if document["source_revision"] != revision:
+        raise ReleaseManifestError("release source revision does not match")
+
+    expected: dict[str, tuple[str, int]] = {}
+    for allowed in contents:
+        for relative, source_file in _iter_files(source, allowed):
+            if relative in expected:
+                raise ReleaseManifestError("release source files overlap")
+            try:
+                expected[relative] = (_sha256(source_file), source_file.stat().st_size)
+            except OSError as exc:
+                raise ReleaseManifestError(
+                    "release source cannot be inspected"
+                ) from exc
+
+    recorded = {
+        item["path"]: (item["sha256"], item["size"]) for item in document["files"]
+    }
+    if recorded != expected:
+        raise ReleaseManifestError("release does not match source checkout")
+    return document
 
 
 def verify_release(release_root: str | Path) -> dict[str, Any]:

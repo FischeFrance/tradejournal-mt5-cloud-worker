@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.secret_store import WindowsSecretStore
-from windows_agent.real_handlers import recover_startup_instances
+from windows_agent.interactive_identity import InteractiveIdentityError
+from windows_agent.real_handlers import (
+    reconcile_startup_instances,
+    recover_startup_instances,
+)
 
 
 class FakeRuntime:
@@ -31,6 +36,7 @@ class FakeRuntime:
         self,
         expert_binary: Path,
         history_mode: str,
+        history_from: datetime | None = None,
     ) -> None:
         destination = (
             self.root
@@ -46,6 +52,7 @@ class FakeRuntime:
                 "connection_id": self.connection_id,
                 "expert_binary": expert_binary,
                 "history_mode": history_mode,
+                "history_from": history_from,
             }
         )
 
@@ -102,6 +109,49 @@ def _published_instance(tmp_path: Path, monkeypatch: Any) -> tuple[str, Path, Pa
     return connection_id, instances_root, secrets_root, expert
 
 
+def test_startup_reconciliation_terminates_stale_admin_token_before_recovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    connection_id, instances_root, secrets_root, _expert = _published_instance(
+        tmp_path,
+        monkeypatch,
+    )
+    cleaned: list[Path] = []
+
+    class ElevatedProcessManager:
+        def __init__(self, state_path: Path) -> None:
+            self.state_path = state_path
+
+        @staticmethod
+        def adopt(_terminal: Path) -> int:
+            raise InteractiveIdentityError(
+                "interactive_process_token_not_standard"
+            )
+
+        @staticmethod
+        def cleanup_path(terminal: Path) -> bool:
+            cleaned.append(terminal)
+            return True
+
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.ProcessManager.find",
+        lambda _terminal: [321],
+    )
+
+    result = reconcile_startup_instances(
+        instances_root,
+        secrets_root,
+        process_factory=ElevatedProcessManager,
+    )
+
+    assert result.adopted == ()
+    assert result.terminated == (connection_id,)
+    assert result.missing == (connection_id,)
+    assert result.blocked == ()
+    assert len(cleaned) == 1
+
+
 def test_startup_recovery_resumes_once_without_reading_password(tmp_path: Path, monkeypatch: Any) -> None:
     connection_id, instances_root, secrets_root, expert = _published_instance(tmp_path, monkeypatch)
     store = WindowsSecretStore(secrets_root)
@@ -112,6 +162,11 @@ def test_startup_recovery_resumes_once_without_reading_password(tmp_path: Path, 
     FakeRuntime.installs = []
     FakeRuntime.stopped = False
     FakeProcessManager.adopted = []
+    history_from = datetime(2026, 8, 27, 21, 29, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.new_only_recovery_from",
+        lambda _root: history_from,
+    )
 
     result = recover_startup_instances(
         instances_root,
@@ -133,6 +188,7 @@ def test_startup_recovery_resumes_once_without_reading_password(tmp_path: Path, 
             "server": "Demo",
             "expert_binary": expert,
             "history_mode": "new_only",
+            "history_from": history_from,
         }
     ]
     assert FakeRuntime.installs == [
@@ -140,6 +196,7 @@ def test_startup_recovery_resumes_once_without_reading_password(tmp_path: Path, 
             "connection_id": connection_id,
             "expert_binary": expert,
             "history_mode": "new_only",
+            "history_from": history_from,
         }
     ]
     assert len(FakeProcessManager.adopted) == 1

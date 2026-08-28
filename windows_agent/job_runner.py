@@ -75,10 +75,14 @@ class JobRunner:
         background_workers: tuple[
             Callable[[threading.Event], None], ...
         ] = (),
+        scheduled_maintenance: Any | None = None,
+        lifecycle_coordinator: Any | None = None,
     ) -> None:
         self.state, self.api, self.handlers = state, api, handlers
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.background_workers = background_workers
+        self.scheduled_maintenance = scheduled_maintenance
+        self.lifecycle_coordinator = lifecycle_coordinator
 
     def run_once(self) -> bool:
         job = self.api.claim()

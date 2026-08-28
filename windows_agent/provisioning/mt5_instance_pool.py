@@ -44,6 +44,7 @@ _PRIVATE_CONFIG_NAMES = frozenset(
     {
         "accounts.dat",
         "accounts.ini",
+        "certificates",
         "community.ini",
         "signals.ini",
     }
@@ -417,11 +418,15 @@ class Mt5InstancePool:
     def maintain_once(self, stop_event: Event | None = None) -> int:
         """Replenish sequentially up to target_size and return READY count."""
 
-        self._discard_incompatible_ready_slots()
+        with self._template_lock:
+            self._discard_incompatible_ready_slots()
         while self.ready_count() < self.target_size:
-            if stop_event is not None and stop_event.is_set():
-                break
-            self.build_one()
+            with self._template_lock:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if self.ready_count() >= self.target_size:
+                    break
+                self._build_one_locked()
         return self.ready_count()
 
     def replenish_forever(
@@ -620,12 +625,40 @@ class Mt5InstancePool:
             reservation.unlink(missing_ok=True)
             fsync_directory(self.reservations_root)
 
-    def accept_template_rotation(self, terminal_sha256: str) -> int:
-        """Switch future slots to a verified template and retire only READY slots."""
+    def accept_template_rotation(
+        self,
+        terminal_sha256: str,
+        *,
+        replenish: bool = False,
+        stop_event: Event | None = None,
+    ) -> int:
+        """Switch future slots to a verified template and replace stale READY slots.
+
+        The maintenance path keeps the shared template lock through discard and
+        refill, so no concurrent claim can publish a slot from the prior release.
+        Normal user-triggered fallback promotion leaves refill to the background
+        worker by keeping ``replenish`` false.
+        """
 
         digest = terminal_sha256.strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise InstancePoolError("rotated MT5 template digest is invalid")
         with self._template_lock:
+            try:
+                actual = InstanceProvisioner._sha256(self.source_terminal)
+            except OSError as exc:
+                raise InstancePoolError("rotated MT5 template is unavailable") from exc
+            if actual != digest:
+                raise InstancePoolError("rotated MT5 template digest mismatch")
             self.expected_terminal_sha256 = digest
-            return self._discard_incompatible_ready_slots()
+            discarded = self._discard_incompatible_ready_slots()
+            if replenish:
+                while self.ready_count() < self.target_size:
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    self._build_one_locked()
+                if self.ready_count() < self.target_size:
+                    raise InstancePoolError(
+                        "MT5 instance pool rotation was interrupted"
+                    )
+            return discarded

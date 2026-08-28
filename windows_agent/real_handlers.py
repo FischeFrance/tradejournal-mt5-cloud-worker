@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,12 +63,16 @@ from .mtapi_search import (
     MtApiSearchError,
     MtApiSearchResult,
 )
+from .mt5_lifecycle import Mt5LifecycleCoordinator
+from .mt5_recovery_window import new_only_recovery_from
 from .credential_envelope import decrypt_credential_envelope
 from .job_runner import LeaseLost
+from .interactive_identity import InteractiveIdentityError
 from .provisioning.instance_layout import InstanceLayout
 from .provisioning.mt5_instance import InstanceProvisioner
 from .provisioning.mt5_instance_pool import Mt5InstancePool
 from .provisioning.mt5_template import Mt5TemplateManager
+from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .provisioning.process_manager import ProcessManager
 from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
@@ -513,6 +518,24 @@ def reconcile_startup_instances(
         if publication_valid and len(pids) == 1:
             try:
                 process_factory(state_path).adopt(terminal)
+            except InteractiveIdentityError:
+                # A path match is insufficient after account demotion or a
+                # stale RDP reconnect: an old Administrator token can keep
+                # running the exact terminal.  Never adopt it into the new
+                # service; terminate only this isolated instance and let the
+                # passwordless standard-user recovery path recreate it.
+                try:
+                    cleaned = bool(
+                        process_factory(state_path).cleanup_path(terminal)
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    cleaned = False
+                if cleaned:
+                    terminated.append(connection_id)
+                    missing.append(connection_id)
+                else:
+                    blocked.append(connection_id)
+                continue
             except (OSError, RuntimeError, ValueError):
                 # The exact, valid terminal is already running.  A local state-write failure is
                 # not authority to interrupt the user's connection; leave it alive and surface
@@ -554,6 +577,9 @@ def recover_startup_instances(
     process_factory: Callable[[Path], Any] = ProcessManager,
     process_finder: Callable[[Path], list[int]] = ProcessManager.find,
     runtime_factory: Callable[[Path, str], Any] = NativeMt5Runtime,
+    verified_update_callback: Callable[[Path, Path, Path, str], str | None]
+    | None = None,
+    verified_update_required: bool = False,
 ) -> StartupRecovery:
     """Resume missing managed terminals once, without a control-plane job or password.
 
@@ -603,10 +629,31 @@ def recover_startup_instances(
 
             _verify_binary_pin(expert_binary, expert_sha256)
             runtime = runtime_factory(root, connection_id)
+            if verified_update_callback is not None:
+                setter = getattr(
+                    runtime,
+                    "set_verified_vendor_update_callback",
+                    None,
+                )
+                if not callable(setter):
+                    if verified_update_required:
+                        raise RuntimeError(
+                            "verified MT5 update callback is unavailable"
+                        )
+                else:
+                    setter(
+                        verified_update_callback,
+                        required=verified_update_required,
+                    )
+            history_from = new_only_recovery_from(root)
             trusted_expert_sha256 = hashlib.sha256(
                 expert_binary.read_bytes()
             ).hexdigest()
-            runtime.install_expert(expert_binary, "new_only")
+            runtime.install_expert(
+                expert_binary,
+                "new_only",
+                history_from,
+            )
             provisioner.record_verified_managed_asset_update(
                 root,
                 connection_id,
@@ -617,6 +664,7 @@ def recover_startup_instances(
                 server=server,
                 expert_binary=expert_binary,
                 history_mode="new_only",
+                history_from=history_from,
             )
             provisioner.validate_runtime_assets(connection_id)
             process_factory(state_path).adopt(terminal)
@@ -691,6 +739,8 @@ def build_real_handlers(
     mtapi_search: MtApiSearch | None = None,
     instance_pool: Mt5InstancePool | None = None,
     template_manager: Mt5TemplateManager | None = None,
+    pending_update_store: Mt5PendingUpdateStore | None = None,
+    lifecycle_coordinator: Mt5LifecycleCoordinator | None = None,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers.
 
@@ -712,17 +762,18 @@ def build_real_handlers(
         config: Path,
         signer_subject: str,
     ) -> str | None:
-        if template_manager is None:
-            return None
-        digest = template_manager.promote_verified_update(
-            bundle_root,
-            updater,
-            config,
-            signer_subject,
-        )
-        if instance_pool is not None:
-            instance_pool.accept_template_rotation(digest)
-        return digest
+        if pending_update_store is not None:
+            return pending_update_store.capture(
+                bundle_root,
+                updater,
+                config,
+                signer_subject,
+            ).receipt_id
+        # A connection job is never allowed to mutate the shared golden
+        # template. Production always supplies the durable pending store; a
+        # deliberately minimal/test wiring simply leaves the account-local
+        # verified update isolated.
+        return None
 
     def _configure_runtime(runtime: Any, job: dict) -> Any:
         set_cancel_check = getattr(runtime, "set_cancel_check", None)
@@ -733,8 +784,11 @@ def build_real_handlers(
             "set_verified_vendor_update_callback",
             None,
         )
-        if callable(set_update_callback) and template_manager is not None:
-            set_update_callback(_promote_verified_vendor_update)
+        if callable(set_update_callback) and pending_update_store is not None:
+            set_update_callback(
+                _promote_verified_vendor_update,
+                required=pending_update_store is not None,
+            )
         return runtime
 
     def _provision_instance(connection_id: str) -> Path:
@@ -742,14 +796,20 @@ def build_real_handlers(
             pooled_root = instance_pool.claim(connection_id)
             if pooled_root is not None:
                 return pooled_root
-        return InstanceProvisioner(
-            instances_root,
-            secrets_root,
-        ).provision(
-            connection_id,
-            source_terminal,
-            _current_template_sha256(),
+        template_guard = (
+            template_manager.lock
+            if template_manager is not None
+            else nullcontext()
         )
+        with template_guard:
+            return InstanceProvisioner(
+                instances_root,
+                secrets_root,
+            ).provision(
+                connection_id,
+                source_terminal,
+                _current_template_sha256(),
+            )
 
     def _provision_once(job: dict) -> dict:
         cid = canonical_uuid(str(job["connection_id"]))
@@ -1437,6 +1497,19 @@ def build_real_handlers(
         root = InstanceLayout(instances_root, cid).path
         protected_at_start = _is_protected_instance(root, cid)
         stale_secrets = secrets_root / cid
+        if protected_at_start:
+            # A duplicate provision may reuse only a complete, independently
+            # validated publication.  Ambiguous pre-existing state must be
+            # rejected before decrypting or overwriting any stored credential.
+            try:
+                InstanceProvisioner(
+                    instances_root,
+                    secrets_root,
+                ).validate(cid, _current_template_sha256())
+            except Exception as exc:
+                raise InstanceProvisionFailed(
+                    "pre-existing instance integrity validation failed"
+                ) from exc
         if not protected_at_start and (
             root.exists() or stale_secrets.exists()
         ):
@@ -1572,12 +1645,14 @@ def build_real_handlers(
             finally:
                 if terminal_stopped:
                     try:
+                        recovery_from = new_only_recovery_from(root)
                         runtime.stop()
                         runtime.resume(
                             login=login,
                             server=server,
                             expert_binary=expert_binary,
                             history_mode="new_only",
+                            history_from=recovery_from,
                         )
                         process_factory(state_path).adopt(terminal)
                         restored = True
@@ -1671,7 +1746,14 @@ def build_real_handlers(
             # call even if the instance was never fully provisioned (process.stop() is a no-op
             # when its state file is absent, and InstanceProvisioner.deprovision() is itself
             # idempotent, see test_fake_provision_deprovision_idempotent).
-            process_factory(root / "state" / "terminal-process.json").stop()
+            process = process_factory(
+                root / "state" / "terminal-process.json"
+            )
+            if process.stop() is not True:
+                raise RuntimeError("terminal stop could not be verified")
+            terminal = root / "terminal" / "terminal64.exe"
+            if terminal.parent.exists() and process.cleanup_path(terminal) is not True:
+                raise RuntimeError("terminal cleanup could not be verified")
             InstanceProvisioner(instances_root, secrets_root).deprovision(cid)
         except Exception as exc:
             raise DeprovisionFailed("deprovision failed") from exc
@@ -1757,11 +1839,28 @@ def build_real_handlers(
             _verify_binary_pin(expert_binary, expert_sha256)
             try:
                 runtime = _configure_runtime(runtime_factory(root, cid), job)
+                recovery_from = new_only_recovery_from(root)
+                trusted_expert_sha256 = hashlib.sha256(
+                    expert_binary.read_bytes()
+                ).hexdigest()
+                runtime.install_expert(
+                    expert_binary,
+                    "new_only",
+                    recovery_from,
+                )
+                provisioner.record_verified_managed_asset_update(
+                    root,
+                    cid,
+                    trusted_expert_sha256,
+                )
                 runtime.resume(
                     login=login,
                     server=server,
                     expert_binary=expert_binary,
+                    history_mode="new_only",
+                    history_from=recovery_from,
                 )
+                provisioner.validate_runtime_assets(cid)
             except NativeMt5Error as exc:
                 code = str(exc)
                 if code in ("identity_mismatch", "server_identity_mismatch"):
@@ -1769,6 +1868,10 @@ def build_real_handlers(
                 if code == "terminal_start_failed":
                     raise TerminalStartFailed(code) from exc
                 raise Mt5InitializeFailed(code) from exc
+            except (OSError, ValueError) as exc:
+                raise InstanceProvisionFailed(
+                    "managed runtime asset refresh failed"
+                ) from exc
             try:
                 process_factory(state_path).adopt(terminal)
             except (AttributeError, RuntimeError):
@@ -1797,11 +1900,26 @@ def build_real_handlers(
         )
         return {"live_sync_events_delivered": delivered}
 
-    return {
+    handlers: dict[str, JobHandler] = {
         "provision": provision,
         "historical_sync": historical_sync,
         "deprovision": deprovision,
         "live_sync": live_sync,
+    }
+    if lifecycle_coordinator is None:
+        return handlers
+
+    def _serialized(handler: JobHandler) -> JobHandler:
+        def wrapped(job: dict) -> dict:
+            connection_id = canonical_uuid(str(job["connection_id"]))
+            with lifecycle_coordinator.connection(connection_id):
+                return handler(job)
+
+        return wrapped
+
+    return {
+        name: _serialized(handler)
+        for name, handler in handlers.items()
     }
 
 

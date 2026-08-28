@@ -12,6 +12,7 @@ from watchdog.observers import Observer
 
 from worker.event_outbox import EventOutbox
 
+from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
 from .state_store import atomic_json, read_json
@@ -49,7 +50,13 @@ class _WakeHandler(FileSystemEventHandler):
 
 
 class Mt5EventSupervisor:
-    def __init__(self, instances_root: Path, secrets_root: Path, ingestion_url: str) -> None:
+    def __init__(
+        self,
+        instances_root: Path,
+        secrets_root: Path,
+        ingestion_url: str,
+        lifecycle_coordinator: Mt5LifecycleCoordinator | None = None,
+    ) -> None:
         self.instances_root = Path(instances_root)
         self.secrets = WindowsSecretStore(secrets_root)
         self.ingestion_url = ingestion_url
@@ -57,6 +64,9 @@ class Mt5EventSupervisor:
         self._condition = threading.Condition()
         self._retry_failures: dict[str, int] = {}
         self._retry_after: dict[str, float] = {}
+        self.lifecycle_coordinator = (
+            lifecycle_coordinator or Mt5LifecycleCoordinator()
+        )
 
     def notify(self, path: Path) -> None:
         try:
@@ -83,6 +93,10 @@ class Mt5EventSupervisor:
         return root, adapter, sink
 
     def _process(self, connection_id: str) -> None:
+        with self.lifecycle_coordinator.connection(connection_id):
+            self._process_locked(connection_id)
+
+    def _process_locked(self, connection_id: str) -> None:
         root, adapter, sink = self._components(connection_id)
         files_dir = adapter.files_dir
         event_files = sorted((files_dir / "events").glob("event-*.json"))
@@ -155,20 +169,28 @@ class Mt5EventSupervisor:
                 if all((secret_root / f"{name}.dpapi").is_file() for name in required):
                     self._pending.add(connection_id)
 
-    def run(self, stop_event: threading.Event) -> None:
+    def run(
+        self,
+        stop_event: threading.Event,
+        ready_event: threading.Event | None = None,
+    ) -> None:
         if not self.ingestion_url:
-            logger.error("TRADEJOURNAL_TRADING_INGESTION_URL missing; local event supervisor disabled")
-            stop_event.wait()
-            return
+            raise RuntimeError("MT5 event ingestion is not configured")
         self.instances_root.mkdir(parents=True, exist_ok=True)
         observer = Observer()
         observer.schedule(_WakeHandler(self), str(self.instances_root), recursive=True)
         observer.start()
         try:
+            if not observer.is_alive():
+                raise RuntimeError("MT5 event observer failed to start")
             with self._condition:
                 self._discover()
                 self._condition.notify()
+            if ready_event is not None:
+                ready_event.set()
             while not stop_event.is_set():
+                if not observer.is_alive():
+                    raise RuntimeError("MT5 event observer stopped unexpectedly")
                 with self._condition:
                     if not self._pending:
                         self._condition.wait(timeout=1.0)

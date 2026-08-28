@@ -5,6 +5,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from ..interactive_identity import verify_interactive_process_identity
+
 
 class ProcessManager:
     STATE_SCHEMA_VERSION = 2
@@ -130,6 +132,17 @@ class ProcessManager:
         matches = self.find(executable)
         if len(matches) != 1:
             raise RuntimeError("expected exactly one terminal process")
+        if os.name == "nt":
+            interactive_user = os.environ.get(
+                "TRADEJOURNAL_MT5_INTERACTIVE_USER",
+                "",
+            ).strip()
+            if not interactive_user:
+                raise RuntimeError("dedicated interactive user is unavailable")
+            verify_interactive_process_identity(
+                interactive_user,
+                matches[0],
+            )
         return self._save_identity(
             matches[0],
             executable,

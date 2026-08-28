@@ -45,7 +45,9 @@ string g_connection_id = "unknown-connection";
 bool   g_new_only      = false;
 datetime g_history_from = 0;
 ulong  g_new_only_started_ms = 0;
+bool   g_new_only_recovery_pending = false;
 const ulong NEW_ONLY_STARTUP_GRACE_MS = 5000;
+const int NEW_ONLY_RECOVERY_MAX_SECONDS = 21600; // massimo 6h: recupero gap, non reimport storico
 
 //--- Le 6 timeframe pubblicate in file separati candles/<symbol>-<timeframe>.json.
 string           TIMEFRAME_NAMES[6]  = {"M1", "M5", "M15", "H1", "H4", "D1"};
@@ -315,11 +317,11 @@ void LoadCursorState()
    g_backfill_done = ExtractJsonBool(content, "backfill_done", false);
   }
 
-void SaveCursorState()
+bool SaveCursorState()
   {
    string json = "{\"event_seq\":" + IntegerToString(g_event_seq) +
                  ",\"backfill_done\":" + (g_backfill_done ? "true" : "false") + "}";
-   WriteJsonAtomic("cursor.json", json);
+   return WriteJsonAtomic("cursor.json", json);
   }
 
 //+------------------------------------------------------------------------+
@@ -544,14 +546,18 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
                        const string comment, const string entry, const datetime event_time,
                        long timestamp_msc)
   {
-   g_event_seq++; // coda di unicita' entro lo stesso millisecondo, mai riusato
+   g_event_seq++; // sequenza monotona del file/envelope locale, persistita in cursor.json
    if(timestamp_msc <= 0)
       timestamp_msc = (long)event_time * 1000; // fallback se la proprieta' _MSC non e' disponibile
 
    long   login  = AccountInfoInteger(ACCOUNT_LOGIN);
    string server = AccountInfoString(ACCOUNT_SERVER);
 
-   // Composito e deterministico: connection_id + login + server + tipo + ticket + timestamp_msc.
+   // Composito e deterministico: identita' account/evento broker piu' stato rilevante. I campi
+   // di stato distinguono, per esempio, due ORDER_UPDATE dello stesso ordine (il loro tempo di
+   // setup MT5 resta invariato), senza dipendere dalla sequenza locale del file.
+   // La sequenza appartiene solo al nome/cursore locale: includerla qui renderebbe diverso lo
+   // stesso evento broker quando il recovery rilegge deliberatamente la finestra di overlap.
    // Due connessioni/account diversi non possono mai produrre lo stesso event_id anche con
    // ticket numericamente coincidenti (broker/demo differenti): questo e' il requisito che
    // sostituisce la vecchia deduplica "solo per deal_ticket" (vedi
@@ -559,7 +565,11 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
    // come chiave, non il solo ticket).
    string event_id = g_connection_id + "|" + IntegerToString(login) + "|" + server + "|" +
                       event_type + "|" + IntegerToString(ticket) + "|" +
-                      IntegerToString(timestamp_msc) + "|" + IntegerToString(g_event_seq);
+                      IntegerToString(timestamp_msc) + "|" + symbol + "|" + direction + "|" +
+                      DoubleToString(volume, 8) + "|" + DoubleToString(price, 8) + "|" +
+                      DoubleToString(stop_loss, 8) + "|" + DoubleToString(take_profit, 8) + "|" +
+                      DoubleToString(profit, 8) + "|" + DoubleToString(commission, 8) + "|" +
+                      DoubleToString(swap, 8) + "|" + IntegerToString(magic) + "|" + entry;
 
    string json = "{";
    json += "\"event_id\":" + JsonString(event_id) + ",";
@@ -597,11 +607,10 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
 //| tra i tipi di evento, ogni emettitore rilegge lo stato corrente dal    |
 //| ticket ricevuto invece di fidarsi di uno stato accumulato in memoria.  |
 //+------------------------------------------------------------------------+
-void EmitDealAddEvent(const ulong deal_ticket)
+bool EmitDealAddEvent(const ulong deal_ticket)
   {
    if(!HistoryDealSelect(deal_ticket))
-      return; // il deal potrebbe non essere ancora visibile nella cache storica: evento perso una
-              // tantum, ma posizioni/ordini/account restano comunque corretti al prossimo OnTimer
+      return false; // il deal potrebbe non essere ancora visibile nella cache storica
 
    long     position_id = (long)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
    long     order_id     = (long)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
@@ -627,7 +636,7 @@ void EmitDealAddEvent(const ulong deal_ticket)
                                  symbol, direction, volume, price, 0.0, 0.0,
                                  profit, commission, swap, magic, comment, entry, event_time,
                                  timestamp_msc);
-   WriteEventAtomic(line);
+   return WriteEventAtomic(line);
   }
 
 void EmitOrderEvent(const string event_type, const ulong order_ticket)
@@ -699,10 +708,15 @@ void EmitPositionEvent(const ulong position_ticket)
    WriteEventAtomic(line);
   }
 
-void EmitHistoryOrderEvent(const ulong order_ticket)
+bool EmitHistoryOrderEvent(const ulong order_ticket)
   {
    if(!HistoryOrderSelect(order_ticket))
-      return;
+      return false;
+
+   long state = HistoryOrderGetInteger(order_ticket, ORDER_STATE);
+   if(state != ORDER_STATE_CANCELED && state != ORDER_STATE_EXPIRED &&
+      state != ORDER_STATE_REJECTED)
+      return true; // gli ordini eseguiti sono rappresentati dai rispettivi DEAL_ADD
 
    string   symbol      = HistoryOrderGetString(order_ticket, ORDER_SYMBOL);
    long     type        = HistoryOrderGetInteger(order_ticket, ORDER_TYPE);
@@ -718,7 +732,7 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
    string line = BuildEventJson("HISTORY_ADD", (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
-   WriteEventAtomic(line);
+   return WriteEventAtomic(line);
   }
 
 //+------------------------------------------------------------------------+
@@ -726,11 +740,9 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
 //| nella finestra configurata e lo trascrive con lo stesso schema evento  |
 //| usato in tempo reale, cosi' il bridge non deve distinguere backfill da |
 //| eventi live. Marcato completato nel cursore persistente: un riavvio    |
-//| successivo dell'EA non lo ripete (e anche se lo ripetesse, gli         |
-//| event_id verrebbero rigenerati con una nuova sequenza: la deduplica    |
-//| finale dei deal nel bridge e' comunque per (connection_id, login,      |
-//| server, deal_ticket), non per event_id, quindi resta corretta in ogni  |
-//| caso).                                                                  |
+//| successivo dell'EA non lo ripete. Se venisse riletto dopo un crash,    |
+//| l'event_id basato sui campi immutabili del broker resterebbe identico, |
+//| consentendo al worker di deduplicare il replay.                         |
 //+------------------------------------------------------------------------+
 void RunBackfill()
   {
@@ -766,6 +778,81 @@ void RunBackfill()
 
    PrintFormat("TradeJournalBridge: backfill completato (%d deal, %d ordini storici, finestra %dh).",
                deals_total, orders_total, InpBackfillHours);
+  }
+
+// Un riavvio rolling resta in modalita' new_only, ma puo' ricevere dal Windows Agent un cutoff
+// pre-stop in history_from_unix. Rileggiamo una sola finestra strettamente limitata per non
+// perdere deal/chiusure avvenuti mentre il terminale era fermo. L'identita' evento deriva dai
+// campi immutabili del broker; un crash prima della cancellazione del cutoff puo' quindi ripetere
+// la finestra senza creare duplicati remoti, anche se lo snapshot corrente e' gia' cambiato.
+bool RunNewOnlyRecovery()
+  {
+   if(!g_new_only_recovery_pending || g_history_from <= 0)
+      return true;
+
+   datetime to_time = TimeCurrent();
+   // history_from_unix e' UTC, mentre HistorySelect richiede il tempo del trade server.
+   // Convertiamo il cutoff in una durata UTC e sottraiamo quella durata da TimeCurrent:
+   // in questo modo il recupero resta corretto anche per broker con fuso negativo.
+   long elapsed_seconds = (long)TimeGMT() - (long)g_history_from;
+   if(elapsed_seconds < 0)
+      elapsed_seconds = 0;
+   if(elapsed_seconds > NEW_ONLY_RECOVERY_MAX_SECONDS)
+      elapsed_seconds = NEW_ONLY_RECOVERY_MAX_SECONDS;
+   datetime from_time = (datetime)((long)to_time - elapsed_seconds);
+   if(!HistorySelect(from_time, to_time))
+     {
+      Print("TradeJournalBridge: recovery new_only rinviata, errore=", GetLastError());
+      return false;
+     }
+
+   // HistoryDealSelect/HistoryOrderSelect, usate dagli emettitori, restringono la rispettiva
+   // lista selezionata a un solo elemento. Copiamo quindi tutti i ticket prima di emetterli.
+   int deals_total = HistoryDealsTotal();
+   ulong deal_tickets[];
+   if(ArrayResize(deal_tickets, deals_total) != deals_total)
+     {
+      Print("TradeJournalBridge: memoria insufficiente per i deal del recovery.");
+      return false;
+     }
+   for(int i = 0; i < deals_total; i++)
+      deal_tickets[i] = HistoryDealGetTicket(i);
+
+   int orders_total = HistoryOrdersTotal();
+   ulong order_tickets[];
+   if(ArrayResize(order_tickets, orders_total) != orders_total)
+     {
+      Print("TradeJournalBridge: memoria insufficiente per gli ordini del recovery.");
+      return false;
+     }
+   for(int i = 0; i < orders_total; i++)
+      order_tickets[i] = HistoryOrderGetTicket(i);
+
+   bool all_events_written = true;
+   for(int i = 0; i < deals_total; i++)
+     {
+      if(deal_tickets[i] == 0 || !EmitDealAddEvent(deal_tickets[i]))
+         all_events_written = false;
+     }
+   for(int i = 0; i < orders_total; i++)
+     {
+      if(order_tickets[i] == 0 || !EmitHistoryOrderEvent(order_tickets[i]))
+         all_events_written = false;
+     }
+   if(!all_events_written || !SaveCursorState())
+     {
+      Print("TradeJournalBridge: recovery new_only non persistita, verra' riprovata.");
+      return false;
+     }
+
+   g_new_only_recovery_pending = false;
+   g_history_from = 0;
+   if(!FileDelete(BASE_DIR + "\\history_from_unix"))
+      Print("TradeJournalBridge: cutoff recovery gia' applicato ma non cancellato, errore=",
+            GetLastError());
+   PrintFormat("TradeJournalBridge: recovery new_only completata (%d deal, %d ordini).",
+               deals_total, orders_total);
+   return true;
   }
 
 //+------------------------------------------------------------------------+
@@ -820,6 +907,7 @@ int OnInit()
    WriteInitMarker("connection-id-ready");
    g_new_only = ReadNewOnlyMode();
    g_history_from = ReadHistoryFrom();
+   g_new_only_recovery_pending = g_new_only && g_history_from > 0;
    WriteInitMarker(g_new_only ? "mode-new-only" : "mode-history");
    g_new_only_started_ms = GetTickCount64();
    LoadCursorState();
@@ -857,6 +945,8 @@ void OnTimer()
   {
    if(g_new_only && GetTickCount64() - g_new_only_started_ms < NEW_ONLY_STARTUP_GRACE_MS)
       return;
+   if(g_new_only_recovery_pending && !RunNewOnlyRecovery())
+      return;
    WriteAllSnapshots();
    SaveCursorState();
   }
@@ -882,7 +972,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          EmitOrderEvent("ORDER_UPDATE", trans.order);
          break;
       case TRADE_TRANSACTION_ORDER_DELETE:
-         EmitOrderEvent("ORDER_DELETE", trans.order);
+         // ORDER_DELETE scatta sia per cancellazioni sia quando un ordine viene
+         // eseguito e passa allo storico. Aspettiamo HISTORY_ADD, che legge e
+         // filtra ORDER_STATE_* e usa la stessa identita' del recovery overlap.
          break;
       case TRADE_TRANSACTION_POSITION:
          EmitPositionEvent(trans.position);

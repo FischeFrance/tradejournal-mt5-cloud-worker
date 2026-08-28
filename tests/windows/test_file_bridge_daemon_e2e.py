@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -45,11 +46,26 @@ class FakeNativeRuntime:
 
     def start(self, **kwargs: Any) -> NativeMt5Status:
         assert kwargs["expert_binary"].name == "TradeJournalBridge.ex5"
+        expert_root = self.root / "terminal" / "MQL5" / "Experts" / "TradeJournal"
+        script_root = self.root / "terminal" / "MQL5" / "Scripts" / "TradeJournal"
+        expert_root.mkdir(parents=True, exist_ok=True)
+        script_root.mkdir(parents=True, exist_ok=True)
+        (expert_root / "TradeJournalBridge.ex5").write_bytes(b"expert")
+        (script_root / "TradeJournalDiscovery.ex5").write_bytes(b"discovery")
+        (script_root / "TradeJournalLoader.ex5").write_bytes(b"loader")
         files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"
         files.mkdir(parents=True, exist_ok=True)
         records = {
             "heartbeat.json": {"terminal_connected": True, "account_trade_allowed": False},
-            "account.json": {"login": "42", "server": "Demo", "trade_allowed": False},
+            "account.json": {
+                "login": "42",
+                "server": "Demo",
+                "trade_allowed": False,
+                "balance": 10_000.0,
+                "equity": 10_000.0,
+                "currency": "EUR",
+                "leverage": 100,
+            },
             "positions.json": [],
             "orders.json": [],
             "history_orders.json": [{"ticket": "1", "time": "2026-07-01T00:00:00Z"}],
@@ -58,6 +74,16 @@ class FakeNativeRuntime:
         for name, payload in records.items():
             (files / name).write_text(json.dumps(_bridge_envelope(payload)), encoding="utf-8")
         return NativeMt5Status(999, records["account.json"], records["heartbeat.json"], files)
+
+    def install_expert(self, *_args: object) -> None:
+        return None
+
+    def resume(self, **kwargs: Any) -> NativeMt5Status:
+        return self.start(**kwargs)
+
+    @staticmethod
+    def stop() -> bool:
+        return True
 
 
 class FakeProcessManager:
@@ -73,11 +99,16 @@ class FakeProcessManager:
     def cleanup_path(self, executable: Path) -> bool:
         return True
 
+    @staticmethod
+    def find(_executable: Path) -> list[int]:
+        return []
+
 
 class QueueApi:
     def __init__(self, jobs: list[dict[str, object]]) -> None:
         self.jobs = list(jobs)
         self.transitions: list[tuple[str, str, dict[str, object] | None]] = []
+        self._history_counts: dict[str, int] = {}
 
     def claim(self) -> dict[str, object]:
         return self.jobs.pop(0) if self.jobs else {}
@@ -87,7 +118,44 @@ class QueueApi:
 
     def transition(self, job_id: str, lease_id: str, status: str, result: dict[str, object] | None = None) -> dict[str, str]:
         self.transitions.append((job_id, status, result))
-        return {"status": status}
+        return {"status": "failed" if status == "fail" else status}
+
+    @staticmethod
+    def progress(*_args: object, **_kwargs: object) -> dict[str, bool]:
+        return {"event_recorded": True}
+
+    def history_file_prepare(
+        self,
+        job_id: str,
+        _lease_id: str,
+        **metadata: object,
+    ) -> dict[str, object]:
+        self._history_counts[job_id] = int(metadata["event_count"])
+        return {
+            "already_imported": False,
+            "upload_url": "https://upload.invalid/history",
+            "accepted": 0,
+            "inserted": 0,
+            "duplicates": 0,
+        }
+
+    @staticmethod
+    def upload_history_file(_url: str, _payload: bytes) -> None:
+        return None
+
+    def history_file_import(
+        self,
+        job_id: str,
+        _lease_id: str,
+        expected_count: int,
+    ) -> dict[str, object]:
+        assert expected_count == self._history_counts[job_id]
+        return {
+            "accepted": expected_count,
+            "inserted": expected_count,
+            "duplicates": 0,
+            "object_deleted": True,
+        }
 
 
 def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Path, monkeypatch) -> None:
@@ -96,6 +164,10 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
     monkeypatch.setattr(WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.ProcessManager.find",
+        FakeProcessManager.find,
+    )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
     terminal = tmp_path / "template" / "terminal64.exe"
@@ -117,6 +189,10 @@ def test_daemon_uses_native_file_bridge_by_default_and_deprovisions(tmp_path: Pa
         expert_binary=expert,
         process_factory=FakeProcessManager,
         runtime_factory=FakeNativeRuntime,
+        broker_identity_resolver=lambda _server: SimpleNamespace(
+            broker_label="Fixture Broker",
+            search_text="Fixture Broker",
+        ),
     )
     runner = JobRunner(tmp_path / "agent-state.json", api, handlers)
     while runner.run_once():
@@ -137,6 +213,10 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.ProcessManager.find",
+        FakeProcessManager.find,
+    )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
     terminal = tmp_path / "template" / "terminal64.exe"
@@ -164,6 +244,10 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
         process_factory=FakeProcessManager,
         runtime_factory=FakeNativeRuntime,
         trading_ingestion_url="https://example.invalid/trading-mt5-events",
+        broker_identity_resolver=lambda _server: SimpleNamespace(
+            broker_label="Fixture Broker",
+            search_text="Fixture Broker",
+        ),
     )
     runner = JobRunner(tmp_path / "agent-state.json", api, handlers)
     assert runner.run_once() is True
@@ -171,7 +255,7 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     return cid, api, handlers
 
 
-def test_legacy_live_sync_job_does_not_send_periodic_heartbeat(tmp_path: Path, monkeypatch) -> None:
+def test_legacy_live_sync_job_sends_one_health_heartbeat(tmp_path: Path, monkeypatch) -> None:
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
     api.jobs.append({
         "job_id": "live-sync-1", "job_type": "live_sync", "connection_id": cid, "lease_id": "2",
@@ -182,7 +266,7 @@ def test_legacy_live_sync_job_does_not_send_periodic_heartbeat(tmp_path: Path, m
         assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once() is True
 
     assert api.transitions[-1][1] == "complete"
-    assert mock_post.call_count == 0
+    assert mock_post.call_count == 1
 
 
 def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monkeypatch) -> None:
@@ -214,6 +298,10 @@ def test_live_sync_job_fails_fast_when_ingestion_url_not_configured(tmp_path: Pa
     monkeypatch.setattr(WindowsSecretStore, "_crypt_protect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "_crypt_unprotect", staticmethod(lambda value: value))
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    monkeypatch.setattr(
+        "windows_agent.real_handlers.ProcessManager.find",
+        FakeProcessManager.find,
+    )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
     terminal = tmp_path / "template" / "terminal64.exe"
@@ -242,6 +330,10 @@ def test_live_sync_job_fails_fast_when_ingestion_url_not_configured(tmp_path: Pa
         expert_binary=expert,
         process_factory=FakeProcessManager,
         runtime_factory=FakeNativeRuntime,
+        broker_identity_resolver=lambda _server: SimpleNamespace(
+            broker_label="Fixture Broker",
+            search_text="Fixture Broker",
+        ),
     )
     runner = JobRunner(tmp_path / "agent-state.json", api, handlers)
     assert runner.run_once() is True

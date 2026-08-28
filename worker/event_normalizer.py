@@ -71,6 +71,18 @@ def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     rilevanti => stesso event_id, cosi' che un retry (o un doppio invio dello stesso poll)
     venga deduplicato dall'API invece di creare un evento duplicato.
     """
+    account_part = account_number or "unknown"
+    source_event_id = event.get("source_event_id")
+    if isinstance(source_event_id, str) and source_event_id:
+        # File-bridge events carry an identity built from immutable broker fields. Use it ahead
+        # of the snapshot-derived fingerprint: the same DEAL_ADD may legitimately map from
+        # trade_opened to trade_volume_changed when replayed against a newer snapshot, but it is
+        # still the same source event and must retain the same ingestion id.
+        source_digest = hashlib.sha256(
+            f"{account_part}\x00{source_event_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"mt5-{account_part}-source-{source_digest}"
+
     event_type = event["event_type"]
     ticket = str(event.get("ticket", ""))
     fields = _FINGERPRINT_FIELDS.get(event_type, ())
@@ -79,7 +91,6 @@ def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
         fingerprint_payload, sort_keys=True, separators=(",", ":"), default=str
     )
     digest = hashlib.sha256(fingerprint_json.encode("utf-8")).hexdigest()[:16]
-    account_part = account_number or "unknown"
     return f"mt5-{account_part}-{event_type}-{ticket}-{digest}"
 
 

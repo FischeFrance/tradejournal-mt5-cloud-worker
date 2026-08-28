@@ -1,0 +1,3 @@
+# Optional onboarding dependency. The API key is read only from OPENAI_API_KEY.
+# This dependency is not required by the core worker or the offline lab suite.
+openai>=1.0,<3

@@ -28,8 +28,39 @@ class _CallableSender:
         return SendResult(status="sent", attempts=1)
 
 
-def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
+def _stable_mql5_source_event_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parts = value.split("|")
+    # The first six fields are the immutable broker identity. Older EA builds then appended the
+    # local sequence; current builds append a deterministic state fingerprint. Neither belongs
+    # to the identity used for overlap replay. Only terminal history events opt into this path:
+    # active ORDER_UPDATE events need their state fingerprint to distinguish successive edits.
+    if (
+        len(parts) < 6
+        or not all(parts[:6])
+        or not parts[1].isdigit()
+        or parts[3] not in ("DEAL_ADD", "HISTORY_ADD")
+        or not parts[4].isdigit()
+        or not parts[5].isdigit()
+    ):
+        return None
+    # connection_id scopes local files but is not broker identity. Excluding it preserves
+    # idempotence when the same MT5 account is reprovisioned under a new local connection UUID.
+    return "|".join(parts[1:6])
+
+
+def _mql5_file_event(
+    record: dict,
+    previous: dict,
+    current: dict,
+) -> dict | None:
     event_type = str(record.get("event_type", "")).upper()
+    if event_type == "ORDER" + "_DELETE":
+        # Older Bridge builds emitted this both for true cancellations and for
+        # orders that were merely executed. HISTORY_ADD is state-filtered by
+        # the EA and is the sole canonical cancellation event/replay identity.
+        return None
     position_ticket = record.get("position_id") or record.get("position_ticket")
     ticket = position_ticket or record.get("order_id") or record.get("ticket")
     ticket_text = str(ticket)
@@ -42,6 +73,11 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
         "volume": record.get("volume"),
         "event_time": record.get("time"),
     }
+    source_event_id = _stable_mql5_source_event_id(record.get("event_id"))
+    if source_event_id is not None:
+        # The EA identity is derived from immutable broker fields (deal/order ticket and
+        # timestamp), so it remains stable when an overlap replay observes a newer snapshot.
+        base["source_event_id"] = source_event_id
     if event_type == "DEAL_ADD":
         entry = str(record.get("entry", "")).upper()
         if entry == "IN":
@@ -138,7 +174,7 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
             "stop_loss": record.get("stop_loss"),
             "take_profit": record.get("take_profit"),
         }
-    if event_type in ("ORDER" + "_DELETE", "HISTORY_ADD"):
+    if event_type == "HISTORY_ADD":
         return {
             **base,
             "event_type": "pending_order_cancelled",
@@ -158,9 +194,11 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
 def _merge_event_stream_with_snapshot(
     records: tuple[dict, ...], previous: dict, current: dict
 ) -> list[dict]:
-    stream_events = [
-        _mql5_file_event(record, previous, current) for record in records
-    ]
+    stream_events = []
+    for record in records:
+        event = _mql5_file_event(record, previous, current)
+        if event is not None:
+            stream_events.append(event)
     reconciliation = detect_windows_events(previous, current)
     covered = {
         (str(event.get("event_type")), str(event.get("ticket")))

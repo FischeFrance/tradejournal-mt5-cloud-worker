@@ -107,6 +107,27 @@ def test_new_only_defers_account_reads_until_after_on_init():
     )
 
 
+def test_new_only_restart_recovers_only_a_bounded_downtime_gap():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    assert "NEW_ONLY_RECOVERY_MAX_SECONDS = 21600" in text
+    assert "g_new_only_recovery_pending = g_new_only && g_history_from > 0" in text
+    assert "(long)TimeGMT() - (long)g_history_from" in text
+    assert "HistorySelect(from_time, to_time)" in text
+    assert "ulong deal_tickets[]" in text
+    assert "ulong order_tickets[]" in text
+    assert "state != ORDER_STATE_CANCELED" in text
+    assert "EmitDealAddEvent(ticket)" in text
+    assert "!all_events_written || !SaveCursorState()" in text
+    assert (
+        'IntegerToString(timestamp_msc) + "|" + IntegerToString(g_event_seq)'
+        not in text
+    )
+    assert 'FileDelete(BASE_DIR + "\\\\history_from_unix")' in text
+    assert "g_new_only_recovery_pending && !RunNewOnlyRecovery()" in text
+
+
 def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     text = (MT5_EXPERTS_DIR / "TradeJournalLoader.mq5").read_text(encoding="utf-8")
     assert "void OnStart()" in text

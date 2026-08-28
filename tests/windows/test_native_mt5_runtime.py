@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
 import pytest
@@ -97,8 +100,9 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         patch.object(
             runtime, "_probe_broker_symbol", return_value="EURUSD.raw"
         ) as probe_symbol,
-        patch.object(runtime, "_wait_for_heartbeat", return_value=expected),
-        patch.object(runtime, "stop", return_value=True) as stop,
+            patch.object(runtime, "_wait_for_heartbeat", return_value=expected),
+            patch.object(runtime, "_running_terminal_pids", return_value=[]),
+            patch.object(runtime, "stop", return_value=True) as stop,
     ):
         result = runtime.start(
             login=42,
@@ -186,12 +190,13 @@ def test_start_hands_discovery_chart_directly_to_bridge(tmp_path: Path) -> None:
         patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
         patch.object(runtime, "_remove_readiness_files") as remove_readiness,
         patch.object(runtime, "_publish_bridge_handoff") as publish_handoff,
-        patch.object(
-            runtime,
-            "_wait_for_heartbeat",
-            side_effect=NativeMt5Error("terminal_not_ready"),
-        ) as wait_for_heartbeat,
-        patch.object(runtime, "stop", return_value=True) as stop,
+            patch.object(
+                runtime,
+                "_wait_for_heartbeat",
+                side_effect=NativeMt5Error("terminal_not_ready"),
+            ) as wait_for_heartbeat,
+            patch.object(runtime, "_running_terminal_pids", return_value=[]),
+            patch.object(runtime, "stop", return_value=True) as stop,
     ):
         with pytest.raises(NativeMt5Error, match="terminal_not_ready"):
             runtime.start(
@@ -226,6 +231,106 @@ def test_start_process_uses_portable_config(tmp_path: Path) -> None:
     assert any(value.startswith("/config:") for value in args)
 
 
+def test_scheduled_terminal_task_revalidates_identity_before_create_and_run(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "startup.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+    completed = Mock(returncode=0)
+    with (
+        patch.object(
+            runtime,
+            "_interactive_user",
+            return_value="TradeJournalMT5",
+        ),
+        patch.object(runtime, "_wait_for_interactive_session"),
+        patch.object(runtime, "_prepare_interactive_runtime_acl"),
+        patch.object(runtime, "_grant_interactive_acl"),
+        patch.object(
+            runtime,
+            "_verify_interactive_task_identity",
+        ) as identity_gate,
+        patch("subprocess.run", return_value=completed) as run,
+    ):
+        assert runtime._start_process(config, 42) is None
+
+    assert identity_gate.call_args_list == [
+        call("TradeJournalMT5"),
+        call("TradeJournalMT5"),
+    ]
+    assert run.call_args_list[0].args[0][:2] == ["schtasks", "/Create"]
+    assert run.call_args_list[1].args[0][:2] == ["schtasks", "/Run"]
+
+
+def test_scheduled_terminal_task_is_deleted_when_second_identity_gate_fails(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "startup.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+    completed = Mock(returncode=0)
+    with (
+        patch.object(runtime, "_interactive_user", return_value="TradeJournalMT5"),
+        patch.object(runtime, "_wait_for_interactive_session"),
+        patch.object(runtime, "_prepare_interactive_runtime_acl"),
+        patch.object(runtime, "_grant_interactive_acl"),
+        patch.object(
+            runtime,
+            "_verify_interactive_task_identity",
+            side_effect=(None, NativeMt5Error("interactive_session_token_not_standard")),
+        ),
+        patch("subprocess.run", return_value=completed) as run,
+    ):
+        with pytest.raises(
+            NativeMt5Error,
+            match="interactive_session_token_not_standard",
+        ):
+            runtime._start_process(config, 42)
+
+    assert [item.args[0][1] for item in run.call_args_list] == [
+        "/Create",
+        "/End",
+        "/Delete",
+    ]
+    assert runtime._interactive_task is None
+
+
+def test_scheduled_terminal_task_is_deleted_when_run_fails(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "startup.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+    with (
+        patch.object(runtime, "_interactive_user", return_value="TradeJournalMT5"),
+        patch.object(runtime, "_wait_for_interactive_session"),
+        patch.object(runtime, "_prepare_interactive_runtime_acl"),
+        patch.object(runtime, "_grant_interactive_acl"),
+        patch.object(runtime, "_verify_interactive_task_identity"),
+        patch(
+            "subprocess.run",
+            side_effect=(
+                Mock(returncode=0),
+                Mock(returncode=1),
+                Mock(returncode=0),
+                Mock(returncode=0),
+            ),
+        ) as run,
+    ):
+        with pytest.raises(NativeMt5Error, match="interactive_task_run_failed"):
+            runtime._start_process(config, 42)
+
+    assert [item.args[0][1] for item in run.call_args_list] == [
+        "/Create",
+        "/Run",
+        "/End",
+        "/Delete",
+    ]
+    assert runtime._interactive_task is None
+
+
 def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
@@ -245,6 +350,20 @@ def test_install_expert_persists_from_date_as_unix_timestamp(tmp_path: Path) -> 
     assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "from_date"
     assert (runtime.files / "history_from_unix").read_text(encoding="utf-8") == str(
         int(history_from.timestamp())
+    )
+
+
+def test_install_expert_persists_new_only_recovery_cutoff(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    recovery_from = datetime(2026, 8, 27, 21, 29, 30, tzinfo=timezone.utc)
+
+    runtime.install_expert(expert, "new_only", recovery_from)
+
+    assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "new_only"
+    assert (runtime.files / "history_from_unix").read_text(encoding="utf-8") == str(
+        int(recovery_from.timestamp())
     )
 
 
@@ -302,7 +421,7 @@ def test_startup_config_allows_configured_interactive_user_to_read(
         NativeMt5Runtime,
         "_setting",
         staticmethod(
-            lambda name: "TradeJournalAgent"
+            lambda name: "TradeJournalMT5"
             if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
             else ""
         ),
@@ -321,11 +440,175 @@ def test_startup_config_allows_configured_interactive_user_to_read(
 
     assert restricted == [config]
     run.assert_called_once_with(
-        ["icacls", str(config), "/grant", "TradeJournalAgent:(R)"],
+        ["icacls", str(config), "/grant", "TradeJournalMT5:(R)"],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def test_runtime_rejects_generic_operator_as_interactive_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(
+        NativeMt5Runtime,
+        "_setting",
+        staticmethod(
+            lambda name: "Alice"
+            if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
+            else ""
+        ),
+    )
+
+    with pytest.raises(
+        NativeMt5Error,
+        match="interactive_user_not_dedicated",
+    ):
+        runtime._interactive_user()
+
+
+def test_windows_identity_gate_rejects_disabled_or_admin_local_user() -> None:
+    for document in (
+        '{"Name":"TradeJournalMT5","Enabled":false,'
+        '"SID":"S-1-5-21-1","IsAdministrator":false,'
+        '"ConsentPromptBehaviorUser":0}',
+        '{"Name":"TradeJournalMT5","Enabled":true,'
+        '"SID":"S-1-5-21-1","IsAdministrator":true,'
+        '"ConsentPromptBehaviorUser":0}',
+    ):
+        completed = Mock(returncode=0, stdout=document)
+        with (
+            patch("subprocess.run", return_value=completed),
+            pytest.raises(
+                NativeMt5Error,
+                match="interactive_user_not_dedicated",
+            ),
+        ):
+            NativeMt5Runtime._verify_local_standard_interactive_user(
+                "TradeJournalMT5"
+            )
+
+
+@pytest.mark.parametrize(
+    ("elevation_type", "token_groups", "accepted"),
+    (
+        (1, (("users", 4),), True),
+        (3, (("users", 4),), False),
+        # A stale full Administrator token can report Default when UAC is
+        # disabled. Deny-only membership is also forbidden, so attributes are
+        # deliberately ignored by the verifier.
+        (1, (("administrators", 0x10),), False),
+    ),
+)
+def test_interactive_session_requires_a_fresh_standard_user_token(
+    elevation_type: int,
+    token_groups: tuple[tuple[str, int], ...],
+    accepted: bool,
+) -> None:
+    token = Mock()
+    win32ts = SimpleNamespace(
+        WTSActive=0,
+        WTSDisconnected=4,
+        WTSUserName=5,
+        WTSEnumerateSessions=Mock(
+            return_value=[{"State": 0, "SessionId": 2}]
+        ),
+        WTSQuerySessionInformation=Mock(return_value="TradeJournalMT5"),
+        WTSQueryUserToken=Mock(return_value=token),
+    )
+    win32security = SimpleNamespace(
+        TokenGroups=2,
+        TokenUser=1,
+        WinBuiltinAdministratorsSid=26,
+        GetTokenInformation=Mock(
+            side_effect=lambda _token, information_class: (
+                elevation_type
+                if information_class == 18
+                else token_groups
+            )
+        ),
+        CreateWellKnownSid=Mock(return_value="administrators"),
+        EqualSid=Mock(side_effect=lambda left, right: left == right),
+    )
+
+    with (
+        patch.dict(
+            sys.modules,
+            {"win32ts": win32ts, "win32security": win32security},
+        ),
+        patch(
+            "windows_agent.interactive_identity.os",
+            SimpleNamespace(name="nt", environ=os.environ),
+        ),
+    ):
+        if accepted:
+            assert NativeMt5Runtime._interactive_session_present(
+                "TradeJournalMT5"
+            )
+        else:
+            with pytest.raises(
+                NativeMt5Error,
+                match="interactive_session_token_not_standard",
+            ):
+                NativeMt5Runtime._interactive_session_present(
+                    "TradeJournalMT5"
+                )
+
+    assert win32security.GetTokenInformation.call_args_list == [
+        call(token, 18),
+        call(token, 2),
+    ]
+    token.Close.assert_called_once_with()
+
+
+def test_windows_identity_gate_accepts_uac_auto_deny_policy() -> None:
+    completed = Mock(
+        returncode=0,
+        stdout=(
+            '{"Name":"TradeJournalMT5","Enabled":true,'
+            '"SID":"S-1-5-21-1","IsAdministrator":false,'
+            '"ConsentPromptBehaviorUser":0}'
+        ),
+    )
+    with patch("subprocess.run", return_value=completed) as run:
+        NativeMt5Runtime._verify_local_standard_interactive_user(
+            "TradeJournalMT5"
+        )
+
+    assert (
+        "ConsentPromptBehaviorUser"
+        in run.call_args.args[0][-1]
+    )
+
+
+@pytest.mark.parametrize("policy", [1, 3, 5, None, False])
+def test_windows_identity_gate_rejects_non_auto_deny_uac_policy(
+    policy: int | bool | None,
+) -> None:
+    completed = Mock(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "Name": "TradeJournalMT5",
+                "Enabled": True,
+                "SID": "S-1-5-21-1",
+                "IsAdministrator": False,
+                "ConsentPromptBehaviorUser": policy,
+            }
+        ),
+    )
+    with (
+        patch("subprocess.run", return_value=completed),
+        pytest.raises(
+            NativeMt5Error,
+            match="interactive_user_uac_policy_not_auto_deny",
+        ),
+    ):
+        NativeMt5Runtime._verify_local_standard_interactive_user(
+            "TradeJournalMT5"
+        )
 
 
 def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> None:
@@ -361,6 +644,7 @@ def test_wait_for_authorization_fails_immediately_when_dialog_monitor_detects_re
     )
     with (
         patch.object(runtime, "_authentication_failure_detected", return_value=True),
+        patch.object(runtime, "_running_terminal_pids", return_value=[]),
         pytest.raises(NativeMt5Error, match="authorization_failed"),
     ):
         runtime._wait_for_authorization(
@@ -457,9 +741,10 @@ def test_identity_and_readonly_guards(
         ),
         patch.object(runtime, "_wait_for_account_database"),
         patch.object(runtime, "_wait_for_discovery_start", return_value=True),
-        patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
-        patch.object(runtime, "_remove_readiness_files"),
-        patch.object(runtime, "stop", return_value=True),
+            patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
+            patch.object(runtime, "_remove_readiness_files"),
+            patch.object(runtime, "_running_terminal_pids", return_value=[]),
+            patch.object(runtime, "stop", return_value=True),
     ):
         with pytest.raises(NativeMt5Error, match=code):
             runtime.start(
@@ -480,3 +765,58 @@ def test_crashed_process_is_reported(tmp_path: Path) -> None:
     with patch.object(runtime, "_running_terminal_pids", return_value=[]):
         with pytest.raises(NativeMt5Error, match="mt5_process_crashed"):
             runtime._wait_for_heartbeat(1.0, 42, "Demo")
+
+
+def test_readiness_cleanup_fails_closed_when_stale_file_cannot_be_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    stale = runtime.files / "heartbeat.json"
+    stale.write_text(
+        _envelope({"terminal_connected": True}),
+        encoding="utf-8",
+    )
+    original_unlink = Path.unlink
+
+    def guarded_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == stale:
+            raise PermissionError("fixture locked file")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+
+    with pytest.raises(NativeMt5Error, match="^readiness_cleanup_failed$"):
+        runtime._remove_readiness_files()
+
+    assert stale.is_file()
+
+
+def test_heartbeat_from_before_current_launch_is_rejected(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "account.json").write_text(
+        _envelope(
+            {
+                "login": "42",
+                "server": "Demo",
+                "trade_allowed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime.files / "heartbeat.json").write_text(
+        _envelope({"terminal_connected": True}),
+        encoding="utf-8",
+    )
+    runtime._readiness_not_before = datetime.now(timezone.utc)
+
+    with (
+        patch.object(runtime, "_running_terminal_pids", return_value=[123]),
+        patch("windows_agent.worker.native_mt5_runtime.time.sleep"),
+        pytest.raises(NativeMt5Error, match="^terminal_not_ready$"),
+    ):
+        runtime._wait_for_heartbeat(0.01, 42, "Demo")

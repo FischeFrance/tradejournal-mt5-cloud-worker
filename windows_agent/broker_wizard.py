@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import UUID, uuid4
 
+from .interactive_identity import (
+    DEDICATED_INTERACTIVE_USER,
+    InteractiveIdentityError,
+    verify_interactive_task_identity,
+)
 from .provisioning.process_manager import ProcessManager
 from .state_store import atomic_json
 
@@ -439,13 +444,10 @@ class HiddenSessionBrokerWizard:
     ) -> None:
         if not _SAFE_USER.fullmatch(interactive_user):
             raise BrokerWizardError("interactive user is invalid")
-        if interactive_user.casefold() in {
-            "administrator",
-            "system",
-            "localsystem",
-            "localservice",
-            "networkservice",
-        }:
+        if (
+            interactive_user.casefold()
+            != DEDICATED_INTERACTIVE_USER.casefold()
+        ):
             raise BrokerWizardError("interactive user must be dedicated")
         if not 30 <= timeout_seconds <= 300:
             raise BrokerWizardError("wizard timeout is invalid")
@@ -557,6 +559,12 @@ class HiddenSessionBrokerWizard:
                 self._interactive_user,
                 "(OI)(CI)(RX)",
             )
+            try:
+                verify_interactive_task_identity(self._interactive_user)
+            except InteractiveIdentityError as exc:
+                raise BrokerWizardError(
+                    "wizard interactive identity is unavailable"
+                ) from exc
             create = subprocess.run(
                 [
                     "schtasks",
@@ -583,6 +591,12 @@ class HiddenSessionBrokerWizard:
             if create.returncode != 0:
                 raise BrokerWizardError("wizard task creation failed")
             task_created = True
+            try:
+                verify_interactive_task_identity(self._interactive_user)
+            except InteractiveIdentityError as exc:
+                raise BrokerWizardError(
+                    "wizard interactive identity is unavailable"
+                ) from exc
             start = subprocess.run(
                 ["schtasks", "/Run", "/TN", task_name],
                 capture_output=True,

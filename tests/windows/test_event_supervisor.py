@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
+import windows_agent.event_supervisor as event_supervisor
 from windows_agent.event_supervisor import Mt5EventSupervisor
 
 
@@ -104,3 +108,48 @@ def test_failed_transition_is_not_resent_on_every_local_heartbeat(tmp_path):
 
     assert len(sink.transitions) == 1
     assert sink.flushes == 1
+
+
+def test_run_fails_fast_when_observer_dies_after_readiness(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    class DyingObserver:
+        def __init__(self):
+            self.alive_checks = 0
+            self.stopped = False
+            self.joined = False
+
+        @staticmethod
+        def schedule(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def start():
+            return None
+
+        def is_alive(self):
+            self.alive_checks += 1
+            return self.alive_checks == 1
+
+        def stop(self):
+            self.stopped = True
+
+        def join(self, timeout):
+            assert timeout == 5
+            self.joined = True
+
+    observer = DyingObserver()
+    monkeypatch.setattr(event_supervisor, "Observer", lambda: observer)
+    supervisor = Mt5EventSupervisor(
+        tmp_path / "instances",
+        tmp_path / "secrets",
+        "https://example.invalid",
+    )
+    ready_event = threading.Event()
+
+    with pytest.raises(RuntimeError, match="observer stopped unexpectedly"):
+        supervisor.run(threading.Event(), ready_event)
+
+    assert ready_event.is_set()
+    assert observer.stopped is True
+    assert observer.joined is True

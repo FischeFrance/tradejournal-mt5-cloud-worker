@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -17,6 +19,7 @@ from windows_agent.agent_errors import DeprovisionFailed
 from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
+from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.real_handlers import build_real_handlers
 from windows_agent.state_store import read_json
@@ -60,6 +63,21 @@ class FakeApi:
         self.lease_lost_at = lease_lost_at
         self.heartbeat_calls = 0
         self.transitions: list[tuple[str, dict | None]] = []
+        self.progress_calls: list[tuple[str, str, str | None]] = []
+        self.history_uploads: list[bytes] = []
+        self._history_expected: dict[str, int] = {}
+        self._history_imported: dict[str, dict[str, int | bool | str]] = {}
+
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict:
+        self.progress_calls.append((event_code, event_status, detail_code))
+        return {"event_recorded": True}
 
     def heartbeat(self, job_id: str, lease_id: str) -> dict:
         self.heartbeat_calls += 1
@@ -70,6 +88,53 @@ class FakeApi:
     def transition(self, job_id: str, lease_id: str, status: str, result: dict | None = None) -> dict:
         self.transitions.append((status, result))
         return {}
+
+    def history_file_prepare(
+        self,
+        job_id: str,
+        _lease_id: str,
+        **metadata: int | str,
+    ) -> dict:
+        imported = self._history_imported.get(job_id)
+        if imported is not None:
+            return {
+                "api_version": "1",
+                "already_imported": True,
+                "object_path": "unused",
+                "upload_url": None,
+                "expires_in": 0,
+                **imported,
+            }
+        self._history_expected[job_id] = int(metadata["event_count"])
+        return {
+            "api_version": "1",
+            "already_imported": False,
+            "object_path": f"history/{job_id}.json.gz",
+            "upload_url": f"https://upload.invalid/{job_id}",
+            "expires_in": 7200,
+            "accepted": 0,
+            "inserted": 0,
+            "duplicates": 0,
+        }
+
+    def upload_history_file(self, _url: str, payload: bytes) -> None:
+        self.history_uploads.append(payload)
+
+    def history_file_import(
+        self,
+        job_id: str,
+        _lease_id: str,
+        expected_count: int,
+    ) -> dict:
+        assert expected_count == self._history_expected[job_id]
+        result: dict[str, int | bool | str] = {
+            "accepted": expected_count,
+            "inserted": expected_count,
+            "duplicates": 0,
+            "object_deleted": True,
+        }
+        self._history_imported[job_id] = result
+        return {"api_version": "1", **result}
 
 
 class ScriptedAdapter:
@@ -135,7 +200,27 @@ class FakeProcessManager:
 
 
 @pytest.fixture()
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda _terminal: []),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_protect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_unprotect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda _path: None),
+    )
     instances_root = tmp_path / "instances"
     secrets_root = tmp_path / "secrets"
     source_terminal = tmp_path / "golden" / "terminal64.exe"
@@ -156,6 +241,10 @@ def _handlers(env, api, *, script: dict | None = None):
         source_terminal=env.source_terminal,
         adapter_factory=adapter_factory,
         process_factory=FakeProcessManager,
+        broker_identity_resolver=lambda _server: SimpleNamespace(
+            broker_label="Fixture Broker",
+            search_text="Fixture Broker",
+        ),
     )
 
 
@@ -203,16 +292,20 @@ def test_provision_is_idempotent_on_retry(env):
     assert result["live_sync_started"] is True
 
 
-def test_provision_repairs_existing_layout_without_terminal(env):
+def test_provision_rejects_ambiguous_existing_layout_without_terminal(env):
     cid = str(uuid4())
     root = InstanceLayout(env.instances_root, cid).create()
     (root / "state" / "stale-state.json").write_text("{}", encoding="utf-8")
     handlers = _handlers(env, FakeApi())
 
-    result = handlers["provision"](_job("provision", cid, payload=_provision_payload()))
+    with pytest.raises(Exception) as exc_info:
+        handlers["provision"](
+            _job("provision", cid, payload=_provision_payload())
+        )
 
-    assert result["live_sync_started"] is True
-    assert (root / "terminal" / "terminal64.exe").read_bytes() == b"stub"
+    assert exc_info.value.error_code == "instance_provision_failed"
+    assert (root / "state" / "stale-state.json").is_file()
+    assert not (env.secrets_root / cid).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +491,134 @@ def test_live_sync_start_failure_is_live_sync_failed(env, monkeypatch):
     assert exc_info.value.error_code == "live_sync_failed"
 
 
+def test_stopped_live_sync_repins_deployed_bridge_before_resume(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_protect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "_crypt_unprotect",
+        staticmethod(lambda value: value),
+    )
+    monkeypatch.setattr(
+        WindowsSecretStore,
+        "restrict_acl",
+        staticmethod(lambda _path: None),
+    )
+    env = SimpleNamespace(
+        instances_root=tmp_path / "instances",
+        secrets_root=tmp_path / "secrets",
+        source_terminal=tmp_path / "golden" / "terminal64.exe",
+    )
+    env.source_terminal.parent.mkdir(parents=True)
+    env.source_terminal.write_bytes(b"stub")
+    cid = str(uuid4())
+    root = InstanceProvisioner(
+        env.instances_root,
+        env.secrets_root,
+    ).provision(cid, env.source_terminal)
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_login", "12345")
+    store.write(cid, "mt5_server", "Demo-Server")
+    store.write(cid, "bridge_token", "bridge-token")
+    expert = env.instances_root.parent / "TradeJournalBridge.ex5"
+    expert.write_bytes(b"bridge-v2")
+    expert_sha256 = hashlib.sha256(expert.read_bytes()).hexdigest()
+    events: list[str] = []
+
+    def validate_assets(_self, connection_id: str) -> str:
+        assert connection_id == cid
+        events.append("validate")
+        return "a" * 64
+
+    def record_assets(
+        _cls,
+        instance_root,
+        connection_id: str,
+        digest: str,
+    ) -> str:
+        assert instance_root == root
+        assert connection_id == cid
+        assert digest == expert_sha256
+        events.append("record")
+        return "b" * 64
+
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "validate_runtime_assets",
+        validate_assets,
+    )
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "record_verified_managed_asset_update",
+        classmethod(record_assets),
+    )
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda _terminal: []),
+    )
+
+    class Runtime:
+        def install_expert(self, *_args: object) -> None:
+            events.append("install")
+
+        def resume(self, **_kwargs: object) -> None:
+            events.append("resume")
+
+    class Adapter:
+        @staticmethod
+        def account_info():
+            return SimpleNamespace(trade_allowed=False)
+
+        @staticmethod
+        def terminal_info():
+            return SimpleNamespace(connected=True)
+
+    class Sink:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        @staticmethod
+        def send_heartbeat(_account: object) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        real_handlers,
+        "Mql5FileMt5Adapter",
+        lambda *_args: Adapter(),
+    )
+    monkeypatch.setattr(real_handlers, "TradingIngestionSink", Sink)
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_live_sync_once",
+        lambda *_args: 0,
+    )
+    api = FakeApi()
+    api.progress = lambda *_args: {"event_recorded": True}  # type: ignore[attr-defined]
+    handlers = build_real_handlers(
+        api,
+        instances_root=env.instances_root,
+        secrets_root=env.secrets_root,
+        source_terminal=env.source_terminal,
+        process_factory=FakeProcessManager,
+        expert_binary=expert,
+        expert_sha256=expert_sha256,
+        runtime_factory=lambda *_args: Runtime(),
+        trading_ingestion_url="https://agent.example/trading-mt5-events",
+    )
+
+    result = handlers["live_sync"](_job("live_sync", cid))
+
+    assert result == {"live_sync_events_delivered": 0}
+    assert events == ["validate", "install", "record", "resume", "validate"]
+
+
 # ---------------------------------------------------------------------------
 # Historical sync
 # ---------------------------------------------------------------------------
@@ -425,16 +646,30 @@ def test_historical_sync_reuses_dpapi_credentials_and_imports_records(env):
     )
     assert result["imported_orders"] == 1
     assert result["imported_deals"] == 1
-    root = InstanceLayout(env.instances_root, cid).path
-    lines = (root / "data" / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
+    assert len(api.history_uploads) == 1
+    archive = json.loads(gzip.decompress(api.history_uploads[0]))
+    assert archive["connection_id"] == cid
+    assert archive["account_number"] == "12345"
+    assert archive["server"] == "Demo-Server"
 
 
 def test_historical_sync_dedups_across_repeated_runs(env):
     cid = str(uuid4())
     api = FakeApi()
     moment = int(datetime(2026, 7, 10, tzinfo=timezone.utc).timestamp())
-    deal = {"ticket": 9, "position_id": 1, "symbol": "EURUSD", "volume": 0.1, "price": 1.2, "profit": 5, "commission": -1, "swap": 0, "time": moment}
+    deal = {
+        "ticket": 9,
+        "position_id": 1,
+        "symbol": "EURUSD",
+        "entry": "IN",
+        "direction": "buy",
+        "volume": 0.1,
+        "price": 1.2,
+        "profit": 5,
+        "commission": -1,
+        "swap": 0,
+        "time": moment,
+    }
     handlers = _handlers(env, api, script={"history_deals": (deal,)})
     handlers["provision"](_job("provision", cid, payload=_provision_payload()))
     root = InstanceLayout(env.instances_root, cid).path
@@ -445,8 +680,8 @@ def test_historical_sync_dedups_across_repeated_runs(env):
     handlers["historical_sync"](
         _job("historical_sync", cid, history_mode="from_date", from_date="2026-07-01T00:00:00Z")
     )
-    lines = (root / "data" / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 1
+    assert len(api.history_uploads) == 1
+    assert api._history_imported["job-historical_sync"]["inserted"] == 1
 
 
 def test_historical_sync_invalid_history_mode_rejected(env):
@@ -474,7 +709,12 @@ def test_deprovision_is_idempotent(env):
     result_2 = handlers["deprovision"](_job("deprovision", cid))
     assert result_1 == {"deprovisioned": True}
     assert result_2 == {"deprovisioned": True}
-    assert not root.exists()
+    assert root.exists()
+    assert read_json(root / "state" / "instance.json") == {
+        "connection_id": cid,
+        "status": "deprovisioned",
+    }
+    assert not (root / "terminal").exists()
     assert not (env.secrets_root / cid).exists()
     store = WindowsSecretStore(env.secrets_root)
     with pytest.raises(Exception):
@@ -494,7 +734,9 @@ def test_deprovision_only_touches_its_own_connection(env):
     handlers["provision"](_job("provision", cid_a, payload=_provision_payload()))
     handlers["provision"](_job("provision", cid_b, payload=_provision_payload(login=999, server="Other")))
     handlers["deprovision"](_job("deprovision", cid_a))
-    assert not InstanceLayout(env.instances_root, cid_a).path.exists()
+    root_a = InstanceLayout(env.instances_root, cid_a).path
+    assert read_json(root_a / "state" / "instance.json")["status"] == "deprovisioned"
+    assert not (root_a / "terminal").exists()
     root_b = InstanceLayout(env.instances_root, cid_b).path
     assert (root_b / "terminal" / "terminal64.exe").exists()
     assert WindowsSecretStore(env.secrets_root).read(cid_b, "mt5_login") == "999"
