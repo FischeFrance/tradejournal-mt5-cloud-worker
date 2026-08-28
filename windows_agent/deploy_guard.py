@@ -29,6 +29,7 @@ from uuid import UUID
 from worker.atomic_file import durable_replace, fsync_directory
 
 from .interactive_identity import (
+    _windows_sids_equal,
     verify_interactive_process_identity,
     verify_interactive_task_identity,
 )
@@ -298,7 +299,7 @@ def _assert_local_system() -> None:
         expected = win32security.CreateWellKnownSid(
             win32security.WinLocalSystemSid, None
         )
-        if not win32security.EqualSid(observed, expected):
+        if not _windows_sids_equal(win32security, observed, expected):
             raise DeployGuardError("local_system_required")
     except DeployGuardError:
         raise
@@ -339,11 +340,17 @@ def _assert_request_acl(path: Path) -> None:
                 win32security.ACCESS_ALLOWED_ACE_TYPE,
                 win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
             ):
-                if not any(win32security.EqualSid(sid, item) for item in allowed_sids):
+                if not any(
+                    _windows_sids_equal(win32security, sid, item)
+                    for item in allowed_sids
+                ):
                     raise DeployGuardError("request_acl_invalid")
                 observed_allowed.append(sid)
         if not all(
-            any(win32security.EqualSid(sid, expected) for sid in observed_allowed)
+            any(
+                _windows_sids_equal(win32security, sid, expected)
+                for sid in observed_allowed
+            )
             for expected in allowed_sids
         ):
             raise DeployGuardError("request_acl_invalid")

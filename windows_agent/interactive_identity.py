@@ -40,6 +40,16 @@ class VerifiedInteractiveSession:
     session_id: int
 
 
+def _windows_sids_equal(win32security: Any, left: Any, right: Any) -> bool:
+    """Compare canonical SID strings using the API exposed by pywin32 311."""
+
+    left_value = win32security.ConvertSidToStringSid(left)
+    right_value = win32security.ConvertSidToStringSid(right)
+    if not isinstance(left_value, str) or not isinstance(right_value, str):
+        raise TypeError("Windows SID conversion failed")
+    return left_value.casefold() == right_value.casefold()
+
+
 def verify_local_standard_interactive_user(
     interactive_user: str,
 ) -> LocalInteractiveIdentity:
@@ -122,7 +132,7 @@ def _token_contains_sid(
             raise TypeError("token group is invalid")
         # Inspect every group regardless of attributes. In particular,
         # SE_GROUP_USE_FOR_DENY_ONLY still proves this is a linked admin token.
-        if win32security.EqualSid(group[0], expected_sid):
+        if _windows_sids_equal(win32security, group[0], expected_sid):
             return True
     return False
 
@@ -195,7 +205,11 @@ def _verified_interactive_session_id(
                 )
                 or (
                     expected_user_sid is not None
-                    and not win32security.EqualSid(token_user, expected_sid)
+                    and not _windows_sids_equal(
+                        win32security,
+                        token_user,
+                        expected_sid,
+                    )
                 )
             ):
                 raise InteractiveIdentityError(
@@ -282,7 +296,11 @@ def verify_interactive_process_identity(
                     None,
                 )
                 if (
-                    not win32security.EqualSid(token_user, expected_sid)
+                    not _windows_sids_equal(
+                        win32security,
+                        token_user,
+                        expected_sid,
+                    )
                     or int(elevation_type) != 1
                     or _token_contains_sid(
                         win32security,

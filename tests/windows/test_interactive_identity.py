@@ -58,7 +58,7 @@ def _wts_modules(
         ),
         CreateWellKnownSid=Mock(return_value="administrators"),
         ConvertStringSidToSid=Mock(return_value="local-user"),
-        EqualSid=Mock(side_effect=lambda left, right: left == right),
+        ConvertSidToStringSid=Mock(side_effect=str),
     )
     return win32ts, win32security, token
 
@@ -110,10 +110,10 @@ def test_task_gate_accepts_only_the_exact_local_standard_user_token() -> None:
     ):
         verify_interactive_task_identity("TradeJournalMT5")
 
-    assert win32security.EqualSid.call_args_list[-1] == call(
-        "local-user",
-        "local-user",
-    )
+    assert win32security.ConvertSidToStringSid.call_args_list[-2:] == [
+        call("local-user"),
+        call("local-user"),
+    ]
     token.Close.assert_called_once_with()
 
 

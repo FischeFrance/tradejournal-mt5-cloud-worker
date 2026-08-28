@@ -541,7 +541,7 @@ def test_interactive_session_requires_a_fresh_standard_user_token(
             )
         ),
         CreateWellKnownSid=Mock(return_value="administrators"),
-        EqualSid=Mock(side_effect=lambda left, right: left == right),
+        ConvertSidToStringSid=Mock(side_effect=str),
     )
 
     with (
