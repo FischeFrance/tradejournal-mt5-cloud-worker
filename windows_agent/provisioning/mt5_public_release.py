@@ -47,6 +47,7 @@ MAX_DOWNLOAD_REDIRECTS = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120.0
 INSTALL_TIMEOUT_SECONDS = 300.0
 PROCESS_QUIESCENCE_TIMEOUT_SECONDS = 30.0
+PUBLIC_SHORTCUT_MAX_BYTES = 1024 * 1024
 
 _SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -82,6 +83,10 @@ _MANAGED_RUNTIME_PATHS = frozenset(
         "MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5",
         "MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5",
     }
+)
+_PUBLIC_MT5_SHORTCUTS = (
+    "MetaTrader 5.lnk",
+    "MetaEditor 5.lnk",
 )
 
 
@@ -630,6 +635,7 @@ class Mt5PublicReleaseProbe:
         installer_runner: Callable[[Path, Path, float], int] = _run_installer,
         process_guard: ProcessGuard | None = None,
         acl_restrictor: Callable[[Path], None] = _restrict_shared_acl,
+        public_desktop: Path | None = None,
         install_timeout: float = INSTALL_TIMEOUT_SECONDS,
         process_timeout: float = PROCESS_QUIESCENCE_TIMEOUT_SECONDS,
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
@@ -645,9 +651,101 @@ class Mt5PublicReleaseProbe:
         self.installer_runner = installer_runner
         self.process_guard = process_guard or PsutilMt5ProcessGuard()
         self.acl_restrictor = acl_restrictor
+        self.public_desktop = (
+            _absolute_without_resolving(public_desktop)
+            if public_desktop is not None
+            else self._default_public_desktop()
+        )
         self.install_timeout = install_timeout
         self.process_timeout = process_timeout
         self.clock_ms = clock_ms
+
+    @staticmethod
+    def _default_public_desktop() -> Path | None:
+        if os.name != "nt":
+            return None
+        public_root = os.environ.get("PUBLIC", r"C:\Users\Public")
+        return _absolute_without_resolving(Path(public_root) / "Desktop")
+
+    def _is_probe_staging_shortcut(self, payload: bytes) -> bool:
+        state_root = str(self.state_root).casefold()
+        for encoding in ("utf-8", "utf-16-le"):
+            decoded = payload.decode(encoding, errors="ignore").casefold()
+            if state_root in decoded and ".public-mt5-" in decoded:
+                return True
+        return False
+
+    def _snapshot_public_shortcuts(self) -> dict[str, bytes | None] | None:
+        desktop = self.public_desktop
+        if desktop is None:
+            return None
+        if desktop.exists() and (
+            InstanceProvisioner._is_reparse_point(desktop) or not desktop.is_dir()
+        ):
+            raise Mt5PublicReleaseError("Windows public desktop is unsafe")
+        snapshot: dict[str, bytes | None] = {}
+        for name in _PUBLIC_MT5_SHORTCUTS:
+            shortcut = desktop / name
+            if not shortcut.exists():
+                snapshot[name] = None
+                continue
+            if (
+                InstanceProvisioner._is_reparse_point(shortcut)
+                or not shortcut.is_file()
+                or shortcut.stat().st_size > PUBLIC_SHORTCUT_MAX_BYTES
+            ):
+                raise Mt5PublicReleaseError("Windows public MT5 shortcut is unsafe")
+            try:
+                payload = shortcut.read_bytes()
+            except OSError as exc:
+                raise Mt5PublicReleaseError(
+                    "Windows public MT5 shortcut could not be inspected"
+                ) from exc
+            # A shortcut left by an older probe is not user state.  Treat it
+            # as absent so this run removes it instead of preserving a link to
+            # an already deleted staging distribution.
+            snapshot[name] = (
+                None if self._is_probe_staging_shortcut(payload) else payload
+            )
+        return snapshot
+
+    def _restore_public_shortcuts(
+        self,
+        snapshot: dict[str, bytes | None] | None,
+    ) -> None:
+        if snapshot is None:
+            return
+        desktop = self.public_desktop
+        if desktop is None or set(snapshot) != set(_PUBLIC_MT5_SHORTCUTS):
+            raise Mt5PublicReleaseError("Windows public MT5 shortcut state is invalid")
+        if not desktop.is_dir() or InstanceProvisioner._is_reparse_point(desktop):
+            raise Mt5PublicReleaseError("Windows public desktop is unsafe")
+        for name in _PUBLIC_MT5_SHORTCUTS:
+            shortcut = desktop / name
+            if shortcut.exists() and (
+                InstanceProvisioner._is_reparse_point(shortcut)
+                or not shortcut.is_file()
+            ):
+                raise Mt5PublicReleaseError("Windows public MT5 shortcut is unsafe")
+            original = snapshot[name]
+            if original is None:
+                try:
+                    shortcut.unlink(missing_ok=True)
+                except OSError as exc:
+                    raise Mt5PublicReleaseError(
+                        "Windows public MT5 shortcut could not be removed"
+                    ) from exc
+                continue
+            temporary = desktop / f".tradejournal-{uuid4()}.lnk.tmp"
+            try:
+                temporary.write_bytes(original)
+                os.replace(temporary, shortcut)
+            except OSError as exc:
+                raise Mt5PublicReleaseError(
+                    "Windows public MT5 shortcut could not be restored"
+                ) from exc
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def _ensure_state_root(self) -> None:
         _reject_reparse_ancestry(self.state_root)
@@ -688,6 +786,7 @@ class Mt5PublicReleaseProbe:
             _validate_signer(installer_signer)
             installer_build = _validate_positive_build(self.build_reader(installer))
             terminal_root = stage / "terminal"
+            public_shortcuts = self._snapshot_public_shortcuts()
             before = self.process_guard.snapshot()
             quiescent = False
             runner_error: Exception | None = None
@@ -706,6 +805,8 @@ class Mt5PublicReleaseProbe:
                 terminal_root,
                 self.process_timeout,
             )
+            if quiescent:
+                self._restore_public_shortcuts(public_shortcuts)
             if not quiescent:
                 raise Mt5PublicReleaseError("MT5 installer left a process running")
             if runner_error is not None:

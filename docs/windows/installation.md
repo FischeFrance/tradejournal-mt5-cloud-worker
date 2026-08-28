@@ -102,6 +102,13 @@ UAC; l'Agent `LocalSystem` riconosce il pacchetto annunciato, ne verifica firma 
 riesegue dal proprio deposito protetto. Gli account amministrativi mantengono la policy UAC
 separata definita da `ConsentPromptBehaviorAdmin`.
 
+Anche il bootstrapper ufficiale eseguito dal probe pubblico può creare o sovrascrivere i
+collegamenti `MetaTrader 5.lnk` e `MetaEditor 5.lnk` nel desktop pubblico. Il probe ne salva lo
+stato prima dell'avvio e, soltanto dopo la quiete dei processi MetaQuotes, ripristina i collegamenti
+preesistenti oppure rimuove quelli creati dalla cattura. I collegamenti residui che puntano a una
+directory `.public-mt5-*` del probe sono trattati come artefatti temporanei e non vengono
+ripristinati.
+
 ## Servizio, release iniziale e configurazione
 
 Installare il servizio senza avviarlo. Lo script controlla prima runtime, modulo e dipendenze e

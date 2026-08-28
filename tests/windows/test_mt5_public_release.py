@@ -100,7 +100,10 @@ def _probe(
     downloader: FakeDownloader | None = None,
     runner=None,
     processes: QuietProcesses | None = None,
+    public_desktop: Path | None = None,
 ) -> Mt5PublicReleaseProbe:
+    desktop = public_desktop or tmp_path / "public-desktop"
+    desktop.mkdir(parents=True, exist_ok=True)
     return Mt5PublicReleaseProbe(
         tmp_path / "public-release-state",
         downloader=downloader or FakeDownloader(),
@@ -109,6 +112,7 @@ def _probe(
         installer_runner=runner or _runner(),
         process_guard=processes or QuietProcesses(),
         acl_restrictor=lambda _path: None,
+        public_desktop=desktop,
         clock_ms=lambda: 1_788_000_000_000,
     )
 
@@ -156,6 +160,78 @@ def test_same_release_is_downloaded_and_materialized_again_but_deduplicated(
     assert tuple(path.name for path in probe.releases_root.iterdir()) == (
         first.release_id,
     )
+
+
+def test_installer_public_shortcuts_are_removed_without_touching_other_links(
+    tmp_path: Path,
+) -> None:
+    desktop = tmp_path / "public-desktop"
+    desktop.mkdir()
+    unrelated = desktop / "Operations.lnk"
+    unrelated.write_bytes(b"operator shortcut")
+    materialize = _runner()
+
+    def runner(installer: Path, destination: Path, timeout: float) -> int:
+        result = materialize(installer, destination, timeout)
+        (desktop / "MetaTrader 5.lnk").write_bytes(
+            f"installer target={destination / 'terminal64.exe'}".encode()
+        )
+        (desktop / "MetaEditor 5.lnk").write_bytes(
+            f"installer target={destination / 'MetaEditor64.exe'}".encode()
+        )
+        return result
+
+    _probe(tmp_path, runner=runner, public_desktop=desktop).refresh()
+
+    assert not (desktop / "MetaTrader 5.lnk").exists()
+    assert not (desktop / "MetaEditor 5.lnk").exists()
+    assert unrelated.read_bytes() == b"operator shortcut"
+
+
+def test_preexisting_public_mt5_shortcuts_are_restored_after_installer(
+    tmp_path: Path,
+) -> None:
+    desktop = tmp_path / "public-desktop"
+    desktop.mkdir()
+    terminal_link = desktop / "MetaTrader 5.lnk"
+    editor_link = desktop / "MetaEditor 5.lnk"
+    terminal_link.write_bytes(b"operator terminal shortcut")
+    editor_link.write_bytes(b"operator editor shortcut")
+    materialize = _runner()
+
+    def runner(installer: Path, destination: Path, timeout: float) -> int:
+        result = materialize(installer, destination, timeout)
+        terminal_link.write_bytes(b"installer replacement")
+        editor_link.write_bytes(b"installer replacement")
+        return result
+
+    _probe(tmp_path, runner=runner, public_desktop=desktop).refresh()
+
+    assert terminal_link.read_bytes() == b"operator terminal shortcut"
+    assert editor_link.read_bytes() == b"operator editor shortcut"
+
+
+def test_stale_probe_shortcuts_are_removed_instead_of_restored(
+    tmp_path: Path,
+) -> None:
+    desktop = tmp_path / "public-desktop"
+    desktop.mkdir()
+    stale_root = (
+        tmp_path / "public-release-state" / ".public-mt5-old-probe" / "terminal"
+    )
+    terminal_link = desktop / "MetaTrader 5.lnk"
+    editor_link = desktop / "MetaEditor 5.lnk"
+    terminal_link.write_bytes(
+        f"target={stale_root / 'terminal64.exe'}".encode("utf-16-le")
+    )
+    editor_link.write_bytes(
+        f"target={stale_root / 'MetaEditor64.exe'}".encode("utf-16-le")
+    )
+
+    _probe(tmp_path, public_desktop=desktop).refresh()
+
+    assert not terminal_link.exists()
+    assert not editor_link.exists()
 
 
 def test_zero_exit_without_terminal_never_publishes(tmp_path: Path) -> None:
