@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,7 +83,12 @@ def _runner(
             (destination / "terminal64.exe").write_bytes(
                 f"terminal;build={terminal_build}".encode()
             )
-            (destination / "metaeditor64.exe").write_bytes(b"editor")
+            (destination / "metaeditor64.exe").write_bytes(
+                f"editor;build={terminal_build}".encode()
+            )
+            (destination / "metatester64.exe").write_bytes(
+                f"tester;build={terminal_build}".encode()
+            )
         return exit_code
 
     return run
@@ -436,6 +442,90 @@ def test_read_only_inventory_classifies_build_and_integrity(tmp_path: Path) -> N
         path: path.read_bytes()
         for path in instances.glob("*/state/instance.json")
     } == state_before
+
+
+def _write_trusted_template(root: Path, build: int) -> None:
+    root.mkdir(parents=True)
+    (root / "terminal64.exe").write_bytes(f"terminal;build={build}".encode())
+    (root / "metaeditor64.exe").write_bytes(f"editor;build={build}".encode())
+    (root / "metatester64.exe").write_bytes(f"tester;build={build}".encode())
+    for relative, content in (
+        (
+            Path("MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"),
+            b"bridge",
+        ),
+        (
+            Path("MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5"),
+            b"discovery",
+        ),
+        (
+            Path("MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5"),
+            b"loader",
+        ),
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
+def test_inventory_accepts_only_exact_signed_public_auxiliary_partial(
+    tmp_path: Path,
+) -> None:
+    baseline = _probe(tmp_path / "baseline").refresh()
+    trusted = tmp_path / "trusted"
+    _write_trusted_template(trusted, 6139)
+    instances = tmp_path / "instances"
+    instances.mkdir()
+    connection_id = str(uuid4())
+    root = instances / connection_id
+    terminal_root = root / "terminal"
+    shutil.copytree(trusted, terminal_root)
+    for name in ("metaeditor64.exe", "metatester64.exe"):
+        shutil.copy2(baseline.terminal_root / name, terminal_root / name)
+    state_path = root / "state" / "instance.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "connection_id": connection_id,
+                "status": "provisioned",
+                "terminal_sha256": InstanceProvisioner._sha256(
+                    trusted / "terminal64.exe"
+                ),
+                "template_code_manifest_sha256": (
+                    InstanceProvisioner._code_manifest(trusted)
+                ),
+                "runtime_assets_manifest_sha256": (
+                    InstanceProvisioner._managed_runtime_assets_manifest(
+                        trusted
+                    )
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    inventory = Mt5ProvisionedReleaseInventory(
+        instances,
+        build_reader=_build_reader,
+        signature_verifier=lambda _path: IDENTITY,
+        trusted_template_root=trusted,
+    )
+
+    record = inventory.scan(baseline)[0]
+
+    assert record.classification == "older"
+    assert record.code_integrity is True
+    assert record.state_reseal_required is True
+    assert record.verified_partial_signer == IDENTITY.subject
+    assert record.actual_code_manifest_sha256 == (
+        InstanceProvisioner._code_manifest(terminal_root)
+    )
+
+    (terminal_root / "metaeditor64.exe").write_bytes(b"evil;build=6140")
+    blocked = inventory.scan(baseline)[0]
+    assert blocked.classification == "unverifiable"
+    assert blocked.failure == "code_manifest_mismatch"
+    assert blocked.state_reseal_required is False
 
 
 def test_inventory_rejects_reparse_instances_root(tmp_path: Path) -> None:

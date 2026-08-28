@@ -1392,7 +1392,10 @@ def _build_activation_coordinator(
             pending_update_store=pending,
             public_release_probe=public_release_probe,
             public_release_inventory=(
-                Mt5ProvisionedReleaseInventory(config.instances_root)
+                Mt5ProvisionedReleaseInventory(
+                    config.instances_root,
+                    trusted_template_root=config.source_terminal.parent,
+                )
             ),
         ),
         pool,

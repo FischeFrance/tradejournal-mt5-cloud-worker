@@ -350,7 +350,10 @@ def build_runner(
                 pending_update_store=pending_update_store,
                 public_release_probe=public_release_probe,
                 public_release_inventory=(
-                    Mt5ProvisionedReleaseInventory(config.instances_root)
+                    Mt5ProvisionedReleaseInventory(
+                        config.instances_root,
+                        trusted_template_root=config.source_terminal.parent,
+                    )
                 ),
             )
             config.mt5_maintenance_state_path.parent.mkdir(

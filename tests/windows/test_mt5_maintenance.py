@@ -450,9 +450,15 @@ class FakePublicProbe:
 
 
 class FakePublicInventory:
-    def __init__(self, instances: Path, rotator: FakeRotator) -> None:
+    def __init__(
+        self,
+        instances: Path,
+        rotator: FakeRotator,
+        partial_connection_id: str | None = None,
+    ) -> None:
         self.instances = instances
         self.rotator = rotator
+        self.partial_connection_id = partial_connection_id
         self.calls = 0
 
     def scan(
@@ -464,6 +470,10 @@ class FakePublicInventory:
         for root in sorted(self.instances.iterdir(), key=lambda value: value.name):
             connection_id = root.name
             is_current = connection_id in self.rotator.current
+            is_partial = (
+                not is_current
+                and connection_id == self.partial_connection_id
+            )
             records.append(
                 Mt5InstanceReleaseInventory(
                     connection_id=connection_id,
@@ -485,6 +495,15 @@ class FakePublicInventory:
                     signature_valid=True,
                     classification="current" if is_current else "older",
                     failure=None,
+                    actual_code_manifest_sha256=(
+                        "2" * 64 if is_partial else None
+                    ),
+                    state_reseal_required=is_partial,
+                    verified_partial_signer=(
+                        "CN=MetaQuotes Ltd., O=MetaQuotes Ltd."
+                        if is_partial
+                        else None
+                    ),
                 )
             )
         return tuple(records)
@@ -810,7 +829,11 @@ def test_public_canary_refreshes_baseline_and_updates_only_fpm(
     )
     public = _public_release(manager)
     public_probe = FakePublicProbe(public)
-    public_inventory = FakePublicInventory(instances, rotator)
+    public_inventory = FakePublicInventory(
+        instances,
+        rotator,
+        partial_connection_id=ids[1],
+    )
     pool = FakePool()
     coordinator = _coordinator(
         instances,
@@ -857,7 +880,14 @@ def test_public_canary_refreshes_baseline_and_updates_only_fpm(
     assert manager.discards == 1
     assert pool.calls == []
     assert rotator.rotate_all_calls == []
-    seal.assert_called_once()
+    assert seal.call_count == 2
+    source_seal = seal.call_args_list[0]
+    assert source_seal.kwargs == {
+        "expected_terminal_sha256": "1" * 64,
+        "expected_code_manifest_sha256": "2" * 64,
+    }
+    target_seal = seal.call_args_list[1]
+    assert target_seal.kwargs == {}
 
 
 def test_nightly_public_baseline_promotes_pool_then_only_older_instances(

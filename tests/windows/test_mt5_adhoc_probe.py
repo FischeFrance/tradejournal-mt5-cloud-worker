@@ -351,7 +351,9 @@ def test_main_never_publishes_exception_text(
     result = read_json(tmp_path / f"{nonce}.json")
     assert result["success"] is False
     assert result["code"] == "mt5_adhoc_probe_failed"
-    assert result["details"] == {}
+    assert result["details"] == {
+        "failure_chain": [{"type": "RuntimeError"}],
+    }
 
 
 def test_ad_hoc_entrypoint_has_no_cascade_or_scheduler_path() -> None:

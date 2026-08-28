@@ -208,6 +208,36 @@ class Mt5MaintenanceCoordinator:
         )
 
     @staticmethod
+    def _seal_verified_partial_source(
+        record: Mt5InstanceReleaseInventory,
+    ) -> None:
+        if not record.state_reseal_required:
+            return
+        if (
+            record.classification != "older"
+            or record.terminal_sha256 is None
+            or record.actual_code_manifest_sha256 is None
+            or record.verified_partial_signer is None
+        ):
+            raise Mt5MaintenanceError(
+                "MT5 signed partial update evidence is invalid"
+            )
+        try:
+            InstanceProvisioner.record_verified_vendor_update(
+                record.root,
+                record.connection_id,
+                record.verified_partial_signer,
+                expected_terminal_sha256=record.terminal_sha256,
+                expected_code_manifest_sha256=(
+                    record.actual_code_manifest_sha256
+                ),
+            )
+        except Exception as exc:
+            raise Mt5MaintenanceError(
+                "MT5 signed partial update changed before sealing"
+            ) from exc
+
+    @staticmethod
     def _validate_status(status: NativeMt5Status) -> None:
         if (
             status.pid <= 0
@@ -569,6 +599,7 @@ class Mt5MaintenanceCoordinator:
             )
             signer = prepared.signer_subject
 
+        self._seal_verified_partial_source(observed_before)
         source_state = read_json(
             canary.root / "state" / "instance.json",
             {},
@@ -1146,6 +1177,7 @@ class Mt5MaintenanceCoordinator:
                 if self.rotator.matches_target(record.connection_id, target):
                     already_current.append(record.connection_id)
                 continue
+            self._seal_verified_partial_source(record)
             state = read_json(
                 record.root / "state" / "instance.json",
                 {},
@@ -1319,6 +1351,10 @@ class Mt5MaintenanceCoordinator:
                 } != {canary.server.casefold() for canary in canaries}:
                     raise Mt5MaintenanceError(
                         "MT5 public update lacks an older canary for every broker"
+                    )
+                for canary in public_canaries:
+                    self._seal_verified_partial_source(
+                        by_connection[canary.connection_id]
                     )
                 current, discarded, pool_synchronized = (
                     self._promote_public_baseline(

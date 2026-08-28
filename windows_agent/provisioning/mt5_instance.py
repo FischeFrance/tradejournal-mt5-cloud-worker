@@ -287,6 +287,9 @@ class InstanceProvisioner:
         root: Path,
         connection_id: str,
         signer_subject: str,
+        *,
+        expected_terminal_sha256: str | None = None,
+        expected_code_manifest_sha256: str | None = None,
     ) -> str:
         """Seal executable changes produced by a verified MetaQuotes LiveUpdate.
 
@@ -329,6 +332,22 @@ class InstanceProvisioner:
 
         terminal_sha256 = cls._sha256(terminal)
         code_manifest_sha256 = cls._code_manifest(terminal_root)
+        for expected, actual in (
+            (expected_terminal_sha256, terminal_sha256),
+            (expected_code_manifest_sha256, code_manifest_sha256),
+        ):
+            if expected is None:
+                continue
+            normalized = expected.strip().lower()
+            if (
+                len(normalized) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in normalized
+                )
+                or normalized != actual
+            ):
+                raise ValueError("vendor update binding changed")
         state["terminal_sha256"] = terminal_sha256
         state["template_code_manifest_sha256"] = code_manifest_sha256
         state["vendor_update"] = {

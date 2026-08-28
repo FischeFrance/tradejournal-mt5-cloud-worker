@@ -70,6 +70,12 @@ _CLASSIFICATIONS = frozenset(
         "unverifiable",
     }
 )
+_RECOVERABLE_PARTIAL_UPDATE_PATHS = frozenset(
+    {
+        "metaeditor64.exe",
+        "metatester64.exe",
+    }
+)
 
 
 class Mt5PublicReleaseError(RuntimeError):
@@ -130,6 +136,9 @@ class Mt5InstanceReleaseInventory:
     signature_valid: bool
     classification: Mt5ReleaseClassification
     failure: str | None
+    actual_code_manifest_sha256: str | None = None
+    state_reseal_required: bool = False
+    verified_partial_signer: str | None = None
 
 
 class Downloader(Protocol):
@@ -933,10 +942,16 @@ class Mt5ProvisionedReleaseInventory:
         *,
         build_reader: Callable[[Path], int] = read_windows_pe_build,
         signature_verifier: SignatureVerifier = verify_metaquotes_authenticode,
+        trusted_template_root: Path | None = None,
     ) -> None:
         self.instances_root = _absolute_without_resolving(instances_root)
         self.build_reader = build_reader
         self.signature_verifier = signature_verifier
+        self.trusted_template_root = (
+            _absolute_without_resolving(trusted_template_root)
+            if trusted_template_root is not None
+            else None
+        )
 
     def scan(
         self,
@@ -991,6 +1006,7 @@ class Mt5ProvisionedReleaseInventory:
         hash_integrity: bool = False,
         code_integrity: bool = False,
         signature_valid: bool = False,
+        actual_code_manifest_sha256: str | None = None,
     ) -> Mt5InstanceReleaseInventory:
         return Mt5InstanceReleaseInventory(
             connection_id=connection_id,
@@ -1004,6 +1020,7 @@ class Mt5ProvisionedReleaseInventory:
             signature_valid=signature_valid,
             classification="unverifiable",
             failure=failure,
+            actual_code_manifest_sha256=actual_code_manifest_sha256,
         )
 
     def _inspect_one(
@@ -1037,10 +1054,13 @@ class Mt5ProvisionedReleaseInventory:
             )
         terminal = root / "terminal" / "terminal64.exe"
         actual_terminal: str | None = None
+        actual_code: str | None = None
         build: int | None = None
         signature_valid = False
         hash_valid = False
         code_valid = False
+        state_reseal_required = False
+        verified_partial_signer: str | None = None
         failure = "state_invalid" if not state_valid else None
         try:
             if (
@@ -1069,6 +1089,25 @@ class Mt5ProvisionedReleaseInventory:
             build = _validate_positive_build(self.build_reader(terminal))
         except Exception:
             failure = failure or "terminal_unverifiable"
+        if (
+            state_valid
+            and hash_valid
+            and not code_valid
+            and signature_valid
+            and build is not None
+            and actual_code is not None
+        ):
+            verified_partial_signer = self._verified_partial_update_signer(
+                root=root,
+                state=state,
+                baseline=baseline,
+                recorded_terminal=cast(str, recorded_terminal),
+                recorded_code=cast(str, recorded_code),
+            )
+            if verified_partial_signer is not None:
+                code_valid = True
+                state_reseal_required = True
+                failure = None
         if not state_valid or not hash_valid or not code_valid or not signature_valid or build is None:
             if failure is None:
                 if not hash_valid:
@@ -1092,6 +1131,7 @@ class Mt5ProvisionedReleaseInventory:
                 hash_integrity=hash_valid,
                 code_integrity=code_valid,
                 signature_valid=signature_valid,
+                actual_code_manifest_sha256=actual_code,
             )
         if build < baseline.build:
             classification: Mt5ReleaseClassification = "older"
@@ -1115,4 +1155,97 @@ class Mt5ProvisionedReleaseInventory:
             signature_valid=True,
             classification=classification,
             failure=None,
+            actual_code_manifest_sha256=actual_code,
+            state_reseal_required=state_reseal_required,
+            verified_partial_signer=verified_partial_signer,
         )
+
+    @staticmethod
+    def _code_files(root: Path) -> dict[str, str]:
+        InstanceProvisioner._validate_source_tree(root)
+        files: dict[str, str] = {}
+        for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
+            if not path.is_file() or path.suffix.casefold() not in {
+                ".dll",
+                ".exe",
+                ".ex5",
+            }:
+                continue
+            relative = path.relative_to(root).as_posix().casefold()
+            files[relative] = _sha256(path)
+        return files
+
+    def _verified_partial_update_signer(
+        self,
+        *,
+        root: Path,
+        state: dict[str, object],
+        baseline: Mt5PublicRelease,
+        recorded_terminal: str,
+        recorded_code: str,
+    ) -> str | None:
+        """Recognize only the exact signed MetaQuotes split-build state.
+
+        MetaQuotes can replace ``metaeditor64.exe`` and ``metatester64.exe``
+        before ``terminal64.exe``.  That leaves the terminal pin intact but
+        makes the aggregate executable manifest stale.  It is recoverable
+        only when the instance otherwise equals the current trusted template
+        and the changed auxiliary files are byte-for-byte the freshly
+        downloaded public baseline, with valid MetaQuotes signatures and the
+        same public build.  No EX5, DLL, missing file or arbitrary PE drift is
+        accepted.
+        """
+
+        trusted = self.trusted_template_root
+        recorded_assets = state.get("runtime_assets_manifest_sha256")
+        if trusted is None or not _is_sha256(recorded_assets):
+            return None
+        terminal_root = root / "terminal"
+        try:
+            _reject_reparse_ancestry(trusted)
+            if (
+                InstanceProvisioner._is_reparse_point(trusted)
+                or not trusted.is_dir()
+                or _sha256(trusted / "terminal64.exe") != recorded_terminal
+                or InstanceProvisioner._code_manifest(trusted) != recorded_code
+                or InstanceProvisioner._managed_runtime_assets_manifest(trusted)
+                != recorded_assets
+            ):
+                return None
+            trusted_files = self._code_files(trusted)
+            actual_files = self._code_files(terminal_root)
+            changed = {
+                relative
+                for relative in trusted_files.keys() | actual_files.keys()
+                if trusted_files.get(relative) != actual_files.get(relative)
+            }
+            if not changed or not changed <= _RECOVERABLE_PARTIAL_UPDATE_PATHS:
+                return None
+            subjects: set[str] = set()
+            for relative in changed:
+                actual = terminal_root / Path(relative)
+                public = baseline.terminal_root / Path(relative)
+                if (
+                    relative not in trusted_files
+                    or relative not in actual_files
+                    or not public.is_file()
+                    or InstanceProvisioner._is_reparse_point(public)
+                    or actual_files[relative] != _sha256(public)
+                    or _validate_positive_build(self.build_reader(actual))
+                    != baseline.build
+                    or _validate_positive_build(self.build_reader(public))
+                    != baseline.build
+                ):
+                    return None
+                actual_identity = self.signature_verifier(actual)
+                public_identity = self.signature_verifier(public)
+                _validate_signer(actual_identity)
+                _validate_signer(public_identity)
+                if actual_identity != public_identity:
+                    return None
+                subjects.add(actual_identity.subject)
+            if len(subjects) != 1:
+                return None
+            return subjects.pop()
+        except Exception:
+            return None

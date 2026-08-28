@@ -577,6 +577,52 @@ def test_verified_vendor_update_rotates_instance_integrity_pin(tmp_path: Path) -
     )
 
 
+def test_verified_vendor_update_rejects_changed_expected_binding(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / CONNECTION_ID
+    terminal_root = root / "terminal"
+    terminal_root.mkdir(parents=True)
+    terminal = terminal_root / "terminal64.exe"
+    terminal.write_bytes(b"terminal-v1")
+    for relative in _MANAGED_RUNTIME_ASSETS:
+        asset = terminal_root / relative
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_bytes(relative.as_posix().encode("utf-8"))
+    state_path = root / "state" / "instance.json"
+    atomic_json(
+        state_path,
+        {
+            "connection_id": CONNECTION_ID,
+            "status": "provisioned",
+            "terminal_sha256": InstanceProvisioner._sha256(terminal),
+            "template_code_manifest_sha256": (
+                InstanceProvisioner._code_manifest(terminal_root)
+            ),
+            "runtime_assets_manifest_sha256": (
+                InstanceProvisioner._managed_runtime_assets_manifest(
+                    terminal_root
+                )
+            ),
+        },
+    )
+    before = state_path.read_bytes()
+    terminal.write_bytes(b"terminal-v2")
+
+    with pytest.raises(ValueError, match="binding changed"):
+        InstanceProvisioner.record_verified_vendor_update(
+            root,
+            CONNECTION_ID,
+            SIGNER,
+            expected_terminal_sha256="0" * 64,
+            expected_code_manifest_sha256=(
+                InstanceProvisioner._code_manifest(terminal_root)
+            ),
+        )
+
+    assert state_path.read_bytes() == before
+
+
 def test_live_update_runs_only_staged_verified_copy(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     config = runtime.state / "login-bootstrap.ini"

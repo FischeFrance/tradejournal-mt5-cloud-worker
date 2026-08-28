@@ -297,6 +297,14 @@ golden, non apre o ricostruisce il pool, non ruota la flotta e non scrive lo sta
 La successiva manutenzione completa delle 23:30 rimane l'unico percorso che può pubblicare il
 template e aggiornare pool e account a cascata.
 
+MetaQuotes può lasciare temporaneamente una distribuzione divisa, con `terminal64.exe` sulla build
+precedente ma `metaeditor64.exe` e `metatester64.exe` già sulla build pubblica corrente. Il probe
+accetta questo caso soltanto se il terminale, gli asset TradeJournal e tutto il resto del manifest
+corrispondono ancora al template fidato, se le sole differenze sono quei due file nella root e se
+entrambi sono byte per byte uguali alla distribuzione appena scaricata, firmati da MetaQuotes e con
+la stessa build pubblica. Prima della rotazione lo stato viene risigillato sui digest verificati;
+qualsiasi altra differenza resta `unverifiable` e blocca il pass.
+
 ## Manutenzione MT5
 
 Ogni sera alle 23:30 la manutenzione scarica nuovamente l'installer stabile ufficiale MetaQuotes,

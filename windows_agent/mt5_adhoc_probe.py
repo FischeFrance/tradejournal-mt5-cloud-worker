@@ -53,6 +53,15 @@ FPM_TEST_CONNECTION_ID = "2f1647b4-035e-41be-b634-0cf785a70b07"
 FPM_TEST_SERVER = "FPMTrading-Live"
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _SERVER = re.compile(r"[A-Za-z0-9._ -]{1,128}")
+_SAFE_FAILURE_TYPES = frozenset(
+    {
+        "Mt5AdHocProbeError",
+        "Mt5InstanceRotationError",
+        "Mt5MaintenanceError",
+        "Mt5PublicReleaseError",
+        "Mt5TemplateError",
+    }
+)
 
 
 class Mt5AdHocProbeError(RuntimeError):
@@ -163,7 +172,8 @@ def _build_coordinator(config: AgentRuntimeConfig) -> Mt5MaintenanceCoordinator:
         config.mt5_maintenance_state_path.parent / "mt5-public-releases"
     )
     public_inventory = Mt5ProvisionedReleaseInventory(
-        config.instances_root
+        config.instances_root,
+        trusted_template_root=config.source_terminal.parent,
     )
     rotator = Mt5InstanceRotator(
         instances_root=config.instances_root,
@@ -208,6 +218,23 @@ def _write_result(path: Path, document: dict[str, object]) -> None:
         raise
     except Exception as exc:
         raise Mt5AdHocProbeError("result_write_failed") from exc
+
+
+def _sanitized_failure_chain(exc: Exception) -> list[dict[str, str]]:
+    chain: list[dict[str, str]] = []
+    observed: BaseException | None = exc
+    seen: set[int] = set()
+    while observed is not None and id(observed) not in seen and len(chain) < 6:
+        seen.add(id(observed))
+        name = type(observed).__name__
+        item = {"type": name}
+        if name in _SAFE_FAILURE_TYPES:
+            message = str(observed)
+            if message and "\r" not in message and "\n" not in message:
+                item["message"] = message[:256]
+        chain.append(item)
+        observed = observed.__cause__ or observed.__context__
+    return chain
 
 
 def run_probe(
@@ -320,7 +347,9 @@ def main(argv: list[str] | None = None) -> int:
             **base,
             "success": False,
             "code": "mt5_adhoc_probe_failed",
-            "details": {},
+            "details": {
+                "failure_chain": _sanitized_failure_chain(exc),
+            },
         }
     document["finished_at_unix_ms"] = int(time.time() * 1000)
     try:
