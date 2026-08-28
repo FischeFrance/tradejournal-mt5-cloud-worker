@@ -455,10 +455,12 @@ class FakePublicInventory:
         instances: Path,
         rotator: FakeRotator,
         partial_connection_id: str | None = None,
+        vendor_current_ids: set[str] | None = None,
     ) -> None:
         self.instances = instances
         self.rotator = rotator
         self.partial_connection_id = partial_connection_id
+        self.vendor_current_ids = vendor_current_ids or set()
         self.calls = 0
 
     def scan(
@@ -469,7 +471,10 @@ class FakePublicInventory:
         records: list[Mt5InstanceReleaseInventory] = []
         for root in sorted(self.instances.iterdir(), key=lambda value: value.name):
             connection_id = root.name
-            is_current = connection_id in self.rotator.current
+            is_current = (
+                connection_id in self.rotator.current
+                or connection_id in self.vendor_current_ids
+            )
             is_partial = (
                 not is_current
                 and connection_id == self.partial_connection_id
@@ -925,6 +930,50 @@ def test_nightly_public_baseline_promotes_pool_then_only_older_instances(
     assert len(report.checked_connections) == 2
     assert len(report.migrated_connections) == 1
     assert report.release_changed is True
+
+
+def test_public_baseline_rotates_current_vendor_build_with_stale_managed_template(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("Broker-A", "Broker-B"),
+    )
+    manager.source_terminal.write_bytes(b"terminal-v2")
+    manager.current_sha256 = InstanceProvisioner._sha256(manager.source_terminal)
+    public = _public_release(manager)
+    public_inventory = FakePublicInventory(
+        instances,
+        rotator,
+        vendor_current_ids=set(ids),
+    )
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        FakePool(),
+        None,
+        FakePublicProbe(public),
+        public_inventory,
+    )
+
+    target = Mt5TemplateRelease.from_template(
+        manager.source_terminal,
+        manager.current_sha256,
+    )
+    report = coordinator._rotate_only_older_public_instances(
+        target,
+        6140,
+        public,
+        Event(),
+    )
+
+    assert set(report.migrated) == set(ids)
+    assert rotator.current == set(ids)
+    assert set(rotator.rotate_one_calls) == {(connection_id, False) for connection_id in ids}
 
 
 def test_public_promotion_reuses_exact_current_canary_without_downgrade(

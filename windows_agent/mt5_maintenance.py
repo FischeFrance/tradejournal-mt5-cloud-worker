@@ -1165,7 +1165,7 @@ class Mt5MaintenanceCoordinator:
         baseline: Mt5PublicRelease,
         stop_event: Event,
     ) -> Mt5FleetRotationReport:
-        """Converge numeric older builds without downgrading other releases."""
+        """Converge older builds and current vendor builds without downgrades."""
 
         inventory = self.public_release_inventory
         if inventory is None:
@@ -1187,11 +1187,13 @@ class Mt5MaintenanceCoordinator:
         capture = self._capture_callback(stop_event)
         for record in records:
             self._require_not_stopped(stop_event)
-            if record.classification != "older":
-                if self.rotator.matches_target(record.connection_id, target):
-                    already_current.append(record.connection_id)
+            if self.rotator.matches_target(record.connection_id, target):
+                already_current.append(record.connection_id)
                 continue
-            self._seal_verified_partial_source(record)
+            if record.classification not in {"older", "current"}:
+                continue
+            if record.classification == "older":
+                self._seal_verified_partial_source(record)
             state = read_json(
                 record.root / "state" / "instance.json",
                 {},
@@ -1226,6 +1228,10 @@ class Mt5MaintenanceCoordinator:
             ) from exc
         if any(
             record.classification in {"older", "unverifiable"}
+            or (
+                record.classification == "current"
+                and not self.rotator.matches_target(record.connection_id, target)
+            )
             for record in after
         ):
             raise Mt5MaintenanceError("MT5 public fleet postcondition failed")
