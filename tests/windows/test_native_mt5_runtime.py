@@ -222,7 +222,13 @@ def test_start_process_uses_portable_config(tmp_path: Path) -> None:
     config.parent.mkdir()
     config.write_text("temporary")
     process = Mock(pid=123)
-    with patch("subprocess.Popen", return_value=process) as popen:
+    # Exercise the direct-process fallback deliberately on every host.  The
+    # production Windows path correctly requires the dedicated interactive
+    # identity and is covered by the scheduled-task tests below.
+    with (
+        patch("windows_agent.worker.native_mt5_runtime.os.name", "posix"),
+        patch("subprocess.Popen", return_value=process) as popen,
+    ):
         assert runtime._start_process(config, 42) is process
     args = popen.call_args.args[0]
     assert "/portable" in args
@@ -425,6 +431,11 @@ def test_startup_config_allows_configured_interactive_user_to_read(
             if name == "TRADEJOURNAL_MT5_INTERACTIVE_USER"
             else ""
         ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_verify_local_standard_interactive_user",
+        lambda interactive_user: None,
     )
     completed = Mock(returncode=0)
     with patch("subprocess.run", return_value=completed) as run:
