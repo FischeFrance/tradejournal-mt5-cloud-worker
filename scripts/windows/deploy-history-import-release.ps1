@@ -6,6 +6,7 @@ param(
   [int]$ExpectedTerminalCount = 0,
   [string]$RecoveryConnectionId = '',
   [switch]$PrepareOnly,
+  [switch]$OperatorApprovedImmediate,
   [string]$DeploymentPython = 'C:\TradeJournal\releases\pool71a\.venv\Scripts\python.exe'
 )
 
@@ -654,7 +655,9 @@ try {
     previous_expert_sha256 = $previousExpertSha256
     new_expert_sha256 = $expertSha256
   })
-  [void](Invoke-DeployGuard -Action arm -Payload @{})
+  [void](Invoke-DeployGuard -Action arm -Payload @{
+    operator_approved_immediate = [bool]$OperatorApprovedImmediate
+  })
   $barrierAttempted = $true
   [void](Invoke-DeployGuard -Action barrier -Payload @{})
   $activationBarrierCrossed = $true

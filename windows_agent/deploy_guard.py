@@ -134,7 +134,7 @@ _PAYLOAD_FIELDS = {
             "new_expert_sha256",
         }
     ),
-    "arm": frozenset(),
+    "arm": frozenset({"operator_approved_immediate"}),
     "barrier": frozenset(),
     "barrier_status": frozenset(),
     "converge": frozenset({"fpm_connection_id"}),
@@ -771,6 +771,7 @@ _ARM_FIELDS = frozenset(
         "armed_at_unix_ms",
         "window_started_at_unix_ms",
         "window_ends_at_unix_ms",
+        "activation_mode",
     }
 )
 _BARRIER_FIELDS = frozenset(
@@ -1145,6 +1146,35 @@ def _maintenance_window(
         raise DeployGuardError("maintenance_clock_invalid") from exc
 
 
+def _outside_maintenance_window(
+    config: AgentRuntimeConfig, now: datetime | None = None
+) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise DeployGuardError("maintenance_clock_invalid")
+    try:
+        _maintenance_window(config, current)
+    except DeployGuardError as exc:
+        if exc.code == "outside_maintenance_window":
+            return current
+        raise
+    raise DeployGuardError("immediate_activation_during_maintenance_window")
+
+
+def _arm_activation_window(
+    config: AgentRuntimeConfig, *, immediate: bool
+) -> tuple[datetime, datetime, str]:
+    if not immediate:
+        start, end = _maintenance_window(config)
+        return start, end, "scheduled"
+    current = _outside_maintenance_window(config)
+    return (
+        current,
+        current + timedelta(minutes=config.mt5_maintenance_grace_minutes),
+        "operator_approved_immediate",
+    )
+
+
 def _assert_switch_intact(request: Mapping[str, Any]) -> tuple[AgentRuntimeConfig, dict[str, Any]]:
     """Re-prove every byte selected by switch immediately before the PONR."""
 
@@ -1233,7 +1263,12 @@ def _arm(request: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         raise DeployGuardError("runtime_config_invalid") from exc
     _assert_maintenance_policy(config)
-    start, end = _maintenance_window(config)
+    immediate = request["payload"].get("operator_approved_immediate", False)
+    if not isinstance(immediate, bool):
+        raise DeployGuardError("immediate_activation_approval_invalid")
+    start, end, activation_mode = _arm_activation_window(
+        config, immediate=immediate
+    )
     now_ms = int(time.time() * 1000)
     record = {
         **_binding(request),
@@ -1241,6 +1276,7 @@ def _arm(request: dict[str, Any]) -> dict[str, Any]:
         "armed_at_unix_ms": now_ms,
         "window_started_at_unix_ms": int(start.timestamp() * 1000),
         "window_ends_at_unix_ms": int(end.timestamp() * 1000),
+        "activation_mode": activation_mode,
     }
     try:
         _exclusive_json(arm_path, record)
@@ -1321,16 +1357,29 @@ def _barrier_for_request(request: Mapping[str, Any]) -> dict[str, Any]:
 
 def _activation_config(request: Mapping[str, Any]) -> AgentRuntimeConfig:
     _barrier_for_request(request)
-    _read_deployment_record(request, "arm", _ARM_FIELDS)
+    arm = _read_deployment_record(request, "arm", _ARM_FIELDS)
     _, overrides = _environment_map(_get_service_environment())
     try:
         config = load_runtime_config(_effective_environment(overrides))
     except Exception as exc:
         raise DeployGuardError("runtime_config_invalid") from exc
     _assert_maintenance_policy(config)
-    # A failed post-barrier attempt may be retried only in a later approved
-    # nightly window.  It is not permanently tied to the original arm date.
-    _maintenance_window(config)
+    activation_mode = arm.get("activation_mode")
+    if activation_mode == "scheduled":
+        # A failed post-barrier scheduled attempt may be retried only in a
+        # later approved nightly window.
+        _maintenance_window(config)
+    elif activation_mode == "operator_approved_immediate":
+        current = _outside_maintenance_window(config)
+        current_ms = int(current.timestamp() * 1000)
+        if not (
+            arm["window_started_at_unix_ms"]
+            <= current_ms
+            <= arm["window_ends_at_unix_ms"]
+        ):
+            raise DeployGuardError("immediate_activation_window_expired")
+    else:
+        raise DeployGuardError("activation_mode_invalid")
     if (
         _path_text(_current_target())
         != _path_text(RELEASE_ROOT / f"agent-{request['source_revision'][:12]}")
@@ -1416,6 +1465,12 @@ def _write_activation_schedule_state(
     *,
     status: str,
 ) -> None:
+    arm = _read_deployment_record(request, "arm", _ARM_FIELDS)
+    if arm.get("activation_mode") == "operator_approved_immediate":
+        # An operator-approved daytime convergence must not consume tonight's
+        # scheduler claim.  The 23:30 pass still downloads and verifies the
+        # official release, and becomes a no-op only if it is unchanged.
+        return
     start, end = _maintenance_window(config)
     now = datetime.now(timezone.utc)
     record: dict[str, Any] = {
@@ -1454,10 +1509,32 @@ def _convergence_attempt(
     config: AgentRuntimeConfig,
     request: Mapping[str, Any],
 ) -> tuple[Path, dict[str, Any]]:
-    start, _ = _maintenance_window(config)
+    arm = _read_deployment_record(request, "arm", _ARM_FIELDS)
+    activation_mode = arm.get("activation_mode")
+    if activation_mode == "scheduled":
+        start, _ = _maintenance_window(config)
+        attempt_name = f"converge-attempt-{start.date().isoformat()}"
+    elif activation_mode == "operator_approved_immediate":
+        current = _outside_maintenance_window(config)
+        current_ms = int(current.timestamp() * 1000)
+        if not (
+            arm["window_started_at_unix_ms"]
+            <= current_ms
+            <= arm["window_ends_at_unix_ms"]
+        ):
+            raise DeployGuardError("immediate_activation_window_expired")
+        try:
+            from zoneinfo import ZoneInfo
+
+            start = current.astimezone(ZoneInfo(config.mt5_maintenance_timezone))
+        except Exception as exc:
+            raise DeployGuardError("maintenance_clock_invalid") from exc
+        attempt_name = "converge-attempt-immediate"
+    else:
+        raise DeployGuardError("activation_mode_invalid")
     path = _record_path(
         request["deployment_id"],
-        f"converge-attempt-{start.date().isoformat()}",
+        attempt_name,
     )
     record = {
         **_binding(request),

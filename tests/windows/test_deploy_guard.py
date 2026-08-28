@@ -353,6 +353,7 @@ def test_barrier_requires_fresh_identity_and_is_idempotent_across_nonce(
             "armed_at_unix_ms": 1,
             "window_started_at_unix_ms": 1,
             "window_ends_at_unix_ms": int(deploy_guard.time.time() * 1000) + 60_000,
+            "activation_mode": "scheduled",
         },
     )
     monkeypatch.setattr(deploy_guard, "_assert_switch_intact", lambda _request: None)
@@ -386,6 +387,7 @@ def test_barrier_removes_stale_readiness_and_status_is_authoritative(
             "armed_at_unix_ms": 1,
             "window_started_at_unix_ms": 1,
             "window_ends_at_unix_ms": int(deploy_guard.time.time() * 1000) + 60_000,
+            "activation_mode": "scheduled",
         },
     )
     deploy_guard.AGENT_READINESS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -707,6 +709,21 @@ def test_failed_or_uncertain_convergence_resumes_idempotently_in_same_window(
         "_maintenance_window",
         lambda _config: (start, start + timedelta(minutes=120)),
     )
+    deploy_guard._exclusive_json(
+        deploy_guard._record_path(DEPLOYMENT_ID, "arm"),
+        {
+            "schema_version": 1,
+            "deployment_id": DEPLOYMENT_ID,
+            "source_revision": REVISION,
+            "nonce": str(uuid4()),
+            "armed_at_unix_ms": 1,
+            "window_started_at_unix_ms": int(start.timestamp() * 1000),
+            "window_ends_at_unix_ms": int(
+                (start + timedelta(minutes=120)).timestamp() * 1000
+            ),
+            "activation_mode": "scheduled",
+        },
+    )
     first = _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
     deploy_guard._convergence_attempt(config, first)
 
@@ -946,6 +963,59 @@ def test_rome_window_includes_previous_day_grace_after_midnight(
     )
     assert start.isoformat().startswith("2026-08-27T23:30:00+02:00")
     assert end - start == timedelta(minutes=120)
+
+
+def test_immediate_activation_is_bounded_and_keeps_nightly_claim_available(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(guard_root)
+    current = datetime(2026, 8, 28, 16, 30, tzinfo=timezone(timedelta(hours=2)))
+    monkeypatch.setattr(
+        deploy_guard,
+        "_outside_maintenance_window",
+        lambda _config, now=None: current,
+    )
+
+    start, end, mode = deploy_guard._arm_activation_window(
+        config, immediate=True
+    )
+
+    assert start == current
+    assert end - start == timedelta(minutes=120)
+    assert mode == "operator_approved_immediate"
+
+    deploy_guard._exclusive_json(
+        deploy_guard._record_path(DEPLOYMENT_ID, "arm"),
+        {
+            "schema_version": 1,
+            "deployment_id": DEPLOYMENT_ID,
+            "source_revision": REVISION,
+            "nonce": str(uuid4()),
+            "armed_at_unix_ms": int(current.timestamp() * 1000),
+            "window_started_at_unix_ms": int(current.timestamp() * 1000),
+            "window_ends_at_unix_ms": int(end.timestamp() * 1000),
+            "activation_mode": mode,
+        },
+    )
+    deploy_guard._write_activation_schedule_state(
+        config,
+        _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID}),
+        status="completed",
+    )
+    assert not config.mt5_maintenance_state_path.exists()
+
+
+def test_immediate_activation_is_rejected_inside_nightly_window(
+    guard_root: Path,
+) -> None:
+    config = _config(guard_root)
+    inside = datetime(2026, 8, 28, 23, 45, tzinfo=timezone(timedelta(hours=2)))
+
+    with pytest.raises(
+        deploy_guard.DeployGuardError,
+        match="immediate_activation_during_maintenance_window",
+    ):
+        deploy_guard._outside_maintenance_window(config, inside)
 
 
 def test_health_envelopes_require_one_matching_positive_sequence(

@@ -221,6 +221,21 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-history-import-r
 Questa modalità esegue checkout gate, test, compilazione EA, build immutabile e preflight reale.
 L'attivazione completa va poi rilanciata senza `PrepareOnly` durante la finestra approvata.
 
+Un rollout globale eccezionale, esplicitamente approvato dall'operatore e avviato fuori dalla
+finestra 23:30–01:30, usa lo stesso gate completo con `-OperatorApprovedImmediate`. L'opzione non
+modifica la policy permanente delle 23:30 e non consuma il claim notturno: la sera stessa lo
+scheduler riscarica e verifica la release ufficiale e non riavvia nulla se la flotta è già
+allineata. L'opzione è rifiutata durante la finestra notturna, dove va usato il percorso ordinario.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\deploy-history-import-release.ps1 `
+  -Revision $revision `
+  -SourceRoot $sourceRoot `
+  -DeploymentPython $pythonExe `
+  -RecoveryConnectionId '<uuid-account-FPMTrading-Live>' `
+  -OperatorApprovedImmediate
+```
+
 Per una release successiva, fare fetch, eseguire checkout detached dello SHA completo e verificare
 che `git status --porcelain=v1 --untracked-files=all` non produca output; poi rilanciare lo stesso
 comando con il nuovo `-Revision`. La deploy ripete il controllo Git subito prima del packaging,
