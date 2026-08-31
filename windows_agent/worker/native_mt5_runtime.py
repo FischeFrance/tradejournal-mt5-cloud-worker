@@ -6,13 +6,19 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..provisioning.secret_store import WindowsSecretStore
+from ..state_store import atomic_json
+from .mt5_broker_discovery import (
+    BrokerDiscoveryError,
+    BrokerDiscoveryRequest,
+    BrokerDiscoveryResult,
+    WindowsMt5BrokerDiscovery,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,7 @@ class NativeMt5Runtime:
         self.state = self.root / "state"
         self._process: subprocess.Popen[bytes] | None = None
         self._interactive_task: str | None = None
+        self._broker_discovery_task: str | None = None
         self._last_symbol: str | None = None
 
     def install_expert(self, expert_binary: Path, history_mode: str = "new_only") -> Path:
@@ -229,19 +236,21 @@ class NativeMt5Runtime:
                 "",
             ]
         content = "\n".join((*common, *sections))
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-        finally:
-            content = ""
-        try:
             self._restrict_startup_acl(path)
         except Exception:
-            self._secure_delete_config(path)
+            if password is not None:
+                self._secure_delete_sensitive_config(path)
+            else:
+                self._secure_delete_config(path)
             raise
+        finally:
+            content = ""
         return path
 
     def _interactive_user(self) -> str:
@@ -275,6 +284,12 @@ class NativeMt5Runtime:
         if path is None:
             return
         try:
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+                return
+        except OSError:
+            pass
+        try:
             size = max(path.stat().st_size, 1024)
             with path.open("r+b") as handle:
                 handle.seek(0)
@@ -288,6 +303,26 @@ class NativeMt5Runtime:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    @staticmethod
+    def _secure_delete_sensitive_config(
+        path: Path | None, *, attempts: int = 20, retry_delay: float = 0.1
+    ) -> None:
+        """Delete a plaintext credential file and prove it is gone."""
+
+        if path is None:
+            return
+        for attempt in range(attempts):
+            NativeMt5Runtime._secure_delete_config(path)
+            try:
+                exists = path.exists() or path.is_symlink()
+            except OSError:
+                exists = True
+            if not exists:
+                return
+            if attempt + 1 < attempts:
+                time.sleep(retry_delay)
+        raise NativeMt5Error("sensitive_startup_cleanup_failed")
 
     @staticmethod
     def _setting(name: str) -> str:
@@ -396,6 +431,40 @@ class NativeMt5Runtime:
             time.sleep(0.5)
         raise NativeMt5Error("authorization_timeout")
 
+    def _wait_for_startup_config_consumption(
+        self,
+        checkpoint: dict[Path, int],
+        filename: str,
+        timeout: float,
+    ) -> None:
+        """Wait until MT5 confirms it loaded a sensitive startup config.
+
+        Broker discovery can legitimately delay authorization.  The password file must not stay
+        on disk for that whole interval, so it is removed as soon as MT5 confirms that it has
+        consumed the config, independently of whether the broker is reachable yet.
+        """
+        expected = Path(filename).name.casefold()
+        deadline = time.monotonic() + timeout
+        seen_process = False
+        while time.monotonic() < deadline:
+            for line in self._journal_lines_since(checkpoint):
+                folded = line.casefold()
+                if "successfully initialized from start config" in folded and expected in folded:
+                    return
+
+            pids = self._running_terminal_pids()
+            if pids:
+                seen_process = True
+            if self._process is not None:
+                if self._process.poll() is None:
+                    seen_process = True
+                elif seen_process and not pids:
+                    raise NativeMt5Error("mt5_process_crashed")
+            elif seen_process and not pids:
+                raise NativeMt5Error("mt5_process_crashed")
+            time.sleep(0.25)
+        raise NativeMt5Error("startup_config_not_consumed")
+
     def _wait_for_account_database(self, timeout: float) -> None:
         accounts = self.terminal_root / "Config" / "accounts.dat"
         deadline = time.monotonic() + timeout
@@ -473,6 +542,285 @@ class NativeMt5Runtime:
             raise NativeMt5Error("broker_symbol_probe_failed")
         return symbol
 
+    def _wait_for_terminal_pids(self, timeout: float) -> tuple[int, ...]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pids = tuple(dict.fromkeys(self._running_terminal_pids()))
+            if pids:
+                return pids
+            if self._process is not None and self._process.poll() is not None:
+                raise NativeMt5Error("broker_discovery_terminal_not_found")
+            time.sleep(0.1)
+        raise NativeMt5Error("broker_discovery_terminal_not_found")
+
+    @staticmethod
+    def _validated_discovery_result(
+        result: BrokerDiscoveryResult, expected_server: str
+    ) -> BrokerDiscoveryResult:
+        if (
+            not isinstance(result, BrokerDiscoveryResult)
+            or result.server.casefold() != expected_server.casefold()
+        ):
+            raise NativeMt5Error("broker_discovery_identity_mismatch")
+        return result
+
+    @staticmethod
+    def _map_broker_discovery_error(error: BrokerDiscoveryError) -> NativeMt5Error:
+        return NativeMt5Error(f"broker_discovery_{error.code}")
+
+    def _run_interactive_broker_discovery(
+        self,
+        request: BrokerDiscoveryRequest,
+    ) -> BrokerDiscoveryResult:
+        """Run UIA in the same interactive desktop as MT5, never in service Session 0.
+
+        Only paths and non-secret broker labels are written to the request.  Account numbers,
+        passwords, credential envelopes and tokens are deliberately absent from both argv and
+        the JSON exchange files.
+        """
+
+        interactive_user = self._interactive_user()
+        if not interactive_user:
+            raise NativeMt5Error("broker_discovery_ui_unknown")
+
+        self.files.mkdir(parents=True, exist_ok=True)
+        request_path = self.files / "broker-discovery-request.json"
+        result_path = self.files / "broker-discovery-result.json"
+        launcher = self.state / "launch-broker-discovery.cmd"
+        task = f"TradeJournalMT5Discovery-{self.connection_id}"
+        for path in (request_path, result_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise NativeMt5Error("broker_discovery_internal_error") from exc
+
+        try:
+            atomic_json(
+                request_path,
+                {
+                    "terminal_path": str(request.terminal_path),
+                    "candidate_pids": list(request.candidate_pids),
+                    "expected_server": request.expected_server,
+                    "queries": list(request.queries),
+                    "timeout_seconds": request.timeout_seconds,
+                },
+            )
+            self._restrict_startup_acl(request_path)
+            repo_root = Path(__file__).resolve().parents[2]
+            discovery_python = self._discovery_python_executable(repo_root)
+            launcher_content = (
+                "@echo off\r\n"
+                f'cd /d "{repo_root}"\r\n'
+                f'"{discovery_python}" -m windows_agent.worker.mt5_broker_discovery '
+                f'--request "{request_path}" --result "{result_path}"\r\n'
+            )
+            launcher.write_text(launcher_content, encoding="utf-8")
+            self._restrict_startup_acl(launcher)
+        except Exception as exc:
+            for path in (request_path, result_path, launcher):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if isinstance(exc, NativeMt5Error):
+                raise
+            raise NativeMt5Error("broker_discovery_internal_error") from exc
+        create = [
+            "schtasks",
+            "/Create",
+            "/TN",
+            task,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "23:59",
+            "/RU",
+            interactive_user,
+            "/IT",
+            "/RL",
+            "LIMITED",
+            "/TR",
+            str(launcher),
+            "/F",
+        ]
+        try:
+            completed = subprocess.run(
+                create, capture_output=True, text=True, check=False
+            )
+            if completed.returncode != 0:
+                raise NativeMt5Error("broker_discovery_task_create_failed")
+            self._broker_discovery_task = task
+            completed = subprocess.run(
+                ["schtasks", "/Run", "/TN", task],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise NativeMt5Error("broker_discovery_task_run_failed")
+
+            deadline = time.monotonic() + request.timeout_seconds + 10.0
+            response: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                response = self._read_json(result_path)
+                if response is not None:
+                    break
+                time.sleep(0.1)
+            if response is None:
+                raise NativeMt5Error("broker_discovery_timeout")
+
+            if (
+                set(response) == {"ok", "code", "server", "query_index"}
+                and response.get("ok") is True
+                and response.get("code") == "ok"
+                and isinstance(response.get("server"), str)
+                and not isinstance(response.get("query_index"), bool)
+                and isinstance(response.get("query_index"), int)
+                and 0 <= response["query_index"] < 16
+            ):
+                result = BrokerDiscoveryResult(
+                    server=response["server"],
+                    query_index=response["query_index"],
+                )
+                return self._validated_discovery_result(
+                    result, request.expected_server
+                )
+
+            code = response.get("code")
+            if not isinstance(code, str) or code not in {
+                "invalid_request",
+                "terminal_not_found",
+                "terminal_ambiguous",
+                "ui_unknown",
+                "no_exact_match",
+                "ambiguous_exact_match",
+                "timeout",
+                "internal_error",
+            }:
+                code = "internal_error"
+            raise NativeMt5Error(f"broker_discovery_{code}")
+        finally:
+            if self._broker_discovery_task:
+                subprocess.run(
+                    ["schtasks", "/End", "/TN", self._broker_discovery_task],
+                    capture_output=True,
+                    check=False,
+                )
+                subprocess.run(
+                    [
+                        "schtasks",
+                        "/Delete",
+                        "/TN",
+                        self._broker_discovery_task,
+                        "/F",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                self._broker_discovery_task = None
+            for path in (request_path, result_path, launcher):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _discovery_python_executable(repo_root: Path) -> Path:
+        """Return the real venv interpreter, never pywin32's service host.
+
+        Inside a pywin32 service ``sys.executable`` may be ``PythonService.exe``;
+        that host cannot be used as a normal ``python -m`` command by the
+        interactive scheduled task.  The installer creates this repository-local
+        virtualenv explicitly, so its interpreter is the only accepted launcher.
+        """
+
+        candidate = repo_root / ".venv" / "Scripts" / "python.exe"
+        if not candidate.is_file():
+            raise NativeMt5Error("broker_discovery_python_missing")
+        return candidate
+
+    @staticmethod
+    def scrub_sensitive_startup_files(instance_root: Path) -> None:
+        """Remove plaintext startup credentials left by a killed worker/host."""
+
+        state = Path(instance_root).absolute() / "state"
+        if state.is_symlink():
+            raise NativeMt5Error("sensitive_startup_cleanup_failed")
+        NativeMt5Runtime._secure_delete_sensitive_config(
+            state / "login-bootstrap.ini"
+        )
+
+    def prepare_broker(
+        self,
+        *,
+        expected_server: str,
+        queries: Sequence[str],
+        discovery: WindowsMt5BrokerDiscovery | None = None,
+        timeout: float = 60.0,
+    ) -> BrokerDiscoveryResult:
+        """Resolve one broker in MT5 before the password is read from protected storage.
+
+        The terminal stays alive after success so the following password bootstrap uses the
+        in-memory discovery result even on builds that do not persist ``servers.dat`` when the
+        account wizard is closed.  Any failure stops only this isolated terminal instance.
+        """
+
+        if not self.terminal.is_file():
+            raise NativeMt5Error("terminal_start_failed")
+        # A prior worker may have died after writing its bootstrap.  Do this
+        # before any interactive helper is launched, and remove the persisted
+        # account cache so a retry cannot auto-connect during credential-free
+        # broker discovery.
+        self.scrub_sensitive_startup_files(self.root)
+        self._secure_delete_sensitive_config(
+            self.terminal_root / "Config" / "accounts.dat"
+        )
+        startup = self._write_startup_config(
+            None,
+            None,
+            None,
+            self._startup_symbol("EURUSD"),
+            keep_private=True,
+            start_expert=False,
+            filename="broker-discovery.ini",
+        )
+        try:
+            checkpoint = self._journal_checkpoint()
+            self._start_process(startup)
+            self._wait_for_startup_config_consumption(
+                checkpoint,
+                startup.name,
+                min(timeout, 30.0),
+            )
+            self._secure_delete_config(startup)
+            pids = self._wait_for_terminal_pids(min(timeout, 15.0))
+            try:
+                request = BrokerDiscoveryRequest(
+                    terminal_path=self.terminal,
+                    candidate_pids=pids,
+                    expected_server=expected_server,
+                    queries=tuple(queries),
+                    timeout_seconds=timeout,
+                )
+                if self._interactive_user():
+                    return self._run_interactive_broker_discovery(request)
+                worker = discovery or WindowsMt5BrokerDiscovery()
+                result = worker.discover(
+                    terminal_path=request.terminal_path,
+                    candidate_pids=request.candidate_pids,
+                    expected_server=request.expected_server,
+                    queries=request.queries,
+                    timeout_seconds=request.timeout_seconds,
+                )
+                return self._validated_discovery_result(result, expected_server)
+            except BrokerDiscoveryError as error:
+                raise self._map_broker_discovery_error(error) from error
+        except Exception:
+            self.stop()
+            raise
+        finally:
+            self._secure_delete_config(startup)
+
     def _start_process(
         self,
         config: Path,
@@ -492,15 +840,15 @@ class NativeMt5Runtime:
             command = str(launcher)
             create = [
                 "schtasks", "/Create", "/TN", task, "/SC", "ONCE", "/ST", "23:59",
-                "/RU", interactive_user, "/IT", "/RL", "HIGHEST", "/TR", command, "/F",
+                "/RU", interactive_user, "/IT", "/RL", "LIMITED", "/TR", command, "/F",
             ]
             completed = subprocess.run(create, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 raise NativeMt5Error("interactive_task_create_failed")
+            self._interactive_task = task
             completed = subprocess.run(["schtasks", "/Run", "/TN", task], capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 raise NativeMt5Error("interactive_task_run_failed")
-            self._interactive_task = task
             return None
         arguments = [str(self.terminal), "/portable"]
         if login_hint is not None:
@@ -597,6 +945,7 @@ class NativeMt5Runtime:
         *,
         login: int,
         server: str,
+        connection_target: str | None = None,
         investor_password: str,
         expert_binary: Path,
         history_mode: str = "new_only",
@@ -607,18 +956,22 @@ class NativeMt5Runtime:
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
-        symbol = self._startup_symbol(symbol)
-        self._last_symbol = symbol
-        self.install_expert(expert_binary, history_mode)
         bootstrap: Path | None = None
         discovery: Path | None = None
         startup: Path | None = None
         try:
+            symbol = self._startup_symbol(symbol)
+            self._last_symbol = symbol
+            self.install_expert(expert_binary, history_mode)
             # Phase 1: authenticate with the supplied investor password and ask MT5 to persist it
             # in Config/accounts.dat.  No chart or EA is opened during this first-start window.
+            # ``connection_target`` may be a catalogued host:port used only to reach the
+            # broker during the first login.  ``server`` remains the canonical MT5 identity
+            # checked in journals and account.json. Keeping the two values separate prevents
+            # a direct endpoint from weakening the post-authentication identity check.
             bootstrap = self._write_startup_config(
                 login,
-                server,
+                connection_target or server,
                 investor_password,
                 symbol,
                 keep_private=True,
@@ -629,10 +982,15 @@ class NativeMt5Runtime:
             gc.collect()
             checkpoint = self._journal_checkpoint()
             self._start_process(bootstrap)
+            self._wait_for_startup_config_consumption(
+                checkpoint,
+                bootstrap.name,
+                min(timeout, 30.0),
+            )
+            self._secure_delete_sensitive_config(bootstrap)
+            bootstrap = None
             self._wait_for_authorization(checkpoint, login, server, min(timeout, 120.0))
             self._wait_for_account_database(min(timeout, 15.0))
-            self._secure_delete_config(bootstrap)
-            bootstrap = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
 
@@ -692,7 +1050,7 @@ class NativeMt5Runtime:
         finally:
             investor_password = ""
             gc.collect()
-            self._secure_delete_config(bootstrap)
+            self._secure_delete_sensitive_config(bootstrap)
             self._secure_delete_config(discovery)
             self._secure_delete_config(startup)
 
@@ -729,6 +1087,24 @@ class NativeMt5Runtime:
         return value if isinstance(value, dict) else None
 
     def stop(self, timeout: float = 15.0) -> bool:
+        if self._broker_discovery_task:
+            subprocess.run(
+                ["schtasks", "/End", "/TN", self._broker_discovery_task],
+                capture_output=True,
+                check=False,
+            )
+            subprocess.run(
+                [
+                    "schtasks",
+                    "/Delete",
+                    "/TN",
+                    self._broker_discovery_task,
+                    "/F",
+                ],
+                capture_output=True,
+                check=False,
+            )
+            self._broker_discovery_task = None
         if self._interactive_task:
             subprocess.run(["schtasks", "/End", "/TN", self._interactive_task], capture_output=True, check=False)
             subprocess.run(["schtasks", "/Delete", "/TN", self._interactive_task, "/F"], capture_output=True, check=False)
@@ -737,6 +1113,15 @@ class NativeMt5Runtime:
             (self.state / "launch-terminal.cmd").unlink(missing_ok=True)
         except OSError:
             pass
+        for path in (
+            self.state / "launch-broker-discovery.cmd",
+            self.files / "broker-discovery-request.json",
+            self.files / "broker-discovery-result.json",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         process = self._process
         if process is not None and process.poll() is None:
             process.terminate()

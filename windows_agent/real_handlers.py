@@ -10,6 +10,7 @@ from typing import Any, Callable
 from .agent_errors import (
     AccountIdentityMismatch,
     AgentError,
+    BrokerResolutionFailed,
     CredentialDecryptionFailed,
     CredentialEnvelopeInvalid,
     DeprovisionFailed,
@@ -23,6 +24,12 @@ from .agent_errors import (
     TerminalStartFailed,
 )
 from .agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
+from .broker_registry import BrokerResolution, ResolutionMethod
+from .broker_resolution import (
+    BrokerPlanResolver,
+    ZeroLicenseBrokerResolver,
+    validate_resolution_plan,
+)
 from .credential_envelope import decrypt_credential_envelope
 from .job_runner import LeaseLost
 from .provisioning.instance_layout import InstanceLayout
@@ -149,7 +156,8 @@ def _ensure_no_stale_process(
 ) -> None:
     """Remove only an orphan using this isolated terminal path before a new job."""
     if terminal.is_file() and ProcessManager.find(terminal):
-        process_factory(state_path).cleanup_path(terminal)
+        if not process_factory(state_path).cleanup_path(terminal):
+            raise TerminalStartFailed("stale terminal cleanup failed")
 
 
 def sweep_stale_instances(
@@ -163,12 +171,25 @@ def sweep_stale_instances(
     if not instances_root.exists():
         return swept
     for entry in instances_root.iterdir():
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.is_symlink():
+            continue
+        try:
+            canonical_uuid(entry.name)
+        except ValueError:
             continue
         terminal = entry / "terminal" / "terminal64.exe"
         if terminal.is_file() and ProcessManager.find(terminal):
-            process_factory(entry / "state" / "terminal-process.json").cleanup_path(terminal)
+            cleaned = process_factory(
+                entry / "state" / "terminal-process.json"
+            ).cleanup_path(terminal)
+            if not cleaned:
+                raise RuntimeError("stale terminal cleanup failed")
             swept.append(entry.name)
+        # A killed service/host can leave the ACL-restricted plaintext login INI
+        # even when no terminal process survived.  Terminate an exact stale
+        # terminal first in case it still holds the file open, then prove the
+        # plaintext artifact is absent before another job can be claimed.
+        NativeMt5Runtime.scrub_sensitive_startup_files(entry)
     return swept
 
 
@@ -199,6 +220,7 @@ def build_real_handlers(
     expert_binary: Path = DEFAULT_EXPERT_BINARY,
     runtime_factory: Callable[[Path, str], NativeMt5Runtime] = NativeMt5Runtime,
     trading_ingestion_url: str = "",
+    broker_resolver: BrokerPlanResolver | None = None,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers, reusing exactly the same building
     blocks as customer_flow.py (InstanceProvisioner, WindowsSecretStore, HistorySync, LiveSync)
@@ -207,13 +229,33 @@ def build_real_handlers(
     only for explicitly injected legacy/testing fallback calls and is never the default."""
 
     store = WindowsSecretStore(secrets_root)
+    resolver = (
+        broker_resolver
+        if broker_resolver is not None
+        else ZeroLicenseBrokerResolver()
+    )
 
     def provision(job: dict) -> dict:
         cid = canonical_uuid(str(job["connection_id"]))
         payload = job.get("payload") or {}
         _require_lease(api, job)
+        # Broker planning consumes only validated, non-secret identity fields and
+        # must finish before the credential envelope is opened.
+        login, requested_server = _expected_identity(payload)
+        try:
+            resolution = validate_resolution_plan(
+                resolver.resolve(
+                    requested_server,
+                    broker_hint=payload.get("broker_hint"),
+                ),
+                requested_server=requested_server,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CredentialEnvelopeInvalid("broker resolution input or plan is invalid") from exc
+        server = resolution.expected_server
+        if server is None:  # Kept explicit for type checkers and injected implementations.
+            raise CredentialEnvelopeInvalid("broker resolution did not identify a server")
         password = _decrypt_envelope(payload, secrets_root)
-        login, server = _expected_identity(payload)
         mode, from_date = _history_window(job)
 
         bridge_token = payload.get("bridge_token")
@@ -254,7 +296,7 @@ def build_real_handlers(
 
         if adapter_factory is None:
             result = _start_file_bridge_and_sync(
-                job, api, root, cid, login, server, mode, from_date, store,
+                job, api, root, cid, login, resolution, mode, from_date, store,
                 process_factory, expert_binary, runtime_factory,
             )
         else:
@@ -434,7 +476,7 @@ def _start_file_bridge_and_sync(
     root: Path,
     cid: str,
     login: int,
-    server: str,
+    resolution: BrokerResolution,
     mode: HistoryMode,
     from_date: "datetime | None",
     store: WindowsSecretStore,
@@ -447,43 +489,115 @@ def _start_file_bridge_and_sync(
     No Python MT5 IPC session is created here. The password is only supplied to the protected
     startup config inside ``NativeMt5Runtime`` and is cleared before file parsing/history sync.
     """
+    server = resolution.expected_server
+    if server is None:
+        raise Mt5InitializeFailed("broker resolution did not identify a server")
     terminal = root / "terminal" / "terminal64.exe"
     state_path = root / "state" / "terminal-process.json"
     _ensure_no_stale_process(terminal, state_path, process_factory)
     _require_lease(api, job)
-    _progress(root, status="starting_native_file_bridge")
+    runtime = runtime_factory(root, cid)
+    prepared_discovery_terminal = False
+    if resolution.method is ResolutionMethod.TERMINAL_DISCOVERY:
+        _progress(root, status="resolving_broker")
+        try:
+            runtime.prepare_broker(
+                expected_server=server,
+                queries=resolution.discovery_queries,
+            )
+        except NativeMt5Error as exc:
+            code = str(exc)
+            if code == "terminal_start_failed":
+                raise TerminalStartFailed(code) from exc
+            raise BrokerResolutionFailed(code) from exc
+        prepared_discovery_terminal = True
+        try:
+            _require_lease(api, job)
+            _progress(root, status="broker_resolved")
+        except Exception:
+            # Discovery deliberately leaves this isolated terminal alive so the
+            # login bootstrap can reuse its in-memory broker cache.  If ownership
+            # cannot be handed to that bootstrap, do not orphan the process.
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+            raise
+
+    # Read the credential only after any UI discovery has completed.  The UIA helper receives
+    # only the exact server and non-secret search queries and cannot access this local variable.
+    try:
+        _progress(root, status="starting_native_file_bridge")
+    except Exception:
+        if prepared_discovery_terminal:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+        raise
     try:
         investor_password = store.read(cid, "mt5_investor_password")
     except Exception as exc:
+        if prepared_discovery_terminal:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
         raise SecretStoreFailed("stored credential unavailable") from exc
+    start_kwargs: dict[str, Any] = {}
     try:
-        runtime = runtime_factory(root, cid)
-        status = runtime.start(
+        start_kwargs = dict(
             login=login,
             server=server,
             investor_password=investor_password,
             expert_binary=expert_binary,
             history_mode=mode,
         )
+        if resolution.method is ResolutionMethod.DIRECT_ENDPOINT:
+            start_kwargs["connection_target"] = resolution.connection_target
+        status = runtime.start(**start_kwargs)
     except NativeMt5Error as exc:
+        if prepared_discovery_terminal:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
         code = str(exc)
         if code == "investor_readonly_not_verified":
             raise InvestorAccessNotVerified(code) from exc
         if code in ("identity_mismatch", "server_identity_mismatch"):
             raise AccountIdentityMismatch(code) from exc
+        if code.startswith("broker_discovery_"):
+            raise BrokerResolutionFailed(code) from exc
         if code == "terminal_start_failed":
             raise TerminalStartFailed(code) from exc
         raise Mt5InitializeFailed(code) from exc
+    except Exception:
+        if prepared_discovery_terminal:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+        raise
     finally:
+        start_kwargs.clear()
         investor_password = ""
         gc.collect()
 
     try:
         process_factory(state_path).adopt(terminal)
-    except (AttributeError, RuntimeError):
-        # The runtime owns an already-started, exact terminal path. Adoption is persistence for
-        # deprovision/recovery; a test double may intentionally omit real OS process discovery.
+    except AttributeError:
+        # A narrow unit-test double may intentionally omit process adoption.
         pass
+    except Exception as exc:
+        # Zero or multiple exact processes is also evidence that the discovery ->
+        # login handoff did not retain a single owned instance.  Never report the
+        # connection as ready without durable deprovision/recovery ownership.
+        try:
+            runtime.stop()
+        except Exception:
+            pass
+        raise Mt5InitializeFailed("terminal_process_adoption_failed") from exc
     adapter = Mql5FileMt5Adapter(status.files_path, cid, login, server, root / "state")
     try:
         _verify_investor_access(adapter)

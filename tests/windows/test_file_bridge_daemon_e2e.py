@@ -43,6 +43,10 @@ class FakeNativeRuntime:
         self.root = root
         self.connection_id = connection_id
 
+    def prepare_broker(self, **kwargs: Any) -> None:
+        assert kwargs["expected_server"] == "Demo"
+        assert kwargs["queries"][0] == "Demo"
+
     def start(self, **kwargs: Any) -> NativeMt5Status:
         assert kwargs["expert_binary"].name == "TradeJournalBridge.ex5"
         files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"

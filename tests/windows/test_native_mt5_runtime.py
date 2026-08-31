@@ -7,6 +7,10 @@ from unittest.mock import ANY, Mock, call, patch
 import pytest
 
 from windows_agent.provisioning.secret_store import WindowsSecretStore
+from windows_agent.worker.mt5_broker_discovery import (
+    BrokerDiscoveryRequest,
+    BrokerDiscoveryResult,
+)
 from windows_agent.worker.native_mt5_runtime import (
     NativeMt5Error,
     NativeMt5Runtime,
@@ -70,6 +74,10 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     bootstrap.write_text("Password=not-a-real-secret")
     discovery.write_text("KeepPrivate=1")
     startup.write_text("KeepPrivate=1")
+
+    def assert_sensitive_config_removed(*_args: object) -> None:
+        assert not bootstrap.exists()
+
     expected = NativeMt5Status(
         pid=123,
         account={"login": "42", "server": "Demo", "trade_allowed": False},
@@ -84,7 +92,14 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         ) as write_config,
         patch.object(runtime, "_journal_checkpoint", return_value={}) as checkpoint,
         patch.object(runtime, "_start_process") as start_process,
-        patch.object(runtime, "_wait_for_authorization") as wait_for_authorization,
+        patch.object(
+            runtime, "_wait_for_startup_config_consumption"
+        ) as wait_for_config_consumption,
+        patch.object(
+            runtime,
+            "_wait_for_authorization",
+            side_effect=assert_sensitive_config_removed,
+        ) as wait_for_authorization,
         patch.object(runtime, "_wait_for_account_database") as wait_for_database,
         patch.object(runtime, "_wait_for_investor_sync") as wait_for_investor_sync,
         patch.object(
@@ -138,6 +153,7 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         call({}, 42, "Demo", ANY),
         call({}, 42, "Demo", ANY),
     ]
+    wait_for_config_consumption.assert_called_once_with({}, "login-bootstrap.ini", ANY)
     wait_for_database.assert_called_once_with(ANY)
     assert wait_for_investor_sync.call_args_list == [
         call({}, 42, ANY),
@@ -164,6 +180,297 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert "InpBackfillHours=168" in template
     assert "InpSnapshotHistoryHours=87600" in template
     assert "InpCandleBars=200\n</inputs>" in template
+
+
+def test_start_uses_connection_target_only_for_initial_login(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    bootstrap = runtime.state / "login-bootstrap.ini"
+    bootstrap.parent.mkdir()
+    bootstrap.write_text("temporary")
+
+    with (
+        patch.object(runtime, "_write_startup_config", return_value=bootstrap) as write_config,
+        patch.object(runtime, "_journal_checkpoint", return_value={}),
+        patch.object(runtime, "_start_process"),
+        patch.object(runtime, "_wait_for_startup_config_consumption"),
+        patch.object(
+            runtime,
+            "_wait_for_authorization",
+            side_effect=NativeMt5Error("test_stop_after_login"),
+        ) as wait_for_authorization,
+        patch.object(runtime, "stop", return_value=True),
+    ):
+        with pytest.raises(NativeMt5Error, match="test_stop_after_login"):
+            runtime.start(
+                login=42,
+                server="Broker-Live",
+                connection_target="mt5.example.invalid:443",
+                investor_password="placeholder",
+                expert_binary=expert,
+            )
+
+    write_config.assert_called_once_with(
+        42,
+        "mt5.example.invalid:443",
+        "placeholder",
+        "EURUSD",
+        keep_private=True,
+        start_expert=False,
+        filename="login-bootstrap.ini",
+    )
+    wait_for_authorization.assert_called_once_with({}, 42, "Broker-Live", ANY)
+    assert not bootstrap.exists()
+
+
+def test_prepare_broker_runs_credential_free_and_keeps_terminal_alive(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "broker-discovery.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+    stale_bootstrap = runtime.state / "login-bootstrap.ini"
+    stale_bootstrap.write_text("Password=stale", encoding="utf-8")
+    accounts = runtime.terminal_root / "Config" / "accounts.dat"
+    accounts.parent.mkdir()
+    accounts.write_bytes(b"persisted-account")
+
+    class Discovery:
+        calls: list[dict[str, object]] = []
+
+        def discover(self, **kwargs: object) -> BrokerDiscoveryResult:
+            self.calls.append(kwargs)
+            assert set(kwargs) == {
+                "terminal_path",
+                "candidate_pids",
+                "expected_server",
+                "queries",
+                "timeout_seconds",
+            }
+            return BrokerDiscoveryResult(server="Broker-Live", query_index=1)
+
+    discovery = Discovery()
+    with (
+        patch.object(runtime, "_write_startup_config", return_value=config) as write_config,
+        patch.object(runtime, "_journal_checkpoint", return_value={}),
+        patch.object(runtime, "_start_process") as start_process,
+        patch.object(runtime, "_wait_for_startup_config_consumption") as consumed,
+        patch.object(runtime, "_wait_for_terminal_pids", return_value=(101, 102)),
+        patch.object(runtime, "_interactive_user", return_value=""),
+        patch.object(runtime, "stop", return_value=True) as stop,
+    ):
+        result = runtime.prepare_broker(
+            expected_server="Broker-Live",
+            queries=("Broker Ltd", "Broker-Live"),
+            discovery=discovery,  # type: ignore[arg-type]
+            timeout=45,
+        )
+
+    assert result == BrokerDiscoveryResult(server="Broker-Live", query_index=1)
+    write_config.assert_called_once_with(
+        None,
+        None,
+        None,
+        "EURUSD",
+        keep_private=True,
+        start_expert=False,
+        filename="broker-discovery.ini",
+    )
+    start_process.assert_called_once_with(config)
+    consumed.assert_called_once_with({}, "broker-discovery.ini", 30.0)
+    assert discovery.calls == [
+        {
+            "terminal_path": runtime.terminal,
+            "candidate_pids": (101, 102),
+            "expected_server": "Broker-Live",
+            "queries": ("Broker Ltd", "Broker-Live"),
+            "timeout_seconds": 45.0,
+        }
+    ]
+    assert stop.call_count == 0
+    assert not config.exists()
+    assert not stale_bootstrap.exists()
+    assert not accounts.exists()
+
+
+def test_sensitive_startup_cleanup_fails_closed_when_file_remains(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    bootstrap = runtime.state / "login-bootstrap.ini"
+    bootstrap.parent.mkdir()
+    bootstrap.write_text("Password=stale", encoding="utf-8")
+
+    with (
+        patch.object(NativeMt5Runtime, "_secure_delete_config"),
+        pytest.raises(NativeMt5Error, match="sensitive_startup_cleanup_failed"),
+    ):
+        runtime._secure_delete_sensitive_config(
+            bootstrap, attempts=2, retry_delay=0
+        )
+
+
+def test_discovery_python_requires_repository_venv_interpreter(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(NativeMt5Error, match="broker_discovery_python_missing"):
+        NativeMt5Runtime._discovery_python_executable(tmp_path)
+
+    interpreter = tmp_path / ".venv" / "Scripts" / "python.exe"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"python")
+    assert NativeMt5Runtime._discovery_python_executable(tmp_path) == interpreter
+
+
+def test_prepare_broker_failure_stops_only_the_isolated_terminal(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "broker-discovery.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+
+    class WrongDiscovery:
+        @staticmethod
+        def discover(**_kwargs: object) -> BrokerDiscoveryResult:
+            return BrokerDiscoveryResult(server="Broker-Demo", query_index=0)
+
+    with (
+        patch.object(runtime, "_write_startup_config", return_value=config),
+        patch.object(runtime, "_journal_checkpoint", return_value={}),
+        patch.object(runtime, "_start_process"),
+        patch.object(runtime, "_wait_for_startup_config_consumption"),
+        patch.object(runtime, "_wait_for_terminal_pids", return_value=(101,)),
+        patch.object(runtime, "_interactive_user", return_value=""),
+        patch.object(runtime, "stop", return_value=True) as stop,
+    ):
+        with pytest.raises(
+            NativeMt5Error, match="broker_discovery_identity_mismatch"
+        ):
+            runtime.prepare_broker(
+                expected_server="Broker-Live",
+                queries=("Broker",),
+                discovery=WrongDiscovery(),  # type: ignore[arg-type]
+            )
+
+    stop.assert_called_once_with()
+    assert not config.exists()
+
+
+def test_interactive_discovery_task_contains_no_account_or_credentials(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    runtime.state.mkdir()
+    request = BrokerDiscoveryRequest(
+        terminal_path=runtime.terminal,
+        candidate_pids=(101,),
+        expected_server="Broker-Live",
+        queries=("Broker Ltd",),
+        timeout_seconds=10,
+    )
+    captured: dict[str, str] = {}
+    discovery_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    discovery_python.parent.mkdir(parents=True)
+    discovery_python.write_bytes(b"python")
+
+    def run(args: list[str], **_kwargs: object) -> Mock:
+        if "/Run" in args:
+            request_path = runtime.files / "broker-discovery-request.json"
+            launcher = runtime.state / "launch-broker-discovery.cmd"
+            captured["request"] = request_path.read_text(encoding="utf-8")
+            captured["launcher"] = launcher.read_text(encoding="utf-8")
+            (runtime.files / "broker-discovery-result.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "code": "ok",
+                        "server": "Broker-Live",
+                        "query_index": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return Mock(returncode=0)
+
+    with (
+        patch.object(runtime, "_interactive_user", return_value="AgentUser"),
+        patch.object(runtime, "_restrict_startup_acl"),
+        patch.object(
+            runtime,
+            "_discovery_python_executable",
+            return_value=discovery_python,
+        ),
+        patch("subprocess.run", side_effect=run) as subprocess_run,
+    ):
+        result = runtime._run_interactive_broker_discovery(request)
+
+    assert result.server == "Broker-Live"
+    assert result.query_index == 0
+    assert "Broker-Live" in captured["request"]
+    assert "Broker Ltd" in captured["request"]
+    assert str(discovery_python) in captured["launcher"]
+    combined = (captured["request"] + captured["launcher"]).casefold()
+    for forbidden in (
+        "account",
+        "login",
+        "password",
+        "credential",
+        "token",
+        "authorization",
+    ):
+        assert forbidden not in combined
+    create_args = subprocess_run.call_args_list[0].args[0]
+    assert "/IT" in create_args
+    assert "/RU" in create_args
+    assert "AgentUser" in create_args
+    assert "LIMITED" in create_args
+    assert "HIGHEST" not in create_args
+    assert not (runtime.files / "broker-discovery-request.json").exists()
+    assert not (runtime.files / "broker-discovery-result.json").exists()
+    assert not (runtime.state / "launch-broker-discovery.cmd").exists()
+
+
+def test_stop_cleans_orphaned_broker_discovery_task_and_exchange_files(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.state.mkdir()
+    runtime.files.mkdir(parents=True)
+    runtime._broker_discovery_task = "TradeJournalMT5Discovery-test"
+    paths = (
+        runtime.state / "launch-broker-discovery.cmd",
+        runtime.files / "broker-discovery-request.json",
+        runtime.files / "broker-discovery-result.json",
+    )
+    for path in paths:
+        path.write_text("non-secret")
+
+    with (
+        patch("subprocess.run", return_value=Mock(returncode=0)) as run,
+        patch.object(runtime, "_running_terminal_pids", return_value=[]),
+        patch.object(runtime, "_running_metaeditor_pids", return_value=[]),
+    ):
+        assert runtime.stop()
+
+    assert runtime._broker_discovery_task is None
+    assert all(not path.exists() for path in paths)
+    assert run.call_args_list[0].args[0] == [
+        "schtasks",
+        "/End",
+        "/TN",
+        "TradeJournalMT5Discovery-test",
+    ]
+    assert run.call_args_list[1].args[0] == [
+        "schtasks",
+        "/Delete",
+        "/TN",
+        "TradeJournalMT5Discovery-test",
+        "/F",
+    ]
 
 
 def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path, monkeypatch) -> None:
@@ -194,6 +501,7 @@ def test_start_uses_loader_to_attach_bridge_after_account_sync(tmp_path: Path) -
         ),
         patch.object(runtime, "_journal_checkpoint", return_value={}),
         patch.object(runtime, "_start_process") as start_process,
+        patch.object(runtime, "_wait_for_startup_config_consumption"),
         patch.object(runtime, "_wait_for_authorization"),
         patch.object(runtime, "_wait_for_account_database"),
         patch.object(runtime, "_wait_for_investor_sync"),
@@ -241,6 +549,30 @@ def test_start_process_uses_portable_config(tmp_path: Path) -> None:
     assert "/portable" in args
     assert "/login:42" in args
     assert any(value.startswith("/config:") for value in args)
+
+
+def test_interactive_start_tracks_task_when_run_fails(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    config = runtime.state / "startup.ini"
+    config.parent.mkdir()
+    config.write_text("temporary")
+
+    with (
+        patch.object(runtime, "_interactive_user", return_value="AgentUser"),
+        patch(
+            "subprocess.run",
+            side_effect=[Mock(returncode=0), Mock(returncode=1)],
+        ) as run,
+        pytest.raises(NativeMt5Error, match="interactive_task_run_failed"),
+    ):
+        runtime._start_process(config)
+
+    assert runtime._interactive_task == (
+        "TradeJournalMT5-00000000-0000-4000-8000-000000000001"
+    )
+    create_args = run.call_args_list[0].args[0]
+    assert "LIMITED" in create_args
+    assert "HIGHEST" not in create_args
 
 
 def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
@@ -349,6 +681,32 @@ def test_wait_for_authorization_reads_only_new_journal_lines(tmp_path: Path) -> 
         runtime._wait_for_authorization(checkpoint, 42, "Demo", 1.0)
 
 
+def test_wait_for_startup_config_consumption_reads_only_new_journal_lines(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    logs = runtime.terminal_root / "logs"
+    logs.mkdir()
+    journal = logs / "20260718.log"
+    journal.write_bytes(
+        "AA\t0\t10:00:00\tStartup\tsuccessfully initialized from start config "
+        '"old-bootstrap.ini"\r\n'.encode("utf-16-le")
+    )
+    checkpoint = runtime._journal_checkpoint()
+    with journal.open("ab") as handle:
+        handle.write(
+            (
+                "BB\t0\t10:00:01\tStartup\tsuccessfully initialized from start config "
+                '"C:\\Agent\\state\\login-bootstrap.ini"\r\n'
+            ).encode("utf-16-le")
+        )
+
+    with patch.object(runtime, "_running_terminal_pids", return_value=[123]):
+        runtime._wait_for_startup_config_consumption(
+            checkpoint, "login-bootstrap.ini", 1.0
+        )
+
+
 def test_wait_for_investor_sync_requires_sync_and_readonly_lines(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     logs = runtime.terminal_root / "logs"
@@ -399,6 +757,7 @@ def test_identity_and_readonly_guards(
         ),
         patch.object(runtime, "_journal_checkpoint", return_value={}),
         patch.object(runtime, "_start_process"),
+        patch.object(runtime, "_wait_for_startup_config_consumption"),
         patch.object(runtime, "_wait_for_authorization"),
         patch.object(runtime, "_wait_for_account_database"),
         patch.object(runtime, "_wait_for_investor_sync"),

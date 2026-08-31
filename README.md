@@ -4,8 +4,11 @@
 > `requirements-windows.txt` e `windows_agent`. Il percorso Ubuntu/Docker/Wine/MQL5 descritto
 > più avanti è conservato integralmente come legacy e non è più il percorso raccomandato.
 > L'agente Windows espone soltanto letture, richiede una password investor DEMO e non contiene
-> primitive di trading. Vedere [docs/windows/installation.md](docs/windows/installation.md) e
-> [docs/windows/demo-poc-runbook.md](docs/windows/demo-poc-runbook.md).
+> primitive di trading. Vedere [docs/windows/installation.md](docs/windows/installation.md),
+> [docs/windows/demo-poc-runbook.md](docs/windows/demo-poc-runbook.md) e il
+> [PoC di broker resolution](docs/windows/broker-resolution.md), inclusa la
+> [Phase 0 UIA credential-free](docs/windows/mt5-broker-discovery-uia.md) e
+> l'[adapter Win32 per Wine](docs/windows/mt5-broker-discovery-win32-wine.md).
 
 POC **isolato** per un Cloud Sync self-hosted di MetaTrader 5: un worker Python che rileva eventi
 di trading (apertura/modifica/chiusura posizioni, ordini pendenti) e li invia all'API di

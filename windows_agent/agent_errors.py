@@ -34,6 +34,10 @@ class TerminalStartFailed(AgentError):
     error_code = "terminal_start_failed"
 
 
+class BrokerResolutionFailed(AgentError):
+    error_code = "broker_resolution_failed"
+
+
 class Mt5InitializeFailed(AgentError):
     error_code = "mt5_initialize_failed"
 

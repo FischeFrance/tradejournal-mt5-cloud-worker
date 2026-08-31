@@ -512,6 +512,23 @@ def test_sweep_stale_instances_empty_root_is_safe(tmp_path):
     assert sweep_stale_instances(tmp_path / "does-not-exist") == []
 
 
+def test_sweep_removes_crash_left_login_bootstrap_without_running_process(
+    tmp_path, monkeypatch
+):
+    cid = str(uuid4())
+    instance = tmp_path / cid
+    state = instance / "state"
+    state.mkdir(parents=True)
+    bootstrap = state / "login-bootstrap.ini"
+    bootstrap.write_text("Password=crash-left-secret", encoding="utf-8")
+    monkeypatch.setattr(
+        real_handlers.ProcessManager, "find", staticmethod(lambda _executable: [])
+    )
+
+    assert sweep_stale_instances(tmp_path) == []
+    assert not bootstrap.exists()
+
+
 # ---------------------------------------------------------------------------
 # Secrets never leak into logs/state
 # ---------------------------------------------------------------------------

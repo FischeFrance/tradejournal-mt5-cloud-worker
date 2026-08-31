@@ -3,6 +3,7 @@ MetaTrader5==5.0.5735
 httpx==0.28.1
 cryptography==49.0.0
 pywin32==311
+pywinauto==0.6.9
 psutil==7.0.0
 types-psutil==7.2.2.20260518
 types-pywin32==312.0.0.20260609
