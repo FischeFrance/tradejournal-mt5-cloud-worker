@@ -108,6 +108,17 @@ def test_stale_pid_cleanup_is_idempotent(tmp_path):
         encoding="utf-8",
     )
     assert manager.stop() is True
+    assert manager.stop() is True
+
+
+def test_stopped_tombstone_fails_closed_when_terminal_is_running(tmp_path, monkeypatch):
+    manager = ProcessManager(tmp_path / "state.json")
+    manager.state_path.write_text(
+        '{"schema_version":2,"stopped":true,"executable":"C:\\\\terminal\\\\terminal64.exe"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ProcessManager, "find", staticmethod(lambda _path: [321]))
+
     assert manager.stop() is False
 
 

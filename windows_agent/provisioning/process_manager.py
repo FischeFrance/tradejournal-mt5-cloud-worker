@@ -206,6 +206,20 @@ class ProcessManager:
         state = read_json(self.state_path)
         pid = state.get("pid")
         if not isinstance(pid, int):
+            executable = state.get("executable")
+            if (
+                state.get("schema_version") == self.STATE_SCHEMA_VERSION
+                and state.get("stopped") is True
+                and isinstance(executable, str)
+                and executable.strip()
+            ):
+                # A successful stop deliberately replaces the PID identity with this terminal
+                # tombstone. Replaying deprovision must accept it only while no matching process
+                # has appeared again; malformed or legacy state still fails closed.
+                try:
+                    return not self.find(Path(executable))
+                except (OSError, RuntimeError, ValueError):
+                    return False
             return False
         try:
             import psutil
