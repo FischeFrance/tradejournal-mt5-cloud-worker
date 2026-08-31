@@ -218,6 +218,54 @@ def test_corrupt_ready_slot_is_destroyed_and_never_claimed(
     assert pool.ready_count() == 0
 
 
+def test_stale_ready_slot_is_destroyed_and_never_claimed(
+    tmp_path: Path,
+) -> None:
+    pool = _pool(tmp_path, target_size=1)
+    slot = pool.build_one()
+    (pool.source_terminal.parent / "plugin.dll").write_bytes(
+        b"current-release-plugin"
+    )
+
+    assert pool.claim(str(uuid4())) is None
+    assert not slot.exists()
+    assert pool.ready_count() == 0
+
+
+def test_maintenance_replaces_slot_from_previous_template_release(
+    tmp_path: Path,
+) -> None:
+    pool = _pool(tmp_path, target_size=1)
+    old_slot = pool.build_one()
+    (pool.source_terminal.parent / "plugin.dll").write_bytes(
+        b"current-release-plugin"
+    )
+
+    assert pool.maintain_once() == 1
+
+    new_slot = pool.ready_slots()[0]
+    assert new_slot != old_slot
+    assert not old_slot.exists()
+    assert (
+        new_slot / "terminal" / "plugin.dll"
+    ).read_bytes() == b"current-release-plugin"
+
+
+def test_startup_recovery_discards_slot_from_previous_template_release(
+    tmp_path: Path,
+) -> None:
+    pool = _pool(tmp_path, target_size=1)
+    old_slot = pool.build_one()
+    (pool.source_terminal.parent / "plugin.dll").write_bytes(
+        b"current-release-plugin"
+    )
+
+    pool.recover_incomplete()
+
+    assert not old_slot.exists()
+    assert pool.ready_count() == 0
+
+
 def test_consumed_or_failed_slot_is_never_returned_to_ready(
     tmp_path: Path,
 ) -> None:
@@ -236,6 +284,57 @@ def test_consumed_or_failed_slot_is_never_returned_to_ready(
     assert pool.ready_count() == 1
     assert pool.ready_slots()[0].name != old_slot_id
     assert not (tmp_path / "instances" / connection_id).exists()
+
+
+def test_retry_discards_incomplete_instance_and_claims_fresh_ready_slot(
+    tmp_path: Path,
+) -> None:
+    pool = _pool(tmp_path, target_size=1)
+    pool.maintain_once()
+    connection_id = str(uuid4())
+    destination = tmp_path / "instances" / connection_id
+    (destination / "state").mkdir(parents=True)
+    (destination / "state" / "instance.json").write_text(
+        json.dumps(
+            {
+                "connection_id": connection_id,
+                "status": "preparing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (destination / "partial.marker").write_text(
+        "interrupted prior attempt",
+        encoding="utf-8",
+    )
+    secret = tmp_path / "secrets" / connection_id / "mt5_investor_password.dpapi"
+    secret.parent.mkdir(parents=True)
+    secret.write_bytes(b"fresh-retry-secret")
+
+    root = pool.claim(connection_id)
+
+    assert root == destination
+    assert not (destination / "partial.marker").exists()
+    assert read_json(destination / "state" / "instance.json")["status"] == (
+        "provisioned"
+    )
+    assert secret.read_bytes() == b"fresh-retry-secret"
+    assert pool.ready_count() == 0
+
+
+def test_retry_never_discards_invalid_published_instance(tmp_path: Path) -> None:
+    pool = _pool(tmp_path, target_size=1)
+    pool.maintain_once()
+    connection_id = str(uuid4())
+    root = pool.claim(connection_id)
+    assert root is not None
+    (root / "terminal" / "terminal64.exe").write_bytes(b"tampered")
+
+    with pytest.raises(InstancePoolError, match="published instance"):
+        pool.claim(connection_id)
+
+    assert root.exists()
+    assert pool.ready_count() == 0
 
 
 def test_empty_pool_returns_none_for_explicit_direct_copy_fallback(

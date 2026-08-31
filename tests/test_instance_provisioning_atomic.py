@@ -80,6 +80,33 @@ def test_existing_instance_rejects_tampered_terminal(tmp_path: Path) -> None:
         )
 
 
+def test_runtime_assets_are_pinned_per_instance_not_global_template(
+    tmp_path: Path,
+) -> None:
+    terminal = _template(tmp_path)
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+    root = provisioner.provision(connection_id, terminal)
+    assets = (
+        "MQL5/Experts/TradeJournal/TradeJournalBridge.ex5",
+        "MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5",
+        "MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5",
+    )
+    for relative in assets:
+        asset = root / "terminal" / relative
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_bytes(relative.encode("utf-8"))
+
+    first_pin = provisioner.seal_runtime_assets(connection_id)
+    assert provisioner.validate_runtime_assets(connection_id) == first_pin
+
+    (root / "terminal" / assets[0]).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="runtime assets mismatch"):
+        provisioner.validate_runtime_assets(connection_id)
+
+
 def test_template_symlink_is_rejected(tmp_path: Path) -> None:
     terminal = _template(tmp_path)
     outside = tmp_path / "outside.dat"

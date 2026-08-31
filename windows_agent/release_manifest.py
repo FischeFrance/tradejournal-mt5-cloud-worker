@@ -119,6 +119,19 @@ def _write_manifest(path: Path, payload: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _fsync_file(path: Path) -> None:
+    read_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    write_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(
+        os.fspath(path),
+        write_flags if os.name == "nt" else read_flags,
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def build_release(
     source_root: str | Path,
     output_root: str | Path,
@@ -159,8 +172,7 @@ def build_release(
                 target = stage.joinpath(*relative.split("/"))
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_file, target)
-                with target.open("rb") as handle:
-                    os.fsync(handle.fileno())
+                _fsync_file(target)
                 files.append(
                     {
                         "path": relative,

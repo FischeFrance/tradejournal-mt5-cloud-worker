@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,28 @@ class NativeMt5Runtime:
     """
 
     _MANAGED_CHART_PROFILE = "TradeJournal"
+    _CACHED_SYMBOL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}")
+    _BOOTSTRAP_BASE_SYMBOLS = (
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "USDCHF",
+        "AUDUSD",
+        "USDCAD",
+        "NZDUSD",
+        "XAUUSD",
+    )
+    _DISCOVERY_RESOLUTIONS = frozenset(
+        ("exact", "currency_pair", "name_related", "fallback")
+    )
+    _GENERATED_EXAMPLE_DIRS = (
+        Path("MQL5/Experts/Advisors"),
+        Path("MQL5/Experts/Examples"),
+        Path("MQL5/Experts/Free Robots"),
+        Path("MQL5/Indicators/Examples"),
+        Path("MQL5/Indicators/Free Indicators"),
+        Path("MQL5/Scripts/Examples"),
+    )
 
     def __init__(self, instance_root: Path, connection_id: str) -> None:
         self.root = instance_root.resolve()
@@ -87,16 +110,14 @@ class NativeMt5Runtime:
             durable_replace(temporary_expert, destination)
         finally:
             temporary_expert.unlink(missing_ok=True)
-        loader = (
+        discovery = (
             self.terminal_root
             / "MQL5"
             / "Scripts"
             / "TradeJournal"
-            / "TradeJournalLoader.ex5"
+            / "TradeJournalDiscovery.ex5"
         )
-        if not loader.is_file():
-            raise NativeMt5Error("loader_script_missing")
-        if not loader.with_name("TradeJournalDiscovery.ex5").is_file():
+        if not discovery.is_file():
             raise NativeMt5Error("discovery_script_missing")
         self.files.mkdir(parents=True, exist_ok=True)
         connection_tmp = self.files / "connection_id.tmp"
@@ -164,6 +185,183 @@ class NativeMt5Runtime:
             handle.write("\r\n".join(lines) + "\r\n")
             handle.flush()
             os.fsync(handle.fileno())
+        durable_replace(temporary, destination)
+        return destination
+
+    def _write_symbol_preference(self, preferred: str) -> Path:
+        if (
+            not preferred
+            or preferred != preferred.strip()
+            or len(preferred) > 64
+            or any(ord(character) < 32 for character in preferred)
+        ):
+            raise NativeMt5Error("invalid_startup_symbol")
+        self.files.mkdir(parents=True, exist_ok=True)
+        destination = self.files / "symbol-preference.txt"
+        temporary = self.files / "symbol-preference.tmp"
+        self._write_text_durable(temporary, preferred, "utf-8")
+        durable_replace(temporary, destination)
+        return destination
+
+    def _probe_broker_symbol(
+        self,
+        preferred: str,
+        login: int,
+        server: str,
+        timeout: float,
+    ) -> str:
+        if (
+            not isinstance(preferred, str)
+            or not preferred
+            or preferred != preferred.strip()
+            or type(login) is not int
+            or login <= 0
+            or not isinstance(server, str)
+            or not server
+            or server != server.strip()
+            or timeout <= 0
+        ):
+            raise NativeMt5Error("broker_symbol_probe_invalid")
+        output = self.files / "discovered-symbol.json"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            if output.is_file():
+                try:
+                    record = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise NativeMt5Error("broker_symbol_probe_invalid") from exc
+                if not isinstance(record, dict):
+                    raise NativeMt5Error("broker_symbol_probe_invalid")
+                symbol = record.get("symbol")
+                if (
+                    record.get("schema_version") != 1
+                    or record.get("connection_id") != self.connection_id
+                    or type(record.get("login")) is not int
+                    or record.get("login") != login
+                    or not isinstance(record.get("server"), str)
+                    or record["server"].casefold() != server.casefold()
+                    or record.get("requested_symbol") != preferred
+                    or record.get("resolution") not in self._DISCOVERY_RESOLUTIONS
+                    or type(record.get("catalog_total")) is not int
+                    or record["catalog_total"] <= 0
+                    or record.get("synchronized") is not True
+                    or type(record.get("terminal_build")) is not int
+                    or record["terminal_build"] <= 0
+                    or not isinstance(symbol, str)
+                    or not symbol
+                    or symbol != symbol.strip()
+                    or len(symbol) > 64
+                    or any(ord(character) < 32 for character in symbol)
+                ):
+                    raise NativeMt5Error("broker_symbol_probe_invalid")
+                return symbol
+            if self._process is not None and self._process.poll() is not None:
+                raise NativeMt5Error("mt5_process_crashed")
+            time.sleep(0.25)
+        raise NativeMt5Error("broker_symbol_probe_failed")
+
+    def _cached_broker_symbol(
+        self,
+        login: int,
+        server: str,
+        preferred: str,
+    ) -> str | None:
+        """Read an exact chart symbol from MT5's broker-scoped account cache.
+
+        The first authenticated terminal phase may create ``selected-<login>.dat``.
+        This private, broker-dependent cache is used only as a best-effort chart
+        hint.  A missing/unrecognizable token is not a failure: the caller falls
+        back to the configured symbol and the in-terminal Discovery script is
+        always the authoritative verifier before the bridge is installed.
+        """
+        if not isinstance(login, int) or isinstance(login, bool) or login <= 0:
+            raise NativeMt5Error("invalid_login")
+        if (
+            not server
+            or server != server.strip()
+            or len(server) > 128
+            or any(character in server for character in "\\/\r\n\0")
+        ):
+            raise NativeMt5Error("invalid_server")
+        if (
+            not preferred
+            or preferred != preferred.strip()
+            or len(preferred) > 64
+            or any(ord(character) < 32 for character in preferred)
+        ):
+            raise NativeMt5Error("invalid_startup_symbol")
+
+        bases = self.terminal_root / "Bases"
+        if not bases.exists():
+            return None
+        if self._is_reparse_point(bases) or not bases.is_dir():
+            raise NativeMt5Error("broker_symbol_cache_invalid")
+        try:
+            matching = [
+                entry
+                for entry in bases.iterdir()
+                if entry.name.casefold() == server.casefold()
+            ]
+        except OSError as exc:
+            raise NativeMt5Error("broker_symbol_cache_invalid") from exc
+        if len(matching) != 1:
+            return None
+
+        broker_root = matching[0]
+        symbols = broker_root / "symbols"
+        selected = symbols / f"selected-{login}.dat"
+        for path in (broker_root, symbols):
+            if not path.exists():
+                return None
+            if self._is_reparse_point(path) or not path.is_dir():
+                raise NativeMt5Error("broker_symbol_cache_invalid")
+        if not selected.exists():
+            return None
+        if self._is_reparse_point(selected) or not selected.is_file():
+            raise NativeMt5Error("broker_symbol_cache_invalid")
+        try:
+            size = selected.stat().st_size
+            if size <= 0 or size > 32 * 1024 * 1024:
+                raise NativeMt5Error("broker_symbol_cache_invalid")
+            payload = selected.read_bytes()
+        except NativeMt5Error:
+            raise
+        except OSError as exc:
+            raise NativeMt5Error("broker_symbol_cache_invalid") from exc
+
+        decoded = payload.decode("utf-16-le", errors="ignore")
+        tokens = set(self._CACHED_SYMBOL_TOKEN.findall(decoded))
+        base_symbols = tuple(
+            dict.fromkeys((preferred.upper(), *self._BOOTSTRAP_BASE_SYMBOLS))
+        )
+        candidates: list[tuple[int, int, int, str, str]] = []
+        for token in tokens:
+            folded = token.upper()
+            for priority, base in enumerate(base_symbols):
+                if base not in folded:
+                    continue
+                candidates.append(
+                    (
+                        priority,
+                        0 if folded == base else 1,
+                        abs(len(folded) - len(base)),
+                        folded,
+                        token,
+                    )
+                )
+                break
+        if not candidates:
+            return None
+        return min(candidates)[-1]
+
+    def _publish_bridge_handoff(self) -> Path:
+        template = self.files / "TradeJournalBridge.tpl"
+        if not template.is_file():
+            raise NativeMt5Error("bridge_template_invalid")
+        destination = self.files / "bridge-ready"
+        temporary = self.files / "bridge-ready.tmp"
+        self._write_text_durable(temporary, "ready\n", "ascii")
         durable_replace(temporary, destination)
         return destination
 
@@ -238,6 +436,46 @@ class NativeMt5Runtime:
         except OSError as exc:
             raise NativeMt5Error("chart_profile_cleanup_failed") from exc
         return len(removable)
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        try:
+            stat_result = os.lstat(path)
+        except OSError:
+            return True
+        return path.is_symlink() or bool(
+            getattr(stat_result, "st_file_attributes", 0) & 0x400
+        )
+
+    def _remove_generated_example_code(self) -> tuple[str, ...]:
+        """Remove only MT5's known generated examples while the terminal is stopped.
+
+        The first authenticated MT5 start can materialize bundled examples.  Leaving
+        them in the isolated instance makes the following Loader start perform a full
+        recompilation before the bridge can run.  Every target is fixed, contained in
+        this instance, and rejected if it is a reparse point.
+        """
+        if self._running_terminal_pids():
+            raise NativeMt5Error("generated_example_cleanup_in_use")
+        removed: list[str] = []
+        for relative in self._GENERATED_EXAMPLE_DIRS:
+            target = self.terminal_root / relative
+            if not target.exists():
+                continue
+            if self._is_reparse_point(target) or not target.is_dir():
+                raise NativeMt5Error("generated_example_cleanup_invalid")
+            for directory, names, files in os.walk(target, followlinks=False):
+                directory_path = Path(directory)
+                if self._is_reparse_point(directory_path):
+                    raise NativeMt5Error("generated_example_cleanup_invalid")
+                if any(
+                    self._is_reparse_point(directory_path / name)
+                    for name in (*names, *files)
+                ):
+                    raise NativeMt5Error("generated_example_cleanup_invalid")
+            shutil.rmtree(target)
+            removed.append(relative.as_posix())
+        return tuple(removed)
 
     def _write_startup_config(
         self,
@@ -650,37 +888,19 @@ class NativeMt5Runtime:
         raise NativeMt5Error("investor_sync_timeout")
 
     def _remove_readiness_files(self) -> None:
-        for name in ("account.json", "heartbeat.json"):
+        for name in (
+            "account.json",
+            "heartbeat.json",
+            "discovered-symbol.json",
+            "discovered-symbol.tmp",
+            "bridge-ready",
+            "bridge-ready.tmp",
+            "symbol-preference.tmp",
+        ):
             try:
                 (self.files / name).unlink(missing_ok=True)
             except OSError:
                 pass
-
-    def _write_symbol_preference(self, preferred: str) -> None:
-        # Published into the terminal's MQL5\Files sandbox BEFORE the discovery script starts, so
-        # TradeJournalDiscovery can resolve the real broker symbol (e.g. EURUSD.raw) in-terminal.
-        self.files.mkdir(parents=True, exist_ok=True)
-        (self.files / "discovered-symbol.json").unlink(missing_ok=True)
-        tmp = self.files / "symbol-preference.tmp"
-        self._write_text_durable(tmp, preferred, "ascii")
-        durable_replace(tmp, self.files / "symbol-preference.txt")
-
-    def _probe_broker_symbol(self, preferred: str, timeout: float = 30.0) -> str:
-        # Read the symbol resolved IN-TERMINAL by TradeJournalDiscovery (MQL5), published to the
-        # sandbox as discovered-symbol.json. This deliberately does NOT use the MetaTrader5 Python
-        # IPC (mt5.initialize): that path is intermittent (-10005 "IPC timeout") and is not designed
-        # for multiple terminals on one host -- both fatal for a multi-instance provisioner.
-        output = self.files / "discovered-symbol.json"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not output.is_file():
-            self._check_cancelled()
-            time.sleep(0.25)
-        record = self._read_json(output) if output.is_file() else None
-        symbol = str(record.get("symbol", "")) if record else ""
-        output.unlink(missing_ok=True)
-        if not symbol or len(symbol) > 64 or any(c in symbol for c in "\r\n"):
-            raise NativeMt5Error("broker_symbol_probe_failed")
-        return symbol
 
     def _start_process(
         self,
@@ -1079,7 +1299,6 @@ class NativeMt5Runtime:
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
         bootstrap: Path | None = None
-        discovery: Path | None = None
         startup: Path | None = None
         try:
             startup_server = connection_endpoint or server
@@ -1094,8 +1313,6 @@ class NativeMt5Runtime:
                 start_expert=False,
                 filename="login-bootstrap.ini",
             )
-            investor_password = ""
-            gc.collect()
             checkpoint = self._journal_checkpoint()
             self._start_process(bootstrap)
             observed_server = self._wait_for_authorization(
@@ -1112,63 +1329,41 @@ class NativeMt5Runtime:
                 else server
             )
             self._wait_for_account_database(min(timeout, 15.0))
+            # A broker cache token can improve the initial chart choice for suffix-only
+            # catalogues, but it is deliberately non-blocking.  If the private .dat format is
+            # absent or opaque (as observed with FTMO), start Discovery with the configured
+            # symbol and let the official in-terminal MQL5 catalogue resolve the final value.
+            bootstrap_symbol = (
+                self._cached_broker_symbol(login, effective_server, symbol) or symbol
+            )
             self._secure_delete_config(bootstrap)
             bootstrap = None
             if not self.stop():
                 raise NativeMt5Error("terminal_stop_failed")
             self._reset_managed_chart_profile()
+            self._remove_generated_example_code()
 
-            # Phase 2: open a credential-free discovery chart so MT5 hydrates the broker symbol
-            # catalogue. Once investor synchronization is proven, the in-terminal MQL5 script
-            # TradeJournalDiscovery selects the real broker symbol (for example EURUSD.raw instead
-            # of the generic EURUSD placeholder) and publishes it to the sandbox as
-            # discovered-symbol.json. No account password and no Python IPC are used here.
-            discovery = self._write_startup_config(
-                None,
-                None,
-                None,
-                symbol,
+            # Phase 2: re-authenticate from a protected, short-lived configuration and run the
+            # in-terminal Discovery script. A cache-derived chart symbol is only an optional hint;
+            # Discovery resolves and confirms the final symbol from MT5's official catalogue,
+            # synchronizes it, then publishes a result correlated to this account and instance.
+            self._remove_readiness_files()
+            self._write_symbol_preference(symbol)
+            self._last_symbol = bootstrap_symbol
+            startup = self._write_startup_config(
+                login,
+                effective_server,
+                investor_password,
+                bootstrap_symbol,
                 keep_private=True,
                 start_expert=False,
                 script_name="TradeJournal\\TradeJournalDiscovery",
-                filename="symbol-discovery.ini",
-            )
-            self._write_symbol_preference(symbol)
-            checkpoint = self._journal_checkpoint()
-            self._start_process(discovery, login)
-            self._wait_for_authorization(
-                checkpoint,
-                login,
-                effective_server,
-                min(timeout, 120.0),
-            )
-            self._wait_for_investor_sync(checkpoint, login, min(timeout, 300.0))
-            symbol = self._probe_broker_symbol(symbol)
-            self._last_symbol = symbol
-            self._secure_delete_config(discovery)
-            discovery = None
-            if not self.stop():
-                raise NativeMt5Error("terminal_stop_failed")
-            self._reset_managed_chart_profile()
-
-            # Phase 3: start passwordlessly on the persisted account. A read-only script receives
-            # OnStart immediately, waits for the account to be synchronized, then applies the
-            # template containing the real TradeJournalBridge EA. This avoids attaching an EA
-            # during MT5's account switch, where build 6032 can load it without delivering OnInit.
-            self._remove_readiness_files()
-            self._install_bridge_template(symbol)
-            startup = self._write_startup_config(
-                None,
-                None,
-                None,
-                symbol,
-                keep_private=True,
-                start_expert=False,
-                script_name="TradeJournal\\TradeJournalLoader",
                 filename="startup.ini",
             )
+            investor_password = ""
+            gc.collect()
             checkpoint = self._journal_checkpoint()
-            self._start_process(startup, login)
+            self._start_process(startup)
             self._wait_for_authorization(
                 checkpoint,
                 login,
@@ -1176,6 +1371,15 @@ class NativeMt5Runtime:
                 min(timeout, 120.0),
             )
             self._wait_for_investor_sync(checkpoint, login, min(timeout, 120.0))
+            resolved_symbol = self._probe_broker_symbol(
+                symbol,
+                login,
+                effective_server,
+                min(timeout, 120.0),
+            )
+            self._last_symbol = resolved_symbol
+            self._install_bridge_template(resolved_symbol)
+            self._publish_bridge_handoff()
             status = self._wait_for_heartbeat(
                 min(timeout, 90.0),
                 login,
@@ -1197,7 +1401,6 @@ class NativeMt5Runtime:
             investor_password = ""
             gc.collect()
             self._secure_delete_config(bootstrap)
-            self._secure_delete_config(discovery)
             self._secure_delete_config(startup)
 
     def resume(

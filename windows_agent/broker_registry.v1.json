@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "profiles": [
+    {
+      "profile_id": "fpm-trading-live",
+      "broker_id": "fpm-trading",
+      "broker_name": "FPM Trading Ltd",
+      "server": "FPMTrading-Live",
+      "environment": "live",
+      "aliases": [],
+      "discovery_queries": [
+        "FPM Trading Ltd",
+        "FPM Trading"
+      ],
+      "source": "vps-find-broker-validated-2026-07-22"
+    }
+  ]
+}

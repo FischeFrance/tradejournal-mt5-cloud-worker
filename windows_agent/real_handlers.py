@@ -204,6 +204,21 @@ def _verify_binary_pin(path: Path, expected_sha256: str | None) -> None:
         raise TerminalStartFailed("pinned binary digest mismatch")
 
 
+def _recorded_instance_terminal_sha256(root: Path) -> str:
+    """Return the immutable terminal pin published with one instance.
+
+    A template rotation applies to *new* instances only.  An already published
+    instance must continue to be checked against the digest recorded in its own
+    state file; comparing it to the current template would incorrectly mark a
+    healthy, older live session as corrupted.
+    """
+    state = read_json(root / "state" / "instance.json")
+    value = state.get("terminal_sha256") if isinstance(state, dict) else None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise InstanceProvisionFailed("published instance terminal digest invalid")
+    return value
+
+
 def _decrypt_envelope(payload: dict, secrets_root: Path) -> str:
     envelope = payload.get("credential_envelope")
     if not isinstance(envelope, dict):
@@ -1376,7 +1391,11 @@ def build_real_handlers(
             # call even if the instance was never fully provisioned (process.stop() is a no-op
             # when its state file is absent, and InstanceProvisioner.deprovision() is itself
             # idempotent, see test_fake_provision_deprovision_idempotent).
-            process_factory(root / "state" / "terminal-process.json").stop()
+            process = process_factory(root / "state" / "terminal-process.json")
+            process.stop()
+            terminal = root / "terminal" / "terminal64.exe"
+            if root.exists() and not process.cleanup_path(terminal):
+                raise RuntimeError("instance processes survived cleanup")
             InstanceProvisioner(instances_root, secrets_root).deprovision(cid)
         except Exception as exc:
             raise DeprovisionFailed("deprovision failed") from exc
@@ -1401,12 +1420,14 @@ def build_real_handlers(
         cid = canonical_uuid(str(job["connection_id"]))
         try:
             root = InstanceProvisioner(instances_root, secrets_root).validate(
-                cid, terminal_sha256, verify_code=False
+                cid,
+                verify_code=False,
             )
         except Exception as exc:
             raise InstanceProvisionFailed(
                 "provisioned instance integrity validation failed"
             ) from exc
+        recorded_terminal_sha256 = _recorded_instance_terminal_sha256(root)
         _record_checkpoint(
             api,
             job,
@@ -1427,16 +1448,36 @@ def build_real_handlers(
 
         terminal = root / "terminal" / "terminal64.exe"
         state_path = root / "state" / "terminal-process.json"
-        if not (terminal.is_file() and ProcessManager.find(terminal)):
+        _verify_binary_pin(terminal, recorded_terminal_sha256)
+        terminal_is_running = terminal.is_file() and ProcessManager.find(terminal)
+        provisioner = InstanceProvisioner(instances_root, secrets_root)
+        try:
+            provisioner.validate_runtime_assets(cid)
+        except ValueError as exc:
+            # Legacy instances predate the per-instance runtime asset pin.  A
+            # one-time seal is permitted only while their exact terminal is
+            # already running and its immutable terminal pin has passed above.
+            # The operation never overwrites an existing asset pin.
+            if "asset pin missing" not in str(exc) or not terminal_is_running:
+                raise InstanceProvisionFailed(
+                    "provisioned managed runtime assets invalid"
+                ) from exc
             try:
-                InstanceProvisioner(instances_root, secrets_root).validate(
-                    cid, terminal_sha256
+                provisioner.seal_runtime_assets(cid)
+            except Exception as seal_exc:
+                raise InstanceProvisionFailed(
+                    "legacy runtime asset migration failed"
+                ) from seal_exc
+        if not terminal_is_running:
+            try:
+                provisioner.validate(
+                    cid,
+                    verify_code=False,
                 )
             except Exception as exc:
                 raise InstanceProvisionFailed(
                     "provisioned instance code integrity validation failed"
                 ) from exc
-            _verify_binary_pin(terminal, terminal_sha256)
             _verify_binary_pin(expert_binary, expert_sha256)
             try:
                 runtime = runtime_factory(root, cid)
@@ -1855,6 +1896,10 @@ def _start_file_bridge_and_sync(
         raise _map_mt5_error(exc) from exc
     except Exception as exc:
         raise LiveSyncFailed("file bridge sync failed") from exc
+    try:
+        InstanceProvisioner(root.parent, store.root).seal_runtime_assets(cid)
+    except Exception as exc:
+        raise InstanceProvisionFailed("managed runtime asset sealing failed") from exc
     return {
         "imported_deals": counts["deals"],
         "imported_orders": counts["orders"],

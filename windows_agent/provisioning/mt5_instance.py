@@ -22,6 +22,17 @@ _MT5_GENERATED_EXAMPLE_DIRS = (
     Path("MQL5/Scripts/Examples"),
 )
 
+# These are the only executable files authored and installed by TradeJournal
+# into an otherwise vendor-managed MT5 tree.  MT5 is allowed to update its own
+# binaries; the bridge assets are not.  Their digest is sealed per published
+# instance after a successful native start, rather than compared with whatever
+# happens to be in the current global template.
+_MANAGED_RUNTIME_ASSETS = (
+    Path("MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"),
+    Path("MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5"),
+    Path("MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5"),
+)
+
 
 class InstanceProvisioner:
     def __init__(self, instances_root: Path, secrets_root: Path) -> None:
@@ -176,6 +187,46 @@ class InstanceProvisioner:
             removed.append(relative.as_posix())
         return tuple(removed)
 
+    def seal_runtime_assets(self, connection_id: str) -> str:
+        """Atomically pin the managed EA/script files for one instance.
+
+        The pin is write-once.  It is deliberately independent of the mutable
+        MetaQuotes template and therefore lets a healthy live instance survive
+        a template rotation without accepting a later modification of its own
+        TradeJournal binaries.
+        """
+        root = self.validate(connection_id, verify_code=False)
+        state_path = root / "state" / "instance.json"
+        state = read_json(state_path, {})
+        if not isinstance(state, dict):
+            raise ValueError("published instance state invalid")
+        digest = self._managed_runtime_assets_manifest(root / "terminal")
+        recorded = state.get("runtime_assets_manifest_sha256")
+        if recorded is not None:
+            if not isinstance(recorded, str) or recorded != digest:
+                raise ValueError("published managed runtime assets mismatch")
+            return digest
+        state["runtime_assets_manifest_sha256"] = digest
+        state["runtime_assets_manifest_version"] = 1
+        atomic_json(state_path, state)
+        return digest
+
+    def validate_runtime_assets(self, connection_id: str) -> str:
+        """Validate the write-once per-instance TradeJournal asset pin."""
+        root = self.validate(connection_id, verify_code=False)
+        state = read_json(root / "state" / "instance.json", {})
+        recorded = (
+            state.get("runtime_assets_manifest_sha256")
+            if isinstance(state, dict)
+            else None
+        )
+        if not isinstance(recorded, str) or len(recorded) != 64:
+            raise ValueError("published managed runtime asset pin missing")
+        actual = self._managed_runtime_assets_manifest(root / "terminal")
+        if actual != recorded:
+            raise ValueError("published managed runtime assets mismatch")
+        return actual
+
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()
@@ -252,6 +303,17 @@ class InstanceProvisioner:
             raise ValueError("terminal template contains no executable content")
         return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
 
+    @classmethod
+    def _managed_runtime_assets_manifest(cls, terminal_root: Path) -> str:
+        cls._validate_source_tree(terminal_root)
+        entries: list[str] = []
+        for relative in _MANAGED_RUNTIME_ASSETS:
+            asset = terminal_root / relative
+            if cls._is_reparse_point(asset) or not asset.is_file():
+                raise ValueError("published managed runtime asset missing")
+            entries.append(f"{relative.as_posix()}:{cls._sha256(asset)}")
+        return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
     @staticmethod
     def _is_reparse_point(path: Path) -> bool:
         try:
@@ -299,17 +361,15 @@ class InstanceProvisioner:
 
     def deprovision(self, connection_id: str) -> None:
         layout = InstanceLayout(self.instances_root, connection_id)
-        self.secrets.delete_connection(connection_id)
         root = layout.path
-        if not root.exists():
-            return
-        atomic_json(
-            root / "state" / "instance.json",
-            {"connection_id": connection_id, "status": "deprovisioned"},
-        )
-        for child in (root / "terminal", root / "worker", root / "data"):
-            if child.exists():
-                shutil.rmtree(child)
+        if root.exists():
+            if self._is_reparse_point(root) or not root.is_dir():
+                raise ValueError("instance cleanup root is unsafe")
+            shutil.rmtree(root)
+        self.secrets.delete_connection(connection_id)
+        secret_root = self.secrets.root / connection_id
+        if root.exists() or secret_root.exists():
+            raise OSError("connection cleanup is incomplete")
 
     def discard_failed(self, connection_id: str) -> None:
         """Remove every local artifact owned by an inactive failed provision.

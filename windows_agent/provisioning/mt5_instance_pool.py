@@ -149,7 +149,7 @@ class Mt5InstancePool:
         shutil.rmtree(path)
 
     def recover_incomplete(self) -> None:
-        """Remove only never-published pool work left by an interrupted agent."""
+        """Recover interrupted work and retire READY slots from older code."""
 
         self._ensure_roots()
         for root in (self.building_root, self.claimed_root):
@@ -162,6 +162,7 @@ class Mt5InstancePool:
             ):
                 raise InstancePoolError("pool reservation is unsafe")
             reservation.unlink()
+        self._discard_incompatible_ready_slots()
 
     @staticmethod
     def _empty_directory(path: Path) -> None:
@@ -255,6 +256,16 @@ class Mt5InstancePool:
         self._uuid(value.get("slot_id"))
         return value
 
+    def _current_code_manifest(self) -> str:
+        try:
+            return InstanceProvisioner._code_manifest(
+                self.source_terminal.parent
+            )
+        except (OSError, ValueError) as exc:
+            raise InstancePoolError(
+                "current MT5 template code manifest is unavailable"
+            ) from exc
+
     def _validate_slot(self, root: Path) -> dict:
         if (
             InstanceProvisioner._is_reparse_point(root)
@@ -280,6 +291,13 @@ class Mt5InstancePool:
                 != record["template_manifest_sha256"]
             ):
                 raise InstancePoolError("pool slot manifest mismatch")
+            if (
+                record["code_manifest_sha256"]
+                != self._current_code_manifest()
+            ):
+                raise InstancePoolError(
+                    "pool slot does not match the current MT5 template"
+                )
             InstanceProvisioner._validate_published_instance(
                 root,
                 instance,
@@ -369,9 +387,26 @@ class Mt5InstancePool:
     def ready_count(self) -> int:
         return len(self.ready_slots())
 
+    def _discard_incompatible_ready_slots(self) -> int:
+        discarded = 0
+        for slot in self.ready_slots():
+            try:
+                self._validate_slot(slot)
+            except InstancePoolError:
+                self._remove_tree(slot)
+                discarded += 1
+                logger.warning(
+                    "discarded incompatible MT5 pool slot %s",
+                    slot.name,
+                )
+        if discarded:
+            fsync_directory(self.ready_root)
+        return discarded
+
     def maintain_once(self, stop_event: Event | None = None) -> int:
         """Replenish sequentially up to target_size and return READY count."""
 
+        self._discard_incompatible_ready_slots()
         while self.ready_count() < self.target_size:
             if stop_event is not None and stop_event.is_set():
                 break
@@ -420,6 +455,12 @@ class Mt5InstancePool:
 
         ``None`` means the pool was empty; the caller may use the existing
         direct-copy fallback. Invalid slots are destroyed rather than reused.
+
+        A destination can already exist only when the same connection is being
+        recovered.  A complete, pinned publication is reused.  An incomplete
+        publication from an interrupted prior attempt is discarded before a
+        fresh READY slot is claimed; this prevents a retry from being pinned to
+        unusable partial state.
         """
 
         try:
@@ -432,21 +473,41 @@ class Mt5InstancePool:
             self.instances_root,
             connection_id,
         ).path
+        provisioner = InstanceProvisioner(
+            self.instances_root,
+            self.secrets_root,
+        )
         if destination.exists():
-            return InstanceProvisioner(
-                self.instances_root,
-                self.secrets_root,
-            ).validate(connection_id, self.expected_terminal_sha256)
+            try:
+                return provisioner.validate(
+                    connection_id,
+                    self.expected_terminal_sha256,
+                )
+            except ValueError:
+                # A root marked provisioned could still belong to a live
+                # terminal whose integrity changed after launch.  Do not
+                # remove it blindly: fail closed and let the normal lifecycle
+                # own it.  Only an incomplete prior publication is safe to
+                # retire before assigning a new pool slot.
+                state = read_json(destination / "state" / "instance.json", {})
+                if state.get("status") == "provisioned":
+                    raise InstancePoolError(
+                        "published instance validation failed"
+                    )
+                # Credentials for this retry have already been freshly
+                # persisted before the instance is claimed.  Retire only the
+                # incomplete instance tree: deleting the connection's DPAPI
+                # vault here would erase the just-written credential envelope
+                # before the bridge can consume it.
+                self._remove_tree(destination)
+                fsync_directory(self.instances_root)
         self._ensure_roots()
         reservation = self._reserve(connection_id)
         claimed: Path | None = None
         published = False
         try:
             if destination.exists():
-                return InstanceProvisioner(
-                    self.instances_root,
-                    self.secrets_root,
-                ).validate(
+                return provisioner.validate(
                     connection_id,
                     self.expected_terminal_sha256,
                 )
@@ -470,6 +531,10 @@ class Mt5InstancePool:
                 except InstancePoolError:
                     self._remove_tree(claimed)
                     claimed = None
+                    logger.warning(
+                        "discarded incompatible MT5 pool slot %s during claim",
+                        slot.name,
+                    )
                     continue
                 state = {
                     **instance,
@@ -493,13 +558,12 @@ class Mt5InstancePool:
                 durable_replace(claimed, destination)
                 claimed = None
                 published = True
-                return InstanceProvisioner(
-                    self.instances_root,
-                    self.secrets_root,
-                ).validate(
+                result = provisioner.validate(
                     connection_id,
                     self.expected_terminal_sha256,
                 )
+                logger.info("claimed MT5 pool slot %s", slot.name)
+                return result
             return None
         except Exception:
             if published and destination.exists():

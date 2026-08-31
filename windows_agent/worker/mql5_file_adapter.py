@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,13 @@ SCHEMA_VERSION = 1
 # while leaving margin for an initial full-history pass on a busy Windows host.
 DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 30.0
 MAX_CHECKPOINT_DEAL_KEYS = 512
+# The EA publishes a complete bundle every two seconds.  On Windows, replacing one
+# of those files can keep the destination briefly unavailable to another process.
+# Cover one complete producer cycle plus margin, while keeping malformed JSON and
+# identity/schema failures immediately fail-closed.
+_TRANSIENT_READ_ATTEMPTS = 26
+_SNAPSHOT_CONSISTENCY_ATTEMPTS = 26
+_TRANSIENT_READ_DELAY_SECONDS = 0.1
 _EVENT_FILE = re.compile(r"^event-([0-9]+)\.json$")
 
 
@@ -77,10 +85,19 @@ class Mql5FileMt5Adapter:
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
     def _read_path_envelope(self, path: Path, label: str) -> tuple[dict[str, Any], Any]:
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise Mql5FileAdapterError(f"{label}_unavailable") from exc
+        for attempt in range(_TRANSIENT_READ_ATTEMPTS):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8-sig"))
+                break
+            except OSError as exc:
+                if attempt + 1 == _TRANSIENT_READ_ATTEMPTS:
+                    raise Mql5FileAdapterError(f"{label}_unavailable") from exc
+                # The EA publishes files atomically, but Windows can briefly deny a
+                # concurrent reader while the replacement is finalized.  Retry only
+                # that narrow sharing race; malformed content remains fail-closed.
+                time.sleep(_TRANSIENT_READ_DELAY_SECONDS)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise Mql5FileAdapterError(f"{label}_unavailable") from exc
         if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
             raise Mql5FileAdapterError(f"{label}_schema_invalid")
         generated_at = self._parse_time(raw.get("generated_at"))
@@ -200,33 +217,36 @@ class Mql5FileMt5Adapter:
 
     def snapshot(self, lookback_hours: int = 72) -> dict[str, dict[str, Any]]:
         del lookback_hours  # freshness is enforced from the producer's generated_at field.
-        heartbeat_before, heartbeat_payload = self._heartbeat_envelope()
-        if not heartbeat_payload["terminal_connected"]:
-            raise Mql5FileAdapterError("terminal_not_connected")
-        account_envelope, account = self._read_envelope("account.json")
-        if not isinstance(account, dict) or str(account.get("login")) != self.expected_login:
-            raise Mql5FileIdentityMismatch("account_identity_mismatch")
-        positions_envelope, positions = self._rows("positions.json")
-        orders_envelope, orders = self._rows("orders.json")
-        deals_envelope, deals = self._rows("deals.json")
-        heartbeat_after, _ = self._heartbeat_envelope()
-        sequences = {
-            int(heartbeat_before["sequence"]),
-            int(heartbeat_after["sequence"]),
-            int(account_envelope["sequence"]),
-            int(positions_envelope["sequence"]),
-            int(orders_envelope["sequence"]),
-            int(deals_envelope["sequence"]),
-        }
-        if len(sequences) != 1:
-            raise Mql5FileAdapterError("snapshot_sequence_mismatch")
-        mapped_deals = self._dedupe(deals, "ticket")
-        self._save_checkpoint(int(deals_envelope["sequence"]), list(mapped_deals))
-        return {
-            "positions": self._dedupe(positions, "ticket"),
-            "orders": self._dedupe(orders, "ticket"),
-            "deals": mapped_deals,
-        }
+        for attempt in range(_SNAPSHOT_CONSISTENCY_ATTEMPTS):
+            heartbeat_before, heartbeat_payload = self._heartbeat_envelope()
+            if not heartbeat_payload["terminal_connected"]:
+                raise Mql5FileAdapterError("terminal_not_connected")
+            account_envelope, account = self._read_envelope("account.json")
+            if not isinstance(account, dict) or str(account.get("login")) != self.expected_login:
+                raise Mql5FileIdentityMismatch("account_identity_mismatch")
+            positions_envelope, positions = self._rows("positions.json")
+            orders_envelope, orders = self._rows("orders.json")
+            deals_envelope, deals = self._rows("deals.json")
+            heartbeat_after, _ = self._heartbeat_envelope()
+            sequences = {
+                int(heartbeat_before["sequence"]),
+                int(heartbeat_after["sequence"]),
+                int(account_envelope["sequence"]),
+                int(positions_envelope["sequence"]),
+                int(orders_envelope["sequence"]),
+                int(deals_envelope["sequence"]),
+            }
+            if len(sequences) == 1:
+                mapped_deals = self._dedupe(deals, "ticket")
+                self._save_checkpoint(int(deals_envelope["sequence"]), list(mapped_deals))
+                return {
+                    "positions": self._dedupe(positions, "ticket"),
+                    "orders": self._dedupe(orders, "ticket"),
+                    "deals": mapped_deals,
+                }
+            if attempt + 1 < _SNAPSHOT_CONSISTENCY_ATTEMPTS:
+                time.sleep(_TRANSIENT_READ_DELAY_SECONDS)
+        raise Mql5FileAdapterError("snapshot_sequence_mismatch")
 
     def _history(self, name: str, start: datetime, end: datetime) -> tuple[dict[str, Any], ...]:
         self.verify_identity()

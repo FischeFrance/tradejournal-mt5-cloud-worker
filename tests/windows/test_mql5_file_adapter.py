@@ -91,6 +91,151 @@ def test_rejects_snapshot_composed_from_different_publish_sequences(tmp_path: Pa
         adapter.snapshot()
 
 
+def test_retries_one_snapshot_publish_boundary_before_accepting_a_consistent_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    original_rows = adapter._rows
+    reads = 0
+
+    def rows_during_publish(name: str):
+        nonlocal reads
+        result = original_rows(name)
+        if name == "positions.json" and reads == 0:
+            reads += 1
+            _write(adapter.files_dir, "heartbeat.json", {"terminal_connected": True}, sequence=2)
+            _write(
+                adapter.files_dir,
+                "account.json",
+                {
+                    "login": "42",
+                    "server": "Demo-Server",
+                    "balance": 100.0,
+                    "equity": 101.0,
+                    "currency": "USD",
+                    "leverage": 100,
+                    "trade_allowed": False,
+                },
+                sequence=2,
+            )
+            _write(adapter.files_dir, "positions.json", [], sequence=2)
+            _write(adapter.files_dir, "orders.json", [], sequence=2)
+            _write(adapter.files_dir, "deals.json", [], sequence=2)
+        return result
+
+    monkeypatch.setattr(adapter, "_rows", rows_during_publish)
+    monkeypatch.setattr("windows_agent.worker.mql5_file_adapter.time.sleep", lambda _: None)
+
+    assert adapter.snapshot() == {"positions": {}, "orders": {}, "deals": {}}
+    assert reads == 1
+
+
+def test_retries_a_transient_windows_sharing_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _ready_adapter(tmp_path)
+    original_read_text = Path.read_text
+    blocked_path = adapter.files_dir / "heartbeat.json"
+    attempts = 0
+
+    def read_text_with_one_sharing_failure(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        if path == blocked_path and attempts == 0:
+            attempts += 1
+            raise PermissionError("sharing violation")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text_with_one_sharing_failure)
+    monkeypatch.setattr("windows_agent.worker.mql5_file_adapter.time.sleep", lambda _: None)
+
+    assert adapter.verify_identity() == {"login": "42", "server": "Demo-Server"}
+    assert attempts == 1
+
+
+def test_retries_windows_sharing_errors_across_a_complete_publish_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    original_read_text = Path.read_text
+    blocked_path = adapter.files_dir / "heartbeat.json"
+    attempts = 0
+
+    def read_text_during_publish(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        if path == blocked_path and attempts < 20:
+            attempts += 1
+            raise PermissionError("sharing violation")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text_during_publish)
+    monkeypatch.setattr("windows_agent.worker.mql5_file_adapter.time.sleep", lambda _: None)
+
+    assert adapter.verify_identity() == {"login": "42", "server": "Demo-Server"}
+    assert attempts == 20
+
+
+def test_persistent_windows_sharing_error_remains_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    blocked_path = adapter.files_dir / "heartbeat.json"
+    original_read_text = Path.read_text
+
+    def read_text_always_blocked(path: Path, *args: object, **kwargs: object) -> str:
+        if path == blocked_path:
+            raise PermissionError("sharing violation")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text_always_blocked)
+    monkeypatch.setattr("windows_agent.worker.mql5_file_adapter.time.sleep", lambda _: None)
+
+    with pytest.raises(Mql5FileAdapterError, match="heartbeat_unavailable"):
+        adapter.verify_identity()
+
+
+def test_retries_snapshot_boundaries_across_a_complete_publish_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    original_rows = adapter._rows
+    position_reads = 0
+
+    def rows_during_repeated_publish_boundaries(name: str):
+        nonlocal position_reads
+        result = original_rows(name)
+        if name == "positions.json" and position_reads < 20:
+            position_reads += 1
+            _write(
+                adapter.files_dir,
+                "heartbeat.json",
+                {"terminal_connected": True, "account_trade_allowed": False},
+                sequence=position_reads + 1,
+            )
+        elif name == "positions.json":
+            _write(
+                adapter.files_dir,
+                "account.json",
+                {
+                    "login": "42",
+                    "server": "Demo-Server",
+                    "balance": 100.0,
+                    "equity": 101.0,
+                    "currency": "USD",
+                    "leverage": 100,
+                    "trade_allowed": False,
+                },
+                sequence=position_reads + 1,
+            )
+            _write(adapter.files_dir, "positions.json", [], sequence=position_reads + 1)
+            _write(adapter.files_dir, "orders.json", [], sequence=position_reads + 1)
+            _write(adapter.files_dir, "deals.json", [], sequence=position_reads + 1)
+        return result
+
+    monkeypatch.setattr(adapter, "_rows", rows_during_repeated_publish_boundaries)
+    monkeypatch.setattr("windows_agent.worker.mql5_file_adapter.time.sleep", lambda _: None)
+
+    assert adapter.snapshot() == {"positions": {}, "orders": {}, "deals": {}}
+    assert position_reads == 20
+
+
 def test_event_files_are_read_in_sequence_and_acknowledged_separately(tmp_path: Path) -> None:
     adapter = _ready_adapter(tmp_path)
     _write(

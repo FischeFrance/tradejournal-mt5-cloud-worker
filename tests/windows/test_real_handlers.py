@@ -213,6 +213,7 @@ def _handlers(
     broker_wizard=None,
     mtapi_search=None,
     instance_pool=None,
+    terminal_sha256=None,
 ):
     def adapter_factory(terminal, login, server):
         return ScriptedAdapter(terminal, login, server, script=script or {})
@@ -232,6 +233,7 @@ def _handlers(
         broker_wizard=broker_wizard,
         mtapi_search=mtapi_search,
         instance_pool=instance_pool,
+        terminal_sha256=terminal_sha256,
     )
 
 
@@ -1538,6 +1540,30 @@ def test_live_sync_start_failure_is_live_sync_failed(env, monkeypatch):
     assert exc_info.value.error_code == "live_sync_failed"
 
 
+def test_live_sync_accepts_existing_instance_after_template_pin_rotation(env):
+    """A new global template pin must not invalidate an already-live instance."""
+    cid = str(uuid4())
+    original_digest = hashlib.sha256(b"stub").hexdigest()
+    rotated_template_digest = "a" * 64
+    InstanceProvisioner(env.instances_root, env.secrets_root).provision(
+        cid,
+        env.source_terminal,
+        expected_terminal_sha256=original_digest,
+    )
+
+    handlers = _handlers(
+        env,
+        FakeApi(),
+        terminal_sha256=rotated_template_digest,
+    )
+
+    # Reaching secret lookup proves live_sync accepted the instance's recorded
+    # digest rather than rejecting it against the rotated global template pin.
+    with pytest.raises(Exception) as exc_info:
+        handlers["live_sync"](_job("live_sync", cid))
+    assert exc_info.value.error_code == "secret_store_failed"
+
+
 # ---------------------------------------------------------------------------
 # Historical sync
 # ---------------------------------------------------------------------------
@@ -1614,6 +1640,8 @@ def test_deprovision_is_idempotent(env):
     result_2 = handlers["deprovision"](_job("deprovision", cid))
     assert result_1 == {"deprovisioned": True}
     assert result_2 == {"deprovisioned": True}
+    assert not root.exists()
+    assert not (env.secrets_root / cid).exists()
     store = WindowsSecretStore(env.secrets_root)
     with pytest.raises(Exception):
         store.read(cid, "mt5_investor_password")
@@ -1632,7 +1660,7 @@ def test_deprovision_only_touches_its_own_connection(env):
     handlers["provision"](_job("provision", cid_a, payload=_provision_payload()))
     handlers["provision"](_job("provision", cid_b, payload=_provision_payload(login=999, server="Other")))
     handlers["deprovision"](_job("deprovision", cid_a))
-    assert not (InstanceLayout(env.instances_root, cid_a).path / "terminal").exists()
+    assert not InstanceLayout(env.instances_root, cid_a).path.exists()
     root_b = InstanceLayout(env.instances_root, cid_b).path
     assert (root_b / "terminal" / "terminal64.exe").exists()
     assert WindowsSecretStore(env.secrets_root).read(cid_b, "mt5_login") == "999"

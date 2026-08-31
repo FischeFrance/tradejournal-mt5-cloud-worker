@@ -36,10 +36,10 @@ def _runtime(
     terminal = tmp_path / "terminal" / "terminal64.exe"
     terminal.parent.mkdir(parents=True)
     terminal.write_bytes(b"terminal")
-    loader = terminal.parent / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalLoader.ex5"
-    loader.parent.mkdir(parents=True)
-    loader.write_bytes(b"loader")
-    loader.with_name("TradeJournalDiscovery.ex5").write_bytes(b"discovery")
+    scripts = terminal.parent / "MQL5" / "Scripts" / "TradeJournal"
+    scripts.mkdir(parents=True)
+    (scripts / "TradeJournalLoader.ex5").write_bytes(b"loader")
+    (scripts / "TradeJournalDiscovery.ex5").write_bytes(b"discovery")
     templates = terminal.parent / "Profiles" / "Templates"
     templates.mkdir(parents=True)
     (templates / "ADX.tpl").write_text(
@@ -72,16 +72,35 @@ def _envelope(payload: dict[str, object]) -> str:
     )
 
 
+def _discovery_result(
+    runtime: NativeMt5Runtime,
+    *,
+    symbol: str = "EURUSD.raw",
+    login: int = 42,
+    server: str = "Demo",
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "connection_id": runtime.connection_id,
+        "login": login,
+        "server": server,
+        "requested_symbol": "EURUSD",
+        "symbol": symbol,
+        "resolution": "currency_pair",
+        "catalog_total": 512,
+        "synchronized": True,
+        "terminal_build": 6036,
+    }
+
+
 def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("Password=not-a-real-secret")
-    discovery.write_text("KeepPrivate=1")
     startup.write_text("KeepPrivate=1")
     expected = NativeMt5Status(
         pid=123,
@@ -93,18 +112,26 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
+            side_effect=[bootstrap, startup],
         ) as write_config,
         patch.object(runtime, "_journal_checkpoint", return_value={}) as checkpoint,
         patch.object(runtime, "_start_process") as start_process,
         patch.object(runtime, "_wait_for_authorization") as wait_for_authorization,
         patch.object(runtime, "_wait_for_account_database") as wait_for_database,
+        patch.object(
+            runtime,
+            "_cached_broker_symbol",
+            return_value="EURUSD.raw",
+        ) as cached_symbol,
         patch.object(runtime, "_wait_for_investor_sync") as wait_for_investor_sync,
         patch.object(
-            runtime, "_probe_broker_symbol", return_value="EURUSD.raw"
+            runtime,
+            "_probe_broker_symbol",
+            return_value="EURUSD.raw",
         ) as probe_symbol,
         patch.object(runtime, "_wait_for_heartbeat", return_value=expected),
         patch.object(runtime, "stop", return_value=True) as stop,
+        patch.object(runtime, "_remove_generated_example_code") as remove_examples,
     ):
         result = runtime.start(
             login=42,
@@ -126,46 +153,32 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
             filename="login-bootstrap.ini",
         ),
         call(
-            None,
-            None,
-            None,
-            "EURUSD",
-            keep_private=True,
-            start_expert=False,
-            script_name="TradeJournal\\TradeJournalDiscovery",
-            filename="symbol-discovery.ini",
-        ),
-        call(
-            None,
-            None,
-            None,
+            42,
+            "Demo",
+            "not-a-real-secret",
             "EURUSD.raw",
             keep_private=True,
             start_expert=False,
-            script_name="TradeJournal\\TradeJournalLoader",
+            script_name="TradeJournal\\TradeJournalDiscovery",
             filename="startup.ini",
         ),
     ]
-    assert checkpoint.call_count == 3
+    assert checkpoint.call_count == 2
     assert wait_for_authorization.call_args_list == [
         call({}, 42, "Demo", ANY, "203.0.113.10:443"),
         call({}, 42, "Demo", ANY),
-        call({}, 42, "Demo", ANY),
     ]
     wait_for_database.assert_called_once_with(ANY)
-    assert wait_for_investor_sync.call_args_list == [
-        call({}, 42, ANY),
-        call({}, 42, ANY),
-    ]
-    probe_symbol.assert_called_once_with("EURUSD")
+    cached_symbol.assert_called_once_with(42, "Demo", "EURUSD")
+    assert wait_for_investor_sync.call_args_list == [call({}, 42, ANY)]
+    probe_symbol.assert_called_once_with("EURUSD", 42, "Demo", 120.0)
     assert start_process.call_args_list == [
         call(bootstrap),
-        call(discovery, 42),
-        call(startup, 42),
+        call(startup),
     ]
-    assert stop.call_count == 2
+    assert stop.call_count == 1
+    remove_examples.assert_called_once_with()
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
     assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "new_only"
     template_path = runtime.files / "TradeJournalBridge.tpl"
@@ -178,6 +191,22 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert "InpBackfillHours=168" in template
     assert "InpSnapshotHistoryHours=87600" in template
     assert "InpCandleBars=200\n</inputs>" in template
+
+
+def test_remove_generated_example_code_removes_only_known_paths(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    generated = runtime.terminal_root / "MQL5" / "Scripts" / "Examples" / "Demo.mq5"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("example", encoding="utf-8")
+    retained = runtime.terminal_root / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalDiscovery.ex5"
+    retained.parent.mkdir(parents=True, exist_ok=True)
+    retained.write_bytes(b"loader")
+
+    removed = runtime._remove_generated_example_code()
+
+    assert removed == ("MQL5/Scripts/Examples",)
+    assert not generated.exists()
+    assert retained.is_file()
 
 
 def test_reset_managed_chart_profile_removes_only_managed_generated_chart_state(
@@ -273,58 +302,194 @@ def test_startup_config_uses_expert_name_relative_to_mql5_experts(tmp_path: Path
     assert str(runtime.terminal_root) not in content
 
 
-def test_start_uses_loader_to_attach_bridge_after_account_sync(tmp_path: Path) -> None:
+def test_start_falls_back_to_configured_chart_when_private_cache_is_opaque(
+    tmp_path: Path,
+) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
     expert.write_bytes(b"expert")
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("temporary")
-    discovery.write_text("temporary")
     startup.write_text("temporary")
+    expected = NativeMt5Status(
+        pid=123,
+        account={"login": "42", "server": "Demo", "trade_allowed": False},
+        heartbeat={"terminal_connected": True},
+        files_path=runtime.files,
+    )
     with (
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
-        ),
+            side_effect=[bootstrap, startup],
+        ) as write_config,
         patch.object(runtime, "_journal_checkpoint", return_value={}),
         patch.object(runtime, "_start_process") as start_process,
         patch.object(runtime, "_wait_for_authorization"),
         patch.object(runtime, "_wait_for_account_database"),
+        patch.object(
+            runtime,
+            "_cached_broker_symbol",
+            return_value=None,
+        ) as cached_symbol,
         patch.object(runtime, "_wait_for_investor_sync"),
-        patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
         patch.object(runtime, "_remove_readiness_files") as remove_readiness,
+        patch.object(runtime, "_write_symbol_preference") as write_preference,
+        patch.object(
+            runtime,
+            "_probe_broker_symbol",
+            return_value="EURUSD",
+        ) as probe_symbol,
+        patch.object(runtime, "_install_bridge_template") as install_template,
+        patch.object(runtime, "_publish_bridge_handoff") as publish_handoff,
         patch.object(
             runtime,
             "_wait_for_heartbeat",
-            side_effect=NativeMt5Error("terminal_not_ready"),
+            return_value=expected,
         ) as wait_for_heartbeat,
         patch.object(runtime, "stop", return_value=True) as stop,
     ):
-        with pytest.raises(NativeMt5Error, match="terminal_not_ready"):
-            runtime.start(
-                login=42,
-                server="Demo",
-                investor_password="placeholder",
-                expert_binary=expert,
-                history_mode="new_only",
-                timeout=90,
-            )
+        result = runtime.start(
+            login=42,
+            server="Demo",
+            investor_password="placeholder",
+            expert_binary=expert,
+            history_mode="new_only",
+            timeout=90,
+        )
 
+    assert result == expected
     assert start_process.call_args_list == [
         call(bootstrap),
-        call(discovery, 42),
-        call(startup, 42),
+        call(startup),
     ]
+    assert write_config.call_args_list[1] == call(
+        42,
+        "Demo",
+        "placeholder",
+        "EURUSD",
+        keep_private=True,
+        start_expert=False,
+        script_name="TradeJournal\\TradeJournalDiscovery",
+        filename="startup.ini",
+    )
     wait_for_heartbeat.assert_called_once_with(90.0, 42, "Demo")
-    assert stop.call_count == 3
+    assert stop.call_count == 1
     assert remove_readiness.call_count == 1
+    write_preference.assert_called_once_with("EURUSD")
+    cached_symbol.assert_called_once_with(42, "Demo", "EURUSD")
+    probe_symbol.assert_called_once_with("EURUSD", 42, "Demo", 90.0)
+    install_template.assert_called_once_with("EURUSD")
+    publish_handoff.assert_called_once_with()
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
+
+
+def test_symbol_handoff_files_are_validated_and_published_atomically(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+
+    preference = runtime._write_symbol_preference("EURUSD")
+    assert preference.read_text(encoding="utf-8") == "EURUSD"
+
+    output = runtime.files / "discovered-symbol.json"
+    output.write_text(json.dumps(_discovery_result(runtime)), encoding="utf-8")
+    assert runtime._probe_broker_symbol("EURUSD", 42, "Demo", 1.0) == "EURUSD.raw"
+
+    runtime._install_bridge_template("EURUSD.raw")
+    handoff = runtime._publish_bridge_handoff()
+    assert handoff.read_text(encoding="ascii") == "ready\n"
+    assert not (runtime.files / "bridge-ready.tmp").exists()
+
+
+def test_cached_broker_symbol_uses_exact_account_and_server_scope(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    selected = (
+        runtime.terminal_root
+        / "Bases"
+        / "FPMTrading-Live"
+        / "symbols"
+        / "selected-12345678.dat"
+    )
+    selected.parent.mkdir(parents=True)
+    selected.write_bytes(
+        "description\0GBPUSD.raw\0EURUSD.raw\0USDJPY.raw\0".encode("utf-16-le")
+    )
+
+    assert (
+        runtime._cached_broker_symbol(12345678, "fpmtrading-live", "EURUSD")
+        == "EURUSD.raw"
+    )
+    assert runtime._cached_broker_symbol(12345679, "FPMTrading-Live", "EURUSD") is None
+    assert runtime._cached_broker_symbol(12345678, "Other-Live", "EURUSD") is None
+
+
+def test_cached_broker_symbol_rejects_symlinked_selected_file(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    symbols = runtime.terminal_root / "Bases" / "Demo" / "symbols"
+    symbols.mkdir(parents=True)
+    outside = tmp_path / "outside.dat"
+    outside.write_bytes("EURUSD.raw".encode("utf-16-le"))
+    selected = symbols / "selected-42.dat"
+    try:
+        selected.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(NativeMt5Error, match="broker_symbol_cache_invalid"):
+        runtime._cached_broker_symbol(42, "Demo", "EURUSD")
+
+
+@pytest.mark.parametrize("symbol", ["", " EURUSD", "EURUSD\n", "X" * 65])
+def test_symbol_handoff_rejects_invalid_values(tmp_path: Path, symbol: str) -> None:
+    runtime = _runtime(tmp_path)
+    with pytest.raises(NativeMt5Error, match="invalid_startup_symbol"):
+        runtime._write_symbol_preference(symbol)
+
+
+def test_symbol_probe_rejects_malformed_discovery_output(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "discovered-symbol.json").write_text(
+        '{"symbol":"EURUSD\\n"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(NativeMt5Error, match="broker_symbol_probe_invalid"):
+        runtime._probe_broker_symbol("EURUSD", 42, "Demo", 1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connection_id", "different-instance"),
+        ("login", 99),
+        ("server", "Other"),
+        ("requested_symbol", "GBPUSD"),
+        ("synchronized", False),
+        ("catalog_total", 0),
+    ],
+)
+def test_symbol_probe_rejects_uncorrelated_discovery_output(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    record = _discovery_result(runtime)
+    record[field] = value
+    (runtime.files / "discovered-symbol.json").write_text(
+        json.dumps(record),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(NativeMt5Error, match="broker_symbol_probe_invalid"):
+        runtime._probe_broker_symbol("EURUSD", 42, "Demo", 1.0)
 
 
 def test_start_process_requires_dedicated_interactive_user(tmp_path: Path) -> None:
@@ -344,7 +509,7 @@ def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
         runtime.install_expert(expert, "ten_year_snapshot")
 
 
-def test_login_bootstrap_and_persisted_startup_configs(tmp_path: Path, monkeypatch) -> None:
+def test_login_bootstrap_and_noninteractive_startup_configs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
     runtime = _runtime(tmp_path)
     bootstrap = runtime._write_startup_config(
@@ -367,21 +532,20 @@ def test_login_bootstrap_and_persisted_startup_configs(tmp_path: Path, monkeypat
     startup = runtime._write_startup_config(
         42,
         "Demo",
-        None,
+        "investor-secret",
         "EURUSD",
         keep_private=True,
         start_expert=False,
-        script_name="TradeJournal\\TradeJournalLoader",
+        script_name="TradeJournal\\TradeJournalDiscovery",
         filename="startup.ini",
     )
     startup_content = startup.read_text(encoding="utf-8")
     assert "Login=42" in startup_content
     assert "Server=Demo" in startup_content
-    assert "Password=" not in startup_content
+    assert "Password=investor-secret" in startup_content
     assert "KeepPrivate=1" in startup_content
-    assert "Script=TradeJournal\\TradeJournalLoader" in startup_content
     assert "Expert=" not in startup_content
-    assert "ShutdownTerminal=0" in startup_content
+    assert "Script=TradeJournal\\TradeJournalDiscovery" in startup_content
 
 
 def test_startup_config_allows_configured_interactive_user_to_read(
@@ -715,7 +879,6 @@ def test_start_uses_redirected_server_for_followup_identity_checks(
     runtime.state.mkdir()
     configs = [
         runtime.state / "login-bootstrap.ini",
-        runtime.state / "symbol-discovery.ini",
         runtime.state / "startup.ini",
     ]
     for config in configs:
@@ -746,18 +909,24 @@ def test_start_uses_redirected_server_for_followup_identity_checks(
             side_effect=[
                 "PepperstoneEU-Live",
                 "PepperstoneEU-Live",
-                "PepperstoneEU-Live",
             ],
         ) as wait_for_authorization,
         patch.object(runtime, "_wait_for_account_database"),
+        patch.object(
+            runtime,
+            "_cached_broker_symbol",
+            return_value="EURUSD.raw",
+        ),
         patch.object(runtime, "_wait_for_investor_sync"),
+        patch.object(runtime, "_remove_readiness_files"),
+        patch.object(runtime, "_write_symbol_preference"),
         patch.object(
             runtime,
             "_probe_broker_symbol",
-            return_value="EURUSD",
+            return_value="EURUSD.raw",
         ),
-        patch.object(runtime, "_remove_readiness_files"),
-        patch.object(runtime, "_install_bridge_template"),
+        patch.object(runtime, "_install_bridge_template") as install_template,
+        patch.object(runtime, "_publish_bridge_handoff"),
         patch.object(
             runtime,
             "_wait_for_heartbeat",
@@ -778,9 +947,7 @@ def test_start_uses_redirected_server_for_followup_identity_checks(
     assert wait_for_authorization.call_args_list[1].args[2] == (
         "PepperstoneEU-Live"
     )
-    assert wait_for_authorization.call_args_list[2].args[2] == (
-        "PepperstoneEU-Live"
-    )
+    install_template.assert_called_once_with("EURUSD.raw")
     wait_for_heartbeat.assert_called_once_with(
         90.0,
         42,
@@ -971,25 +1138,34 @@ def test_identity_and_readonly_guards(
         _envelope({"terminal_connected": True})
     )
     bootstrap = runtime.state / "login-bootstrap.ini"
-    discovery = runtime.state / "symbol-discovery.ini"
     startup = runtime.state / "startup.ini"
     runtime.state.mkdir()
     bootstrap.write_text("temporary")
-    discovery.write_text("temporary")
     startup.write_text("temporary")
     with (
         patch.object(
             runtime,
             "_write_startup_config",
-            side_effect=[bootstrap, discovery, startup],
+            side_effect=[bootstrap, startup],
         ),
         patch.object(runtime, "_journal_checkpoint", return_value={}),
         patch.object(runtime, "_start_process"),
         patch.object(runtime, "_wait_for_authorization"),
         patch.object(runtime, "_wait_for_account_database"),
+        patch.object(
+            runtime,
+            "_cached_broker_symbol",
+            return_value="EURUSD.raw",
+        ),
         patch.object(runtime, "_wait_for_investor_sync"),
-        patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
         patch.object(runtime, "_remove_readiness_files"),
+        patch.object(runtime, "_write_symbol_preference"),
+        patch.object(
+            runtime,
+            "_probe_broker_symbol",
+            return_value="EURUSD.raw",
+        ),
+        patch.object(runtime, "_publish_bridge_handoff"),
         patch.object(runtime, "stop", return_value=True),
     ):
         with pytest.raises(NativeMt5Error, match=code):
@@ -1000,7 +1176,6 @@ def test_identity_and_readonly_guards(
                 expert_binary=expert,
             )
     assert not bootstrap.exists()
-    assert not discovery.exists()
     assert not startup.exists()
 
 

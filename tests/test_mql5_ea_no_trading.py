@@ -120,11 +120,22 @@ def test_new_only_defers_account_reads_until_after_on_init():
 
 def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     text = (MT5_EXPERTS_DIR / "TradeJournalLoader.mq5").read_text(encoding="utf-8")
-    assert "void OnStart()" in text
+    assert "int OnInit()" in text
+    assert "void OnTimer()" in text
+    assert "EventSetTimer(1);" in text
+    assert "EventKillTimer();" in text
+    assert "void OnStart()" not in text
     assert "HistorySelect" not in text
     assert "TerminalInfoInteger(TERMINAL_CONNECTED)" in text
-    assert "now_ms - connected_since_ms >= connection_grace_ms" in text
-    assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text
+    assert "now_ms - connected_since_ms < CONNECTION_GRACE_MS" in text
+    assert "ResolveBrokerSymbol" in text
+    assert "SYMBOL_CURRENCY_BASE" in text
+    assert "SYMBOL_CURRENCY_PROFIT" in text
+    assert "FindMatchingSymbol(preferred, true)" in text
+    assert "FindMatchingSymbol(preferred, false)" in text
+    assert "ApplyBridgeTemplate" in text
+    assert "TradeJournalBridge.resolved.tpl" in text
+    assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.resolved.tpl")' in text
 
 
 def test_bridge_keeps_only_the_chart_that_hosts_the_readonly_ea():
@@ -142,8 +153,24 @@ def test_bridge_keeps_only_the_chart_that_hosts_the_readonly_ea():
     assert 'WriteInitMarker("single-chart-ready");' in on_init
 
 
-def test_discovery_script_only_waits_for_account_connection():
+def test_discovery_script_resolves_symbol_and_hands_off_without_third_terminal():
     text = (MT5_EXPERTS_DIR / "TradeJournalDiscovery.mq5").read_text(encoding="utf-8")
-    assert "void OnStart()" in text
+    assert "int OnStart()" in text
     assert "TerminalInfoInteger(TERMINAL_CONNECTED)" in text
-    assert "ChartApplyTemplate" not in text
+    assert "SymbolsTotal(false)" in text
+    assert "SymbolIsSynchronized(symbol)" in text
+    assert "CP_UTF8" in text
+    assert "schema_version" in text
+    assert "connection_id" in text
+    assert "catalog_total" in text
+    assert "SYMBOL_CURRENCY_BASE" in text
+    assert "SYMBOL_CURRENCY_PROFIT" in text
+    assert "FindMatchingSymbol(preferred, true, resolution)" in text
+    assert "FindMatchingSymbol(preferred, false, resolution)" in text
+    assert 'BridgeHandoffReady()' in text
+    assert 'ChartApplyTemplate(0, "\\\\Files\\\\TradeJournal\\\\TradeJournalBridge.tpl")' in text
+    assert 'preferred + ".raw"' not in text
+    runtime = (Path(__file__).parents[1] / "windows_agent" / "worker" / "native_mt5_runtime.py").read_text(encoding="utf-8")
+    assert "TradeJournalDiscovery.ex5" in runtime
+    assert 'script_name="TradeJournal\\\\TradeJournalDiscovery"' in runtime
+    assert "_wait_for_cached_broker_symbol" not in runtime

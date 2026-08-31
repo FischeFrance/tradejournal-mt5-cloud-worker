@@ -12,6 +12,10 @@ import os
 from pathlib import Path
 
 
+_MOVEFILE_REPLACE_EXISTING = 0x00000001
+_MOVEFILE_WRITE_THROUGH = 0x00000008
+
+
 def durable_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
     source_path = os.path.abspath(os.fspath(source))
     destination_path = os.path.abspath(os.fspath(destination))
@@ -41,11 +45,24 @@ def _windows_replace_write_through(source: str, destination: str) -> None:
     move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
     move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
     move_file_ex.restype = wintypes.BOOL
-    movefile_replace_existing = 0x00000001
-    movefile_write_through = 0x00000008
     if not move_file_ex(
         source,
         destination,
-        movefile_replace_existing | movefile_write_through,
+        _windows_move_flags(source),
     ):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_move_flags(source: str) -> int:
+    """Return valid ``MoveFileExW`` flags for files and directories.
+
+    Windows rejects ``MOVEFILE_REPLACE_EXISTING`` when either path names a
+    directory. Pool slots are directories whose destination must not already
+    exist, so keep the durable write-through flag but only request replacement
+    for regular files.
+    """
+
+    flags = _MOVEFILE_WRITE_THROUGH
+    if not os.path.isdir(source):
+        flags |= _MOVEFILE_REPLACE_EXISTING
+    return flags
