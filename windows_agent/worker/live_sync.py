@@ -96,17 +96,61 @@ def _mql5_file_event(
                 "open_time": record.get("time"),
             }
         if entry in ("OUT", "OUT_BY"):
-            if current_position is not None:
+            previous_volume = (
+                previous_position.get("volume")
+                if previous_position is not None
+                else None
+            )
+            current_volume = (
+                current_position.get("volume")
+                if current_position is not None
+                else None
+            )
+            deal_volume = record.get("volume")
+            try:
+                previous_volume_number = float(previous_volume)
+                deal_volume_number = float(deal_volume)
+            except (TypeError, ValueError):
+                previous_volume_number = None
+                deal_volume_number = None
+
+            # The DEAL_ADD file can become visible before the terminal snapshot drops the
+            # closed position. In that race, presence in ``current`` is not proof of a partial
+            # close. The deal volume is authoritative: closing the whole previous volume is a
+            # final execution even while the snapshot still contains the stale position.
+            closes_previous_volume = (
+                previous_volume_number is not None
+                and deal_volume_number is not None
+                and deal_volume_number >= previous_volume_number - 1e-8
+            )
+            if current_position is not None and not closes_previous_volume:
+                remaining_volume = current_volume
+                if (
+                    previous_volume_number is not None
+                    and deal_volume_number is not None
+                ):
+                    expected_remaining = max(
+                        0.0, previous_volume_number - deal_volume_number
+                    )
+                    try:
+                        snapshot_is_stale = (
+                            float(current_volume) >= previous_volume_number - 1e-8
+                        )
+                    except (TypeError, ValueError):
+                        snapshot_is_stale = True
+                    if snapshot_is_stale:
+                        remaining_volume = expected_remaining
                 return {
                     **base,
                     "event_type": "trade_volume_changed",
-                    "volume": current_position.get("volume"),
-                    "previous_volume": (
-                        previous_position.get("volume")
-                        if previous_position is not None
-                        else None
-                    ),
+                    "volume": remaining_volume,
+                    "previous_volume": previous_volume,
                     "partial_close": True,
+                    "close_price": record.get("price"),
+                    "profit": record.get("profit"),
+                    "commission": record.get("commission"),
+                    "swap": record.get("swap"),
+                    "close_time": record.get("time"),
                 }
             return {
                 **base,

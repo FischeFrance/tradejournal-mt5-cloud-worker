@@ -101,3 +101,82 @@ def test_order_delete_is_ignored_and_history_add_is_canonical_cancel():
     assert cancelled["source_event_id"] == (
         "42|Demo|HISTORY_ADD|8001|1787866200000"
     )
+
+
+def test_full_close_wins_over_stale_position_snapshot_and_keeps_economics():
+    position = {
+        "positions": {
+            "1001": {
+                "ticket": "1001",
+                "symbol": "USDCAD",
+                "direction": "sell",
+                "volume": 2.79,
+            }
+        },
+        "orders": {},
+        "deals": {},
+    }
+    record = {
+        "event_type": "DEAL_ADD",
+        "position_id": "1001",
+        "deal_id": "9001",
+        "symbol": "USDCAD",
+        "direction": "buy",
+        "volume": 2.79,
+        "price": 1.37815,
+        "entry": "OUT",
+        "profit": -27.9,
+        "commission": -7.25,
+        "swap": 0.0,
+        "time": "2026-09-09T12:58:34Z",
+    }
+
+    event = _mql5_file_event(record, position, position)
+
+    assert event is not None
+    assert event["event_type"] == "trade_closed"
+    assert event["close_price"] == 1.37815
+    assert event["profit"] == -27.9
+    assert event["commission"] == -7.25
+    assert event["swap"] == 0.0
+
+
+def test_partial_close_uses_deal_volume_when_position_snapshot_is_stale():
+    position = {
+        "positions": {
+            "1001": {
+                "ticket": "1001",
+                "symbol": "EURUSD",
+                "direction": "buy",
+                "volume": 1.0,
+            }
+        },
+        "orders": {},
+        "deals": {},
+    }
+    record = {
+        "event_type": "DEAL_ADD",
+        "position_id": "1001",
+        "deal_id": "9002",
+        "symbol": "EURUSD",
+        "direction": "sell",
+        "volume": 0.4,
+        "price": 1.1,
+        "entry": "OUT_BY",
+        "profit": 12.0,
+        "commission": -0.5,
+        "swap": -0.1,
+        "time": "2026-09-09T13:00:00Z",
+    }
+
+    event = _mql5_file_event(record, position, position)
+
+    assert event is not None
+    assert event["event_type"] == "trade_volume_changed"
+    assert event["previous_volume"] == 1.0
+    assert event["volume"] == 0.6
+    assert event["partial_close"] is True
+    assert event["close_price"] == 1.1
+    assert event["profit"] == 12.0
+    assert event["commission"] == -0.5
+    assert event["swap"] == -0.1
