@@ -117,7 +117,7 @@ def test_new_only_restart_recovers_only_a_bounded_downtime_gap():
     assert "HistorySelect(from_time, to_time)" in text
     assert "ulong deal_tickets[]" in text
     assert "ulong order_tickets[]" in text
-    assert "state != ORDER_STATE_CANCELED" in text
+    assert "state == ORDER_STATE_CANCELED" in text
     assert "EmitDealAddEvent(ticket)" in text
     assert "!all_events_written || !SaveCursorState()" in text
     assert (
@@ -126,6 +126,21 @@ def test_new_only_restart_recovers_only_a_bounded_downtime_gap():
     )
     assert 'FileDelete(BASE_DIR + "\\\\history_from_unix")' in text
     assert "g_new_only_recovery_pending && !RunNewOnlyRecovery()" in text
+
+
+def test_pending_order_fill_has_a_distinct_terminal_source_event():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    for order_type in (
+        "ORDER_TYPE_BUY_LIMIT",
+        "ORDER_TYPE_SELL_LIMIT",
+        "ORDER_TYPE_BUY_STOP",
+        "ORDER_TYPE_SELL_STOP",
+        "ORDER_TYPE_BUY_STOP_LIMIT",
+        "ORDER_TYPE_SELL_STOP_LIMIT",
+    ):
+        assert order_type in text
+    assert "ORDER_STATE_FILLED" in text
+    assert 'event_kind = "HISTORY_FILLED"' in text
 
 
 def test_loader_hands_off_to_bridge_template_after_connection_grace_period():

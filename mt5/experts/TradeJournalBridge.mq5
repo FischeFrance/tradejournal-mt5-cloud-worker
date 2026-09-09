@@ -159,6 +159,16 @@ string DirectionFromType(const long mt5_type)
    return (mt5_type % 2 == 0) ? "buy" : "sell";
   }
 
+bool IsPendingOrderType(const long order_type)
+  {
+   return order_type == ORDER_TYPE_BUY_LIMIT ||
+          order_type == ORDER_TYPE_SELL_LIMIT ||
+          order_type == ORDER_TYPE_BUY_STOP ||
+          order_type == ORDER_TYPE_SELL_STOP ||
+          order_type == ORDER_TYPE_BUY_STOP_LIMIT ||
+          order_type == ORDER_TYPE_SELL_STOP_LIMIT;
+  }
+
 // Il file connection_id e' scritto dall'entrypoint (contenuto non sensibile: solo un UUID di
 // connessione) sotto BASE_DIR PRIMA che il terminale venga avviato, cosi' e' gia' presente al
 // primo OnInit. Un fallback esplicito ("unknown-connection", mai vuoto) evita che un file
@@ -487,6 +497,7 @@ string BuildDealsJson()
       json += "{";
       json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
       json += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
+      json += "\"order_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_ORDER))) + ",";
       json += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
       long deal_type = HistoryDealGetInteger(ticket, DEAL_TYPE);
       json += "\"type\":" + IntegerToString(deal_type) + ",";
@@ -714,12 +725,17 @@ bool EmitHistoryOrderEvent(const ulong order_ticket)
       return false;
 
    long state = HistoryOrderGetInteger(order_ticket, ORDER_STATE);
-   if(state != ORDER_STATE_CANCELED && state != ORDER_STATE_EXPIRED &&
-      state != ORDER_STATE_REJECTED)
-      return true; // gli ordini eseguiti sono rappresentati dai rispettivi DEAL_ADD
+   long type = HistoryOrderGetInteger(order_ticket, ORDER_TYPE);
+   string event_kind = "";
+   if(state == ORDER_STATE_FILLED && IsPendingOrderType(type))
+      event_kind = "HISTORY_FILLED";
+   else if(state == ORDER_STATE_CANCELED || state == ORDER_STATE_EXPIRED ||
+           state == ORDER_STATE_REJECTED)
+      event_kind = "HISTORY_ADD";
+   else
+      return true; // un'esecuzione parziale resta un ordine attivo fino al suo stato terminale
 
    string   symbol      = HistoryOrderGetString(order_ticket, ORDER_SYMBOL);
-   long     type        = HistoryOrderGetInteger(order_ticket, ORDER_TYPE);
    double   volume      = HistoryOrderGetDouble(order_ticket, ORDER_VOLUME_CURRENT);
    double   price       = HistoryOrderGetDouble(order_ticket, ORDER_PRICE_OPEN);
    double   sl          = HistoryOrderGetDouble(order_ticket, ORDER_SL);
@@ -729,7 +745,7 @@ bool EmitHistoryOrderEvent(const ulong order_ticket)
    datetime event_time  = (datetime)HistoryOrderGetInteger(order_ticket, ORDER_TIME_DONE);
    long     timestamp_msc = HistoryOrderGetInteger(order_ticket, ORDER_TIME_DONE_MSC);
 
-   string line = BuildEventJson("HISTORY_ADD", (long)order_ticket, 0, (long)order_ticket, 0,
+   string line = BuildEventJson(event_kind, (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
    return WriteEventAtomic(line);

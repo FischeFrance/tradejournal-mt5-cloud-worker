@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from windows_agent.worker.live_sync import _mql5_file_event
+from windows_agent.worker.live_sync import (
+    _merge_event_stream_with_snapshot,
+    _mql5_file_event,
+)
 from worker.event_normalizer import normalize_event
 
 
@@ -63,6 +66,7 @@ def test_replayed_deal_keeps_source_identity_when_snapshot_mapping_changes():
     reprovisioned_payload = normalize_event(reprovisioned, "42", "Demo")
 
     assert first["event_type"] == "trade_opened"
+    assert first["origin_order_ticket"] == "8001"
     assert replay["event_type"] == "trade_volume_changed"
     assert first_payload["event_id"] == replay_payload["event_id"]
     assert legacy_payload["event_id"] == replay_payload["event_id"]
@@ -101,6 +105,99 @@ def test_order_delete_is_ignored_and_history_add_is_canonical_cancel():
     assert cancelled["source_event_id"] == (
         "42|Demo|HISTORY_ADD|8001|1787866200000"
     )
+
+
+def test_pending_fill_source_event_uses_the_broker_order_ticket():
+    empty = {"positions": {}, "orders": {}, "deals": {}}
+    filled = {
+        "event_id": (
+            "00000000-0000-4000-8000-000000000001|42|Demo|"
+            "HISTORY_FILLED|8001|1787866200000|EURUSD"
+        ),
+        "event_type": "HISTORY_FILLED",
+        "ticket": "8001",
+        "order_id": "8001",
+        "symbol": "EURUSD",
+        "direction": "buy",
+        "volume": 0.1,
+        "price": 1.1,
+        "time": "2026-08-27T21:30:00Z",
+    }
+
+    event = _mql5_file_event(filled, empty, empty)
+
+    assert event is not None
+    assert event["event_type"] == "pending_order_filled"
+    assert event["ticket"] == "8001"
+    assert event["volume"] is None
+    assert event["source_event_id"] == (
+        "42|Demo|HISTORY_FILLED|8001|1787866200000"
+    )
+
+
+def test_stream_fill_suppresses_a_stale_snapshot_cancellation_and_keeps_ids_distinct():
+    source_prefix = "00000000-0000-4000-8000-000000000001|42|Demo"
+    previous = {
+        "positions": {},
+        "orders": {
+            "8001": {
+                "ticket": "8001", "symbol": "EURUSD", "direction": "buy",
+                "volume": 0.1, "price": 1.1, "stop_loss": 1.09, "take_profit": 1.11,
+            }
+        },
+        "deals": {},
+    }
+    current = {
+        "positions": {
+            "1001": {
+                "ticket": "1001", "symbol": "EURUSD", "direction": "buy",
+                "volume": 0.1, "open_price": 1.1, "stop_loss": 1.09, "take_profit": 1.11,
+            }
+        },
+        "orders": {},
+        "deals": {},  # The periodic snapshot is deliberately stale while source events arrive.
+    }
+    records = (
+        {
+            "event_id": f"{source_prefix}|DEAL_ADD|9001|1787866200000|EURUSD",
+            "event_type": "DEAL_ADD",
+            "ticket": "9001",
+            "position_id": "1001",
+            "order_id": "8001",
+            "deal_id": "9001",
+            "symbol": "EURUSD",
+            "direction": "buy",
+            "volume": 0.1,
+            "price": 1.1,
+            "entry": "IN",
+            "time": "2026-08-27T21:30:00Z",
+        },
+        {
+            "event_id": f"{source_prefix}|HISTORY_FILLED|8001|1787866200001|EURUSD",
+            "event_type": "HISTORY_FILLED",
+            "ticket": "8001",
+            "order_id": "8001",
+            "symbol": "EURUSD",
+            "direction": "buy",
+            "volume": 0.1,
+            "price": 1.1,
+            "time": "2026-08-27T21:30:00Z",
+        },
+    )
+
+    events = _merge_event_stream_with_snapshot(records, previous, current)
+    payloads = [normalize_event(event, "42", "Demo") for event in events]
+
+    assert [event["event_type"] for event in events] == [
+        "trade_opened",
+        "pending_order_filled",
+    ]
+    assert events[0]["origin_order_ticket"] == "8001"
+    assert payloads[0]["event_id"] != payloads[1]["event_id"]
+    assert [payload["event_id"] for payload in payloads] == [
+        normalize_event(event, "42", "Demo")["event_id"]
+        for event in _merge_event_stream_with_snapshot(records, previous, current)
+    ]
 
 
 def test_full_close_wins_over_stale_position_snapshot_and_keeps_economics():

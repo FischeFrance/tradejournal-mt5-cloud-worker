@@ -20,6 +20,11 @@ def test_trade_opened_detected_for_new_position():
         "take_profit": 1.1100,
         "open_time": "2026-01-01T00:00:00+00:00",
     }
+    current["deals"]["500"] = {
+        "position_ticket": "1",
+        "entry": "IN",
+        "order_id": "2",
+    }
 
     events = detect_events(previous, current)
 
@@ -29,6 +34,25 @@ def test_trade_opened_detected_for_new_position():
     assert events[0]["symbol"] == "EURUSD"
     assert events[0]["stop_loss"] == 1.0950
     assert events[0]["take_profit"] == 1.1100
+    assert events[0]["origin_order_ticket"] == "2"
+
+
+def test_trade_opened_keeps_no_origin_for_multiple_entry_orders_in_one_position():
+    previous = _empty()
+    current = _empty()
+    current["positions"]["1"] = {
+        "ticket": "1", "symbol": "EURUSD", "direction": "buy", "volume": 0.2,
+        "open_price": 1.1, "stop_loss": 1.09, "take_profit": 1.11,
+    }
+    current["deals"] = {
+        "500": {"position_ticket": "1", "entry": "IN", "order_id": "2"},
+        "501": {"position_ticket": "1", "entry": "IN", "order_id": "3"},
+    }
+
+    events = detect_events(previous, current)
+
+    assert events[0]["event_type"] == "trade_opened"
+    assert "origin_order_ticket" not in events[0]
 
 
 def test_trade_modified_detected_for_stop_loss_change():
@@ -158,22 +182,30 @@ def test_pending_order_cancelled_detected():
     assert events[0]["event_type"] == "pending_order_cancelled"
 
 
-def test_pending_order_disappearing_into_a_position_is_not_a_cancellation():
+def test_pending_order_fill_is_confirmed_by_its_entry_deal():
     previous = _empty()
     previous["orders"]["2"] = {
         "ticket": "2", "symbol": "EURUSD", "direction": "buy", "volume": 0.05,
         "price": 1.0900, "stop_loss": 1.0850, "take_profit": 1.1000,
     }
     current = _empty()
-    current["positions"]["2"] = {
-        "ticket": "2", "symbol": "EURUSD", "direction": "buy", "volume": 0.05,
+    current["positions"]["3"] = {
+        "ticket": "3", "symbol": "EURUSD", "direction": "buy", "volume": 0.05,
         "open_price": 1.0900, "stop_loss": 1.0850, "take_profit": 1.1000,
+    }
+    current["deals"]["500"] = {
+        "position_ticket": "3",
+        "entry": "IN",
+        "order_id": "2",
     }
 
     events = detect_events(previous, current)
 
-    order_events = [e for e in events if e["event_type"] == "pending_order_cancelled"]
-    assert order_events == []
+    assert [event["event_type"] for event in events] == [
+        "trade_opened",
+        "pending_order_filled",
+    ]
+    assert events[0]["origin_order_ticket"] == "2"
 
 
 def test_no_events_when_snapshot_unchanged():

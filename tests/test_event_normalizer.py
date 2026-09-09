@@ -9,6 +9,7 @@ RAW_TRADE_OPENED = {
     "open_price": 1.1000,
     "stop_loss": 1.0950,
     "take_profit": 1.1100,
+    "origin_order_ticket": "2",
     "open_time": "2026-01-01T00:00:00+00:00",
     "event_time": "2026-01-01T00:00:00+00:00",
 }
@@ -21,7 +22,7 @@ def test_normalize_event_produces_all_contract_fields():
         "event_id", "event_type", "platform", "account_number", "server", "external_trade_id",
         "symbol", "direction", "volume", "price", "open_price", "close_price", "stop_loss",
         "take_profit", "previous_stop_loss", "previous_take_profit", "profit", "commission",
-        "swap", "open_time", "close_time", "event_time",
+        "swap", "origin_order_ticket", "open_time", "close_time", "event_time",
     }
     assert set(payload.keys()) == expected_keys
     assert payload["event_type"] == "trade_opened"
@@ -32,6 +33,7 @@ def test_normalize_event_produces_all_contract_fields():
     assert payload["symbol"] == "EURUSD"
     assert payload["stop_loss"] == 1.0950
     assert payload["take_profit"] == 1.1100
+    assert payload["origin_order_ticket"] == "2"
 
 
 def test_normalize_event_accepts_missing_account_number():
@@ -93,7 +95,7 @@ def test_event_id_differs_across_event_types_for_same_ticket():
     assert build_event_id("12345", opened) != build_event_id("12345", closed)
 
 
-def test_normalize_all_seven_event_types_yields_valid_payload():
+def test_normalize_all_eight_event_types_yields_valid_payload():
     raw_events = [
         {"event_type": "trade_opened", "ticket": "1", "symbol": "EURUSD", "direction": "buy",
          "volume": 0.1, "open_price": 1.1, "stop_loss": 1.09, "take_profit": 1.11,
@@ -115,13 +117,15 @@ def test_normalize_all_seven_event_types_yields_valid_payload():
          "event_time": "2026-01-01T02:05:00+00:00"},
         {"event_type": "pending_order_cancelled", "ticket": "2", "symbol": "EURUSD", "direction": "buy",
          "volume": 0.05, "price": 1.09, "event_time": "2026-01-01T02:10:00+00:00"},
+        {"event_type": "pending_order_filled", "ticket": "3", "symbol": "EURUSD", "direction": "buy",
+         "volume": 0.05, "price": 1.09, "event_time": "2026-01-01T02:15:00+00:00"},
     ]
 
     payloads = [normalize_event(e, account_number="12345", server="Demo-Server") for e in raw_events]
 
     assert [p["event_type"] for p in payloads] == [
         "trade_opened", "trade_modified", "trade_modified", "trade_closed",
-        "pending_order_created", "pending_order_modified", "pending_order_cancelled",
+        "pending_order_created", "pending_order_modified", "pending_order_cancelled", "pending_order_filled",
     ]
     assert len({p["event_id"] for p in payloads}) == len(payloads), "ogni evento deve avere un event_id univoco"
     assert all(p["event_id"] for p in payloads)

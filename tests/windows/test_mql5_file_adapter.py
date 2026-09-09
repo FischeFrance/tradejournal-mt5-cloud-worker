@@ -57,7 +57,7 @@ def _ready_adapter(tmp_path: Path) -> Mql5FileMt5Adapter:
     _write(
         root,
         "deals.json",
-        [{"ticket": "3", "position_id": "1", "symbol": "EURUSD", "time": "2026-07-17T10:00:00Z"}],
+        [{"ticket": "3", "position_id": "1", "order_id": "2", "entry": "IN", "symbol": "EURUSD", "time": "2026-07-17T10:00:00Z"}],
     )
     return Mql5FileMt5Adapter(root, CONNECTION_ID, 42, "Demo-Server", tmp_path / "state")
 
@@ -70,6 +70,7 @@ def test_reads_versioned_snapshots_and_preserves_sync_interface(tmp_path: Path) 
     snapshot = adapter.snapshot()
     assert set(snapshot) == {"positions", "orders", "deals"}
     assert list(snapshot["deals"]) == ["3"]
+    assert snapshot["deals"]["3"]["order_id"] == "2"
     assert len(adapter.history_deals(datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc))) == 1
 
 

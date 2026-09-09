@@ -40,7 +40,7 @@ def _stable_mql5_source_event_id(value: object) -> str | None:
         len(parts) < 6
         or not all(parts[:6])
         or not parts[1].isdigit()
-        or parts[3] not in ("DEAL_ADD", "HISTORY_ADD")
+        or parts[3] not in ("DEAL_ADD", "HISTORY_ADD", "HISTORY_FILLED")
         or not parts[4].isdigit()
         or not parts[5].isdigit()
     ):
@@ -61,6 +61,28 @@ def _mql5_file_event(
         # orders that were merely executed. HISTORY_ADD is state-filtered by
         # the EA and is the sole canonical cancellation event/replay identity.
         return None
+    if event_type == "HISTORY_FILLED":
+        order_ticket = record.get("order_id") or record.get("ticket")
+        order_ticket_text = str(order_ticket or "")
+        base = {
+            "ticket": order_ticket_text,
+            "symbol": record.get("symbol"),
+            "direction": record.get("direction"),
+            # MT5 reports ORDER_VOLUME_CURRENT as zero once an order is fully filled. Keep it
+            # null so the pending-order lifecycle projection retains the original order volume.
+            "volume": None,
+            "event_time": record.get("time"),
+        }
+        source_event_id = _stable_mql5_source_event_id(record.get("event_id"))
+        if source_event_id is not None:
+            base["source_event_id"] = source_event_id
+        return {
+            **base,
+            "event_type": "pending_order_filled",
+            "price": record.get("price"),
+            "stop_loss": record.get("stop_loss"),
+            "take_profit": record.get("take_profit"),
+        }
     position_ticket = record.get("position_id") or record.get("position_ticket")
     ticket = position_ticket or record.get("order_id") or record.get("ticket")
     ticket_text = str(ticket)
@@ -89,12 +111,16 @@ def _mql5_file_event(
                     "previous_volume": previous_position.get("volume"),
                     "partial_close": False,
                 }
-            return {
+            opened = {
                 **base,
                 "event_type": "trade_opened",
                 "open_price": record.get("price"),
                 "open_time": record.get("time"),
             }
+            origin_order_ticket = str(record.get("order_id") or "").strip()
+            if origin_order_ticket and origin_order_ticket != "0":
+                opened["origin_order_ticket"] = origin_order_ticket
+            return opened
         if entry in ("OUT", "OUT_BY"):
             previous_volume = (
                 previous_position.get("volume")
@@ -248,6 +274,11 @@ def _merge_event_stream_with_snapshot(
         (str(event.get("event_type")), str(event.get("ticket")))
         for event in stream_events
     }
+    terminal_pending_order_tickets = {
+        str(event.get("ticket"))
+        for event in stream_events
+        if event.get("event_type") == "pending_order_filled"
+    }
     stream_deal_ids = {
         str(record.get("deal_id") or record.get("ticket"))
         for record in records
@@ -256,6 +287,11 @@ def _merge_event_stream_with_snapshot(
     for event in reconciliation:
         key = (str(event.get("event_type")), str(event.get("ticket")))
         if key in covered:
+            continue
+        if (
+            event.get("event_type") == "pending_order_cancelled"
+            and str(event.get("ticket")) in terminal_pending_order_tickets
+        ):
             continue
         if (
             event.get("event_type") == "deal_recorded"
