@@ -24,6 +24,7 @@ from windows_agent.provisioning.mt5_public_release import (
     AuthenticodeIdentity,
     Mt5InstanceReleaseInventory,
     Mt5PublicRelease,
+    Mt5PublicReleaseError,
 )
 from windows_agent.provisioning.mt5_template import PreparedMt5Template
 from windows_agent.provisioning.mt5_update_store import Mt5UpdateRelease
@@ -446,6 +447,21 @@ class FakePublicProbe:
         return self.release
 
     def load_current(self) -> Mt5PublicRelease:
+        return self.release
+
+
+class FailingPublicProbe(FakePublicProbe):
+    def __init__(self, release: Mt5PublicRelease, message: str) -> None:
+        super().__init__(release)
+        self.message = message
+        self.load_calls = 0
+
+    def refresh(self) -> Mt5PublicRelease:
+        self.refresh_calls += 1
+        raise Mt5PublicReleaseError(self.message)
+
+    def load_current(self) -> Mt5PublicRelease:
+        self.load_calls += 1
         return self.release
 
 
@@ -893,6 +909,59 @@ def test_public_canary_refreshes_baseline_and_updates_only_fpm(
     }
     target_seal = seal.call_args_list[1]
     assert target_seal.kwargs == {}
+
+
+def test_public_build_mismatch_uses_last_verified_baseline(tmp_path: Path) -> None:
+    _, instances, expert, manager, rotator, secrets = _fixture(tmp_path)
+    public = _public_release(manager)
+    probe = FailingPublicProbe(
+        public,
+        "MT5 installer and terminal builds differ",
+    )
+    inventory = FakePublicInventory(instances, rotator)
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        FakePool(),
+        public_probe=probe,
+        public_inventory=inventory,
+    )
+
+    baseline, records = coordinator._refresh_public_baseline()
+
+    assert baseline == public
+    assert len(records) == 1
+    assert probe.refresh_calls == 1
+    assert probe.load_calls == 1
+    assert inventory.calls == 1
+
+
+def test_public_refresh_failure_other_than_build_mismatch_still_fails(
+    tmp_path: Path,
+) -> None:
+    _, instances, expert, manager, rotator, secrets = _fixture(tmp_path)
+    probe = FailingPublicProbe(_public_release(manager), "signature invalid")
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        FakePool(),
+        public_probe=probe,
+        public_inventory=FakePublicInventory(instances, rotator),
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="refresh failed"):
+        coordinator._refresh_public_baseline()
+
+    assert probe.refresh_calls == 1
+    assert probe.load_calls == 0
 
 
 def test_nightly_public_baseline_promotes_pool_then_only_older_instances(

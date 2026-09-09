@@ -24,6 +24,7 @@ from .provisioning.mt5_public_release import (
     Mt5InstanceReleaseInventory,
     Mt5ProvisionedReleaseInventory,
     Mt5PublicRelease,
+    Mt5PublicReleaseError,
     Mt5PublicReleaseProbe,
 )
 from .provisioning.mt5_template import (
@@ -151,7 +152,21 @@ class Mt5MaintenanceCoordinator:
         if probe is None or inventory is None:
             raise Mt5MaintenanceError("MT5 public release source is disabled")
         try:
-            baseline = probe.refresh()
+            try:
+                baseline = probe.refresh()
+            except Mt5PublicReleaseError as exc:
+                # MetaQuotes can briefly publish a bootstrapper whose embedded build
+                # still trails the terminal downloaded by that bootstrapper. The new
+                # distribution is not trusted until both builds agree, but an already
+                # published baseline remains fully verifiable and safe to use for this
+                # maintenance pass. Every later pass retries the fresh probe.
+                if str(exc) != "MT5 installer and terminal builds differ":
+                    raise
+                baseline = probe.load_current()
+                logger.warning(
+                    "MT5 public release is temporarily inconsistent; "
+                    "using the last verified baseline"
+                )
             records = tuple(inventory.scan(baseline))
         except Exception as exc:
             raise Mt5MaintenanceError(
