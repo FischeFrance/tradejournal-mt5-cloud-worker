@@ -158,6 +158,29 @@ def test_pending_order_cancelled_detected():
     assert events[0]["event_type"] == "pending_order_cancelled"
 
 
+def test_pending_order_lifecycle_preserves_order_type():
+    """Every lifecycle event must retain the type that makes it a real pending order."""
+    created_snapshot = _empty()
+    created_snapshot["orders"]["2"] = {
+        "ticket": "2", "symbol": "EURUSD", "direction": "buy", "volume": 0.05,
+        "price": 1.0900, "stop_loss": 1.0850, "take_profit": 1.1000,
+        "order_type": 2,
+    }
+    modified_snapshot = copy.deepcopy(created_snapshot)
+    modified_snapshot["orders"]["2"]["stop_loss"] = 1.0870
+
+    created = detect_events(_empty(), created_snapshot)
+    modified = detect_events(created_snapshot, modified_snapshot)
+    cancelled = detect_events(modified_snapshot, _empty())
+
+    assert [event["event_type"] for event in [*created, *modified, *cancelled]] == [
+        "pending_order_created",
+        "pending_order_modified",
+        "pending_order_cancelled",
+    ]
+    assert [event["order_type"] for event in [*created, *modified, *cancelled]] == [2, 2, 2]
+
+
 def test_pending_order_disappearing_into_a_position_is_not_a_cancellation():
     previous = _empty()
     previous["orders"]["2"] = {

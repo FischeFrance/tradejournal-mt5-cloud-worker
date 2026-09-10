@@ -31,6 +31,19 @@ def _base_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _pending_order_fields(order: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the common fields for every pending-order lifecycle event.
+
+    ``order_type`` is deliberately kept with every lifecycle update (not just creation):
+    downstream projections use it to distinguish true pending MT5 order types from market
+    BUY/SELL orders that can also appear in the order stream.
+    """
+    return {
+        **_base_fields(order),
+        "order_type": order.get("order_type"),
+    }
+
+
 def _detect_trade_opened_and_modified(previous: Dict[str, Any], current: Dict[str, Any]) -> List[RawEvent]:
     events: List[RawEvent] = []
     prev_positions = previous.get("positions", {})
@@ -120,7 +133,7 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
             events.append({
                 "event_type": "pending_order_created",
                 "ticket": ticket,
-                **_base_fields(order),
+                **_pending_order_fields(order),
                 "price": order.get("price"),
                 "stop_loss": order.get("stop_loss"),
                 "take_profit": order.get("take_profit"),
@@ -137,7 +150,7 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
             events.append({
                 "event_type": "pending_order_modified",
                 "ticket": ticket,
-                **_base_fields(order),
+                **_pending_order_fields(order),
                 "price": order.get("price"),
                 "stop_loss": order.get("stop_loss"),
                 "take_profit": order.get("take_profit"),
@@ -156,7 +169,7 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
         events.append({
             "event_type": "pending_order_cancelled",
             "ticket": ticket,
-            **_base_fields(order),
+            **_pending_order_fields(order),
             "price": order.get("price"),
             "stop_loss": order.get("stop_loss"),
             "take_profit": order.get("take_profit"),

@@ -21,7 +21,7 @@ def test_normalize_event_produces_all_contract_fields():
         "event_id", "event_type", "platform", "account_number", "server", "external_trade_id",
         "symbol", "direction", "volume", "price", "open_price", "close_price", "stop_loss",
         "take_profit", "previous_stop_loss", "previous_take_profit", "profit", "commission",
-        "swap", "open_time", "close_time", "event_time",
+        "swap", "order_type", "open_time", "close_time", "event_time",
     }
     assert set(payload.keys()) == expected_keys
     assert payload["event_type"] == "trade_opened"
@@ -76,6 +76,45 @@ def test_event_id_changes_when_stop_loss_value_changes():
     id_2 = build_event_id("12345", modified_2)
 
     assert id_1 != id_2
+
+
+def test_pending_order_event_id_does_not_change_when_order_type_is_forwarded():
+    """order_type is routing metadata, not a new lifecycle state for idempotency purposes."""
+    raw = {
+        "event_type": "pending_order_created", "ticket": "2", "symbol": "EURUSD",
+        "direction": "buy", "volume": 0.05, "price": 1.09, "stop_loss": 1.085,
+        "take_profit": 1.10,
+    }
+
+    assert build_event_id("12345", raw) == build_event_id(
+        "12345", {**raw, "order_type": 2}
+    )
+
+
+def test_normalize_pending_order_lifecycles_preserves_order_type():
+    """The normalizer must forward the type for terminal events too, including a fill."""
+    for event_type in (
+        "pending_order_created",
+        "pending_order_modified",
+        "pending_order_cancelled",
+        "pending_order_filled",
+    ):
+        payload = normalize_event(
+            {
+                "event_type": event_type,
+                "ticket": "2",
+                "symbol": "EURUSD",
+                "direction": "buy",
+                "volume": 0.05,
+                "price": 1.09,
+                "order_type": 2,
+                "event_time": "2026-01-01T02:00:00+00:00",
+            },
+            account_number="12345",
+            server="Demo-Server",
+        )
+
+        assert payload["order_type"] == 2
 
 
 def test_event_id_is_stable_regardless_of_unrelated_field_order():
