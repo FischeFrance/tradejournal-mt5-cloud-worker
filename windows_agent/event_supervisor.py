@@ -105,7 +105,11 @@ class Mt5EventSupervisor:
             try:
                 sync = LiveSync(
                     adapter,
-                    _SnapshotState(root / "state" / "live-snapshot.json"),
+                    # Provisioning, history-sync activation and the filesystem supervisor must
+                    # advance one canonical baseline. Using a second hyphenated filename made a
+                    # later history job rediscover an already-open position and emit another
+                    # trade_opened without the original DEAL_ORDER ticket.
+                    _SnapshotState(root / "state" / "live_snapshot.json"),
                     dedup,
                     sink,
                     outbox=EventOutbox(

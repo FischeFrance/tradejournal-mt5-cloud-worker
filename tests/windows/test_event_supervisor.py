@@ -8,6 +8,7 @@ import pytest
 
 import windows_agent.event_supervisor as event_supervisor
 from windows_agent.event_supervisor import Mt5EventSupervisor
+from windows_agent.state_store import atomic_json
 
 
 class FakeAdapter:
@@ -94,6 +95,31 @@ def test_event_marker_wakes_one_snapshot_diff_and_status_is_sent_only_on_change(
     supervisor._process(connection_id)
     assert len(sink.transitions) == 1
     assert sink.flushes == 2
+
+
+def test_event_supervisor_reuses_the_history_sync_live_baseline(tmp_path):
+    connection_id = str(uuid4())
+    root = tmp_path / "instances" / connection_id
+    files_dir = root / "terminal" / "MQL5" / "Files" / "TradeJournal"
+    events_dir = files_dir / "events"
+    events_dir.mkdir(parents=True)
+    marker = events_dir / "event-13.json"
+    marker.write_text("{}", encoding="utf-8")
+    sink = FakeSink()
+    adapter = FakeAdapter(files_dir)
+    atomic_json(root / "state" / "live_snapshot.json", adapter.snapshot())
+    supervisor = Mt5EventSupervisor(
+        tmp_path / "instances",
+        tmp_path / "secrets",
+        "https://example.invalid",
+    )
+    supervisor._components = lambda _cid: (root, adapter, sink)  # type: ignore[method-assign]
+
+    supervisor._process(connection_id)
+
+    assert sink.events == []
+    assert not marker.exists()
+    assert not (root / "state" / "live-snapshot.json").exists()
 
 
 def test_failed_transition_is_not_resent_on_every_local_heartbeat(tmp_path):
