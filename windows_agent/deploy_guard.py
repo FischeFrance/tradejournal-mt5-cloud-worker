@@ -61,7 +61,7 @@ from .state_store import atomic_json, read_json
 
 SCHEMA_VERSION = 1
 SERVICE_NAME = "TradeJournalMT5Agent"
-FPM_SERVER_NAME = "FPMTrading-Live"
+RECOVERY_SERVER_NAME = re.compile(r"[A-Za-z0-9._ -]{1,128}")
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_HEARTBEAT_AGE_SECONDS = 30
 REQUIRED_MAINTENANCE_TIMEZONE = "Europe/Rome"
@@ -684,6 +684,16 @@ def _optional_fpm_id(value: object) -> str:
     if value == "":
         return ""
     return _validate_fpm_id(value)
+
+
+def _required_recovery_server(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or RECOVERY_SERVER_NAME.fullmatch(value) is None
+    ):
+        raise DeployGuardError("recovery_server_invalid")
+    return value
 
 
 def _binding(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1727,12 +1737,12 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
                 root = coordinator.rotator._instance_root(fpm)
                 state = read_json(root / "state" / "instance.json", {})
                 login = int(coordinator.secrets.read(fpm, "mt5_login"))
-                server = coordinator.secrets.read(fpm, "mt5_server")
+                server = _required_recovery_server(
+                    coordinator.secrets.read(fpm, "mt5_server")
+                )
                 if (
                     state.get("status") != "provisioned"
                     or login <= 0
-                    or not isinstance(server, str)
-                    or server.casefold() != FPM_SERVER_NAME.casefold()
                 ):
                     raise ValueError
                 # _probe is the exact restart/login/heartbeat/read-only gate
@@ -2159,14 +2169,13 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
             expected_login = str(
                 int(WindowsSecretStore(config.secrets_root).read(fpm, "mt5_login"))
             )
-            expected_server = WindowsSecretStore(config.secrets_root).read(
-                fpm, "mt5_server"
+            expected_server = _required_recovery_server(
+                WindowsSecretStore(config.secrets_root).read(fpm, "mt5_server")
             )
         except Exception as exc:
             raise DeployGuardError("fpm_stored_identity_invalid") from exc
         if (
             expected_login in ("", "0")
-            or expected_server.casefold() != FPM_SERVER_NAME.casefold()
             or account_identity != heartbeat_identity
             or account_sequence != heartbeat_sequence
             or account_identity.get("login") != expected_login

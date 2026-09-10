@@ -638,7 +638,7 @@ def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
     assert result["pool_ready_count"] == 2
 
 
-def test_converge_explicitly_probes_requested_fpm_when_same_server_selected_other(
+def test_converge_explicitly_probes_requested_readonly_recovery_account(
     guard_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(guard_root)
@@ -654,7 +654,7 @@ def test_converge_explicitly_probes_requested_fpm_when_same_server_selected_othe
     class Secrets:
         @staticmethod
         def read(_connection_id: str, name: str) -> str:
-            return "42" if name == "mt5_login" else "FPMTrading-Live"
+            return "42" if name == "mt5_login" else "FivePercentOnline-Real"
 
     coordinator = SimpleNamespace(
         rotator=SimpleNamespace(_instance_root=lambda _connection_id: fpm_root),
@@ -701,6 +701,22 @@ def test_converge_explicitly_probes_requested_fpm_when_same_server_selected_othe
 
     assert probes == [FPM_CONNECTION_ID]
     assert result["release_id"] == "f" * 64
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", " leading", "trailing ", "bad/server", "line\nbreak"),
+)
+def test_recovery_server_rejects_unsafe_values(value: str) -> None:
+    with pytest.raises(deploy_guard.DeployGuardError, match="recovery_server_invalid"):
+        deploy_guard._required_recovery_server(value)
+
+
+def test_recovery_server_accepts_active_broker_identity() -> None:
+    assert (
+        deploy_guard._required_recovery_server("FivePercentOnline-Real")
+        == "FivePercentOnline-Real"
+    )
 
 
 def test_failed_or_uncertain_convergence_resumes_idempotently_in_same_window(

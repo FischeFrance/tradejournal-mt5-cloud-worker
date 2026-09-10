@@ -209,9 +209,10 @@ Get-Content 'C:\TradeJournal\logs\agent-service.log' -Tail 100
 ```
 
 `RecoveryConnectionId` è obbligatorio quando esiste già almeno un'istanza e deve identificare
-l'account investor-only su `FPMTrading-Live` usato come prova end-to-end. Va omesso soltanto per
-una prima attivazione in cui il preflight `LocalSystem` attesta contemporaneamente zero processi
-MT5 e zero istanze provisioned.
+un account attivo investor-only usato come prova end-to-end. Il server atteso viene letto dal
+secret store locale e confrontato con account e heartbeat; il gate rifiuta un canary con trading
+abilitato. Va omesso soltanto per una prima attivazione in cui il preflight `LocalSystem` attesta
+contemporaneamente zero processi MT5 e zero istanze provisioned.
 
 Fuori dalla finestra notturna si può preparare e collaudare la release senza fermare il servizio,
 commutare la junction o modificare golden, pool e istanze:
