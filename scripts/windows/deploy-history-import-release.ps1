@@ -18,6 +18,7 @@ $currentPath = 'C:\TradeJournal\current'
 $pythonExe = $DeploymentPython
 $serviceRegistry = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
 $servicePythonClassRegistry = Join-Path $serviceRegistry 'PythonClass'
+$servicePythonClassRegistryPath = "SYSTEM\CurrentControlSet\Services\$serviceName\PythonClass"
 $goldenExpert = 'C:\TradeJournal\mt5-template\MQL5\Experts\TradeJournal\TradeJournalBridge.ex5'
 $releasePath = Join-Path $releaseRoot ("agent-" + $Revision.Substring(0, 12))
 $guardStateRoot = 'C:\TradeJournal\state'
@@ -47,8 +48,25 @@ function Set-ServicePythonClass {
   ) {
     throw 'The next Agent service PythonClass binding is invalid.'
   }
-  $key = Get-Item -LiteralPath $servicePythonClassRegistry -ErrorAction Stop
-  $key.SetValue('', $Value, [Microsoft.Win32.RegistryValueKind]::String)
+  # PowerShell's registry provider returns a read-only RegistryKey from Get-Item.
+  # Open the service subkey explicitly as writable before switching the pywin32
+  # PythonClass binding to the newly activated immutable release.
+  $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+    [Microsoft.Win32.RegistryHive]::LocalMachine,
+    [Microsoft.Win32.RegistryView]::Default
+  )
+  $key = $null
+  try {
+    $key = $baseKey.OpenSubKey($servicePythonClassRegistryPath, $true)
+    if ($null -eq $key) {
+      throw 'The Agent service PythonClass registry key could not be opened for writing.'
+    }
+    $key.SetValue('', $Value, [Microsoft.Win32.RegistryValueKind]::String)
+    $key.Flush()
+  } finally {
+    if ($null -ne $key) { $key.Dispose() }
+    $baseKey.Dispose()
+  }
   if (-not [string]::Equals((Get-ServicePythonClass), $Value, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'The Agent service PythonClass binding did not persist.'
   }

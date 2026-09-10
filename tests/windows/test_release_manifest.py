@@ -176,6 +176,24 @@ def test_deployment_gate_binds_and_rechecks_the_source_checkout() -> None:
         assert f"'{release_source}'" in script
 
 
+def test_deployment_opens_service_python_class_registry_key_for_writing() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
+    ).read_text(encoding="utf-8")
+
+    function = script[
+        script.index("function Set-ServicePythonClass") : script.index(
+            "trap {", script.index("function Set-ServicePythonClass")
+        )
+    ]
+    assert "RegistryKey]::OpenBaseKey" in function
+    assert "OpenSubKey($servicePythonClassRegistryPath, $true)" in function
+    assert "$key.Flush()" in function
+    assert "$key.Dispose()" in function
+    assert "$baseKey.Dispose()" in function
+    assert "Get-Item -LiteralPath $servicePythonClassRegistry" not in function
+
+
 def test_deployment_gate_includes_direct_tests_and_powershell_parser() -> None:
     script = (
         REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
