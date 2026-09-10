@@ -33,6 +33,9 @@ _ROTATION_SCHEMA_VERSION = 1
 _RECOVERY_FROM_UNIX_FIELD = "new_only_recovery_from_unix"
 _STAGING_NAME = ".terminal-maintenance-staging"
 _BACKUP_NAME = ".terminal-maintenance-backup"
+_BRIDGE_EXPERT_RELATIVE = Path(
+    "MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"
+)
 _EXECUTABLE_SUFFIXES = frozenset({".dll", ".exe", ".ex5"})
 _WINDOWS_TRANSIENT_DIRECTORY_MOVE_ERRORS = frozenset((5, 32, 33))
 _DIRECTORY_MOVE_ATTEMPTS = 5
@@ -757,7 +760,11 @@ class Mt5InstanceRotator:
                     status = runtime.resume(
                         login=login,
                         server=server,
-                        expert_binary=self.expert_binary,
+                        # The filesystem has just been rolled back to the previous sealed
+                        # release. Reinstalling self.expert_binary here would copy the new
+                        # Bridge over that release and make every subsequent recovery fail its
+                        # code-manifest check. Resume with the restored release's own Bridge.
+                        expert_binary=root / "terminal" / _BRIDGE_EXPERT_RELATIVE,
                         history_mode="new_only",
                         history_from=recovery_from,
                     )
@@ -953,7 +960,7 @@ class Mt5InstanceRotator:
                     rollback_status = runtime.resume(
                         login=login,
                         server=server,
-                        expert_binary=self.expert_binary,
+                        expert_binary=root / "terminal" / _BRIDGE_EXPERT_RELATIVE,
                         history_mode="new_only",
                         history_from=recovery_from,
                     )

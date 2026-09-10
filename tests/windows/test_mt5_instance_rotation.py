@@ -425,6 +425,14 @@ def test_failed_new_release_rolls_back_and_adopts_restarted_old_process(
         "new_only",
         "new_only",
     ]
+    assert controller.resume_calls[1]["expert_binary"] == (
+        root
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
     assert FakeProcess.adopted == [root / "terminal" / "terminal64.exe"]
     assert not (root / "state" / "mt5-rotation.json").exists()
 
@@ -669,6 +677,14 @@ def test_failed_rollback_stop_keeps_backup_and_journal_for_recovery(
     assert recovery.failed == ()
     assert recovery_controller.resume_calls[0]["history_mode"] == "new_only"
     assert recovery_controller.resume_calls[0]["history_from"] == persisted_cutoff
+    assert recovery_controller.resume_calls[0]["expert_binary"] == (
+        root
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
     assert recovery_controller.callback_calls == [
         (verified_update_callback, True)
     ]
