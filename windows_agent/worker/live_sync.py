@@ -50,6 +50,20 @@ def _stable_mql5_source_event_id(value: object) -> str | None:
     return "|".join(parts[1:6])
 
 
+_PENDING_ORDER_TYPES = frozenset(
+    {
+        "2", "3", "4", "5", "6", "7",
+        "BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP",
+        "BUY_STOP_LIMIT", "SELL_STOP_LIMIT",
+    }
+)
+
+
+def _is_pending_order_record(record: dict) -> bool:
+    value = record.get("order_type", record.get("type"))
+    return str(value).strip().upper() in _PENDING_ORDER_TYPES
+
+
 def _mql5_file_event(
     record: dict,
     previous: dict,
@@ -62,6 +76,8 @@ def _mql5_file_event(
         # the EA and is the sole canonical cancellation event/replay identity.
         return None
     if event_type == "HISTORY_FILLED":
+        if not _is_pending_order_record(record):
+            return None
         order_ticket = record.get("order_id") or record.get("ticket")
         order_ticket_text = str(order_ticket or "")
         base = {
@@ -72,6 +88,7 @@ def _mql5_file_event(
             # null so the pending-order lifecycle projection retains the original order volume.
             "volume": None,
             "event_time": record.get("time"),
+            "order_type": record.get("order_type", record.get("type")),
         }
         source_event_id = _stable_mql5_source_event_id(record.get("event_id"))
         if source_event_id is not None:
@@ -95,6 +112,8 @@ def _mql5_file_event(
         "volume": record.get("volume"),
         "event_time": record.get("time"),
     }
+    if record.get("order_type") is not None:
+        base["order_type"] = record.get("order_type")
     source_event_id = _stable_mql5_source_event_id(record.get("event_id"))
     if source_event_id is not None:
         # The EA identity is derived from immutable broker fields (deal/order ticket and
@@ -228,7 +247,7 @@ def _mql5_file_event(
                 else None
             ),
         }
-    if event_type == "ORDER_ADD":
+    if event_type == "ORDER_ADD" and _is_pending_order_record(record):
         return {
             **base,
             "event_type": "pending_order_created",
@@ -236,7 +255,7 @@ def _mql5_file_event(
             "stop_loss": record.get("stop_loss"),
             "take_profit": record.get("take_profit"),
         }
-    if event_type == "ORDER_UPDATE":
+    if event_type == "ORDER_UPDATE" and _is_pending_order_record(record):
         return {
             **base,
             "event_type": "pending_order_modified",
@@ -244,12 +263,14 @@ def _mql5_file_event(
             "stop_loss": record.get("stop_loss"),
             "take_profit": record.get("take_profit"),
         }
-    if event_type == "HISTORY_ADD":
+    if event_type == "HISTORY_ADD" and _is_pending_order_record(record):
         return {
             **base,
             "event_type": "pending_order_cancelled",
             "price": record.get("price"),
         }
+    if event_type in ("ORDER_ADD", "ORDER_UPDATE", "HISTORY_ADD", "HISTORY_FILLED"):
+        return None
     return {
         **base,
         "event_type": "deal_recorded",
@@ -277,7 +298,7 @@ def _merge_event_stream_with_snapshot(
     terminal_pending_order_tickets = {
         str(event.get("ticket"))
         for event in stream_events
-        if event.get("event_type") == "pending_order_filled"
+        if event.get("event_type") in ("pending_order_filled", "pending_order_cancelled")
     }
     stream_deal_ids = {
         str(record.get("deal_id") or record.get("ticket"))
@@ -299,6 +320,29 @@ def _merge_event_stream_with_snapshot(
         ):
             continue
         stream_events.append(event)
+
+    represented_pending_tickets = {
+        str(event.get("ticket"))
+        for event in stream_events
+        if str(event.get("event_type", "")).startswith("pending_order_")
+    }
+    # Re-assert unchanged active orders once per state fingerprint. This upgrades orders observed
+    # by an older bridge with the authoritative order_type and preserves their placement time.
+    for ticket, order in current.get("orders", {}).items():
+        if str(ticket) in represented_pending_tickets or not _is_pending_order_record(order):
+            continue
+        stream_events.append({
+            "event_type": "pending_order_modified",
+            "ticket": str(ticket),
+            "symbol": order.get("symbol"),
+            "direction": order.get("direction"),
+            "volume": order.get("volume"),
+            "price": order.get("price"),
+            "stop_loss": order.get("stop_loss"),
+            "take_profit": order.get("take_profit"),
+            "order_type": order.get("order_type"),
+            "event_time": order.get("placed_at"),
+        })
     return stream_events
 
 

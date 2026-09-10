@@ -141,6 +141,7 @@ def test_pending_order_created_detected():
     current["orders"]["2"] = {
         "ticket": "2", "symbol": "EURUSD", "direction": "buy", "volume": 0.05,
         "price": 1.0900, "stop_loss": 1.0850, "take_profit": 1.1000,
+        "order_type": 2, "placed_at": "2026-01-01T02:00:00+00:00",
     }
 
     events = detect_events(previous, current)
@@ -148,6 +149,8 @@ def test_pending_order_created_detected():
     assert len(events) == 1
     assert events[0]["event_type"] == "pending_order_created"
     assert events[0]["price"] == 1.0900
+    assert events[0]["order_type"] == 2
+    assert events[0]["event_time"] == "2026-01-01T02:00:00+00:00"
 
 
 def test_pending_order_modified_detected():

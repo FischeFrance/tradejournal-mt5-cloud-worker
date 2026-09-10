@@ -267,6 +267,7 @@ class RealMt5Client(Mt5Client):
                     "stop_loss": o.sl,
                     "take_profit": o.tp,
                     "order_type": o.type,
+                    "placed_at": _epoch_to_iso(getattr(o, "time_setup", None)),
                 }
                 for o in orders
             }

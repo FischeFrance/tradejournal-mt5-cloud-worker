@@ -22,7 +22,7 @@ def test_normalize_event_produces_all_contract_fields():
         "event_id", "event_type", "platform", "account_number", "server", "external_trade_id",
         "symbol", "direction", "volume", "price", "open_price", "close_price", "stop_loss",
         "take_profit", "previous_stop_loss", "previous_take_profit", "profit", "commission",
-        "swap", "origin_order_ticket", "open_time", "close_time", "event_time",
+        "swap", "origin_order_ticket", "order_type", "open_time", "close_time", "event_time",
     }
     assert set(payload.keys()) == expected_keys
     assert payload["event_type"] == "trade_opened"

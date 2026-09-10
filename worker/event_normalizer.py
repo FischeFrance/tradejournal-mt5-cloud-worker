@@ -5,8 +5,8 @@ repository principale -- consultato in sola lettura, non modificato).
 Campi del payload, esattamente come richiesti dal contratto API:
 event_id, event_type, platform, account_number, server, external_trade_id, symbol, direction,
 volume, price, open_price, close_price, stop_loss, take_profit, previous_stop_loss,
-previous_take_profit, profit, commission, swap, origin_order_ticket, open_time, close_time,
-event_time.
+previous_take_profit, profit, commission, swap, origin_order_ticket, order_type, open_time,
+close_time, event_time.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ _FINGERPRINT_FIELDS = {
         "open_price",
         "stop_loss",
         "take_profit",
+        "order_type",
         "open_time",
         "origin_order_ticket",
     ),
@@ -52,9 +53,10 @@ _FINGERPRINT_FIELDS = {
         "take_profit",
         "previous_stop_loss",
         "previous_take_profit",
+        "order_type",
     ),
-    "pending_order_cancelled": ("symbol", "direction", "volume", "price"),
-    "pending_order_filled": ("symbol", "direction", "volume", "price"),
+    "pending_order_cancelled": ("symbol", "direction", "volume", "price", "order_type"),
+    "pending_order_filled": ("symbol", "direction", "volume", "price", "order_type"),
     "trade_volume_changed": ("volume", "previous_volume", "partial_close"),
     "deal_recorded": (
         "position_ticket",
@@ -132,6 +134,7 @@ def normalize_event(
         "commission": event.get("commission"),
         "swap": event.get("swap"),
         "origin_order_ticket": event.get("origin_order_ticket"),
+        "order_type": event.get("order_type"),
         "open_time": event.get("open_time"),
         "close_time": event.get("close_time"),
         "event_time": event_time,

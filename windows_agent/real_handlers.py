@@ -85,7 +85,10 @@ from .worker.adapter_errors import (
 )
 from .worker.dedup import PersistentDedup
 from .worker.history_sync import HistoryMode, HistorySync
-from .worker.historical_trade_import import build_historical_trade_events
+from .worker.historical_trade_import import (
+    build_historical_pending_order_events,
+    build_historical_trade_events,
+)
 from .worker.history_file_import import build_history_archive, deliver_history_archive
 from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
@@ -2113,6 +2116,10 @@ def _run_control_plane_history_import(
     try:
         raw_orders = adapter.history_orders(start, now)
         raw_deals = adapter.history_deals(start, now)
+        orders = [
+            value._asdict() if hasattr(value, "_asdict") else dict(value)
+            for value in raw_orders
+        ]
         deals = [
             value._asdict() if hasattr(value, "_asdict") else dict(value)
             for value in raw_deals
@@ -2120,6 +2127,11 @@ def _run_control_plane_history_import(
         events, aggregate_counts = build_historical_trade_events(
             deals, login, server
         )
+        pending_events, pending_counts = build_historical_pending_order_events(
+            orders, login, server
+        )
+        events.extend(pending_events)
+        events.sort(key=lambda event: (str(event["event_time"]), str(event["event_type"])))
     except Exception as exc:
         raise HistorySyncFailed("history snapshot could not be reconstructed") from exc
 
@@ -2148,7 +2160,9 @@ def _run_control_plane_history_import(
                 "orders": len(raw_orders),
                 "deals": len(raw_deals),
                 "positions": aggregate_counts["positions"],
-                "events": aggregate_counts["events"],
+                "events": len(events),
+                "pending_orders": pending_counts["pending_orders"],
+                "pending_events": pending_counts["pending_events"],
             },
         )
     except LeaseLost:
@@ -2162,10 +2176,13 @@ def _run_control_plane_history_import(
         "orders": len(raw_orders),
         "deals": len(raw_deals),
         "positions": aggregate_counts["positions"],
-        "events": aggregate_counts["events"],
+        "events": len(events),
+        "pending_orders": pending_counts["pending_orders"],
+        "pending_events": pending_counts["pending_events"],
         "delivered": int(response["inserted"]),
         "duplicates": int(response["duplicates"]),
         "skipped_deals": aggregate_counts["skipped_deals"],
+        "skipped_orders": pending_counts["skipped_orders"],
     }
 
 

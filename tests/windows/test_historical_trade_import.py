@@ -1,7 +1,10 @@
 import gzip
 import json
 
-from windows_agent.worker.historical_trade_import import build_historical_trade_events
+from windows_agent.worker.historical_trade_import import (
+    build_historical_pending_order_events,
+    build_historical_trade_events,
+)
 from windows_agent.worker.history_file_import import build_history_archive
 from windows_agent.real_handlers import (
     _prime_live_state_after_initial_history,
@@ -69,6 +72,34 @@ def test_skips_non_trade_balance_rows_and_close_without_predecessor():
 
     assert events == []
     assert counts == {"positions": 0, "events": 0, "skipped_deals": 2}
+
+
+def test_history_preserves_only_pending_orders_with_terminal_state():
+    events, counts = build_historical_pending_order_events(
+        [
+            {
+                "ticket": "8001", "symbol": "USDCAD", "type": 3, "state": 4,
+                "volume_initial": 2.79, "price_open": 1.3782, "sl": 1.3787,
+                "tp": 1.3767, "time_setup": "2026-09-09T12:39:00Z",
+                "time_done": "2026-09-09T12:42:00Z",
+            },
+            {
+                "ticket": "9001", "symbol": "USDCAD", "type": 0, "state": 4,
+                "volume_initial": 2.79, "price_open": 1.3782,
+                "time_setup": "2026-09-09T12:58:00Z",
+                "time_done": "2026-09-09T12:58:00Z",
+            },
+        ],
+        "42",
+        "Demo",
+    )
+
+    assert counts == {"pending_orders": 1, "pending_events": 2, "skipped_orders": 1}
+    assert [event["event_type"] for event in events] == [
+        "pending_order_created", "pending_order_filled",
+    ]
+    assert all(event["external_trade_id"] == "8001" for event in events)
+    assert all(event["order_type"] == "3" for event in events)
 
 
 def test_control_plane_import_uploads_one_archive_and_resumes_idempotently(tmp_path):

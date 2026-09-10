@@ -207,6 +207,9 @@ class DirectMt5Adapter:
             "stop_loss": d.get("sl"),
             "take_profit": d.get("tp"),
             "order_type": d.get("type"),
+            "placed_at": datetime.fromtimestamp(
+                d.get("time_setup", d.get("time", 0)), timezone.utc
+            ).isoformat(),
         }
 
     def _deal(self, item: Any) -> dict[str, Any]:

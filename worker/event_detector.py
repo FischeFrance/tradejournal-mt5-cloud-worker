@@ -154,6 +154,8 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
                 "price": order.get("price"),
                 "stop_loss": order.get("stop_loss"),
                 "take_profit": order.get("take_profit"),
+                "order_type": order.get("order_type"),
+                "event_time": order.get("placed_at"),
             })
             continue
 
@@ -173,6 +175,8 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
                 "take_profit": order.get("take_profit"),
                 "previous_stop_loss": prev_order.get("stop_loss"),
                 "previous_take_profit": prev_order.get("take_profit"),
+                "order_type": order.get("order_type"),
+                "event_time": order.get("placed_at"),
             })
 
     for ticket in sorted(prev_orders.keys()):
@@ -195,6 +199,8 @@ def _detect_pending_order_events(previous: Dict[str, Any], current: Dict[str, An
             "price": order.get("price"),
             "stop_loss": order.get("stop_loss"),
             "take_profit": order.get("take_profit"),
+            "order_type": order.get("order_type"),
+            "event_time": order.get("placed_at"),
         })
 
     return events

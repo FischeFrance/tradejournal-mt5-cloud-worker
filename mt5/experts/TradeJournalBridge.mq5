@@ -425,6 +425,7 @@ string BuildOrdersJson()
       double price  = OrderGetDouble(ORDER_PRICE_OPEN);
       double sl     = OrderGetDouble(ORDER_SL);
       double tp     = OrderGetDouble(ORDER_TP);
+      datetime setup_time = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
 
       if(!first)
          json += ",";
@@ -437,7 +438,8 @@ string BuildOrdersJson()
       json += "\"price\":" + JsonNumber(price) + ",";
       json += "\"stop_loss\":" + JsonNumber(sl) + ",";
       json += "\"take_profit\":" + JsonNumber(tp) + ",";
-      json += "\"order_type\":" + IntegerToString(type);
+      json += "\"order_type\":" + IntegerToString(type) + ",";
+      json += "\"placed_at\":" + JsonString(Iso8601FromDatetime(setup_time));
       json += "}";
      }
    json += "]";
@@ -467,10 +469,14 @@ string BuildHistoryOrdersJson()
       json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
       json += "\"symbol\":" + JsonString(HistoryOrderGetString(ticket, ORDER_SYMBOL)) + ",";
       json += "\"volume_current\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_VOLUME_CURRENT)) + ",";
+      json += "\"volume_initial\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_VOLUME_INITIAL)) + ",";
       json += "\"type\":" + IntegerToString(HistoryOrderGetInteger(ticket, ORDER_TYPE)) + ",";
+      json += "\"state\":" + IntegerToString(HistoryOrderGetInteger(ticket, ORDER_STATE)) + ",";
       json += "\"price_open\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_PRICE_OPEN)) + ",";
       json += "\"sl\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_SL)) + ",";
       json += "\"tp\":" + JsonNumber(HistoryOrderGetDouble(ticket, ORDER_TP)) + ",";
+      json += "\"time_setup\":" + JsonString(Iso8601FromDatetime((datetime)HistoryOrderGetInteger(ticket, ORDER_TIME_SETUP))) + ",";
+      json += "\"time_done\":" + JsonString(Iso8601FromDatetime((datetime)HistoryOrderGetInteger(ticket, ORDER_TIME_DONE))) + ",";
       json += "\"time\":" + JsonString(Iso8601FromDatetime((datetime)HistoryOrderGetInteger(ticket, ORDER_TIME_DONE)));
       json += "}";
      }
@@ -555,7 +561,8 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
                        const double stop_loss, const double take_profit, const double profit,
                        const double commission, const double swap, const long magic,
                        const string comment, const string entry, const datetime event_time,
-                       long timestamp_msc)
+                       long timestamp_msc, const long order_type = -1,
+                       const long order_state = -1)
   {
    g_event_seq++; // sequenza monotona del file/envelope locale, persistita in cursor.json
    if(timestamp_msc <= 0)
@@ -605,6 +612,8 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
    json += "\"magic\":" + IntegerToString(magic) + ",";
    json += "\"comment\":" + JsonString(comment) + ",";
    json += "\"entry\":" + (entry == "" ? "null" : JsonString(entry)) + ",";
+   json += "\"order_type\":" + (order_type >= 0 ? IntegerToString(order_type) : "null") + ",";
+   json += "\"order_state\":" + (order_state >= 0 ? IntegerToString(order_state) : "null") + ",";
    json += "\"time\":" + JsonString(Iso8601FromDatetime(event_time));
    json += "}";
    return json;
@@ -691,9 +700,13 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
    else
       return; // ticket non (piu') selezionabile ne' tra gli attivi ne' nello storico: evento ignorato
 
+   if(!IsPendingOrderType(type))
+      return; // ORDER_ADD/UPDATE viene emesso anche per BUY/SELL a mercato
+
    string line = BuildEventJson(event_type, (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
-                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
+                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc,
+                                 type);
    WriteEventAtomic(line);
   }
 
@@ -729,8 +742,9 @@ bool EmitHistoryOrderEvent(const ulong order_ticket)
    string event_kind = "";
    if(state == ORDER_STATE_FILLED && IsPendingOrderType(type))
       event_kind = "HISTORY_FILLED";
-   else if(state == ORDER_STATE_CANCELED || state == ORDER_STATE_EXPIRED ||
-           state == ORDER_STATE_REJECTED)
+   else if(IsPendingOrderType(type) &&
+           (state == ORDER_STATE_CANCELED || state == ORDER_STATE_EXPIRED ||
+            state == ORDER_STATE_REJECTED))
       event_kind = "HISTORY_ADD";
    else
       return true; // un'esecuzione parziale resta un ordine attivo fino al suo stato terminale
@@ -747,7 +761,8 @@ bool EmitHistoryOrderEvent(const ulong order_ticket)
 
    string line = BuildEventJson(event_kind, (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
-                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
+                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc,
+                                 type, state);
    return WriteEventAtomic(line);
   }
 

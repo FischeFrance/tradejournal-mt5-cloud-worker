@@ -81,6 +81,7 @@ def test_order_delete_is_ignored_and_history_add_is_canonical_cancel():
             "ORDER_DELETE|8001|1787866200000|EURUSD"
         ),
         "event_type": "ORDER_DELETE",
+        "order_type": 2,
         "ticket": "8001",
         "order_id": "8001",
         "symbol": "EURUSD",
@@ -115,6 +116,7 @@ def test_pending_fill_source_event_uses_the_broker_order_ticket():
             "HISTORY_FILLED|8001|1787866200000|EURUSD"
         ),
         "event_type": "HISTORY_FILLED",
+        "order_type": 2,
         "ticket": "8001",
         "order_id": "8001",
         "symbol": "EURUSD",
@@ -175,6 +177,7 @@ def test_stream_fill_suppresses_a_stale_snapshot_cancellation_and_keeps_ids_dist
         {
             "event_id": f"{source_prefix}|HISTORY_FILLED|8001|1787866200001|EURUSD",
             "event_type": "HISTORY_FILLED",
+            "order_type": 2,
             "ticket": "8001",
             "order_id": "8001",
             "symbol": "EURUSD",
@@ -198,6 +201,43 @@ def test_stream_fill_suppresses_a_stale_snapshot_cancellation_and_keeps_ids_dist
         normalize_event(event, "42", "Demo")["event_id"]
         for event in _merge_event_stream_with_snapshot(records, previous, current)
     ]
+
+
+def test_market_orders_never_enter_pending_order_projection():
+    empty = {"positions": {}, "orders": {}, "deals": {}}
+    market = {
+        "event_type": "ORDER_ADD", "ticket": "9001", "order_id": "9001",
+        "order_type": 0, "symbol": "USDCAD", "direction": "buy", "volume": 2.79,
+        "price": 1.3782, "time": "2026-09-09T12:58:34Z",
+    }
+    pending = {
+        **market, "ticket": "8001", "order_id": "8001", "order_type": 3,
+        "direction": "sell",
+    }
+
+    assert _mql5_file_event(market, empty, empty) is None
+    created = _mql5_file_event(pending, empty, empty)
+    assert created is not None
+    assert created["event_type"] == "pending_order_created"
+    assert created["order_type"] == 3
+
+
+def test_unchanged_active_pending_order_is_reasserted_with_placement_time():
+    order = {
+        "ticket": "8001", "symbol": "EURUSD", "direction": "buy", "volume": 0.1,
+        "price": 1.1, "stop_loss": 1.09, "take_profit": 1.12, "order_type": 2,
+        "placed_at": "2026-08-27T21:00:00Z",
+    }
+    snapshot = {"positions": {}, "orders": {"8001": order}, "deals": {}}
+
+    events = _merge_event_stream_with_snapshot((), snapshot, snapshot)
+
+    assert events == [{
+        "event_type": "pending_order_modified", "ticket": "8001", "symbol": "EURUSD",
+        "direction": "buy", "volume": 0.1, "price": 1.1, "stop_loss": 1.09,
+        "take_profit": 1.12, "order_type": 2,
+        "event_time": "2026-08-27T21:00:00Z",
+    }]
 
 
 def test_full_close_wins_over_stale_position_snapshot_and_keeps_economics():
