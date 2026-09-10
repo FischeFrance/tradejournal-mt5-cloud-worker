@@ -44,6 +44,27 @@ def test_normalize_event_accepts_missing_account_number():
     assert payload["event_id"].startswith("mt5-unknown-")
 
 
+def test_normalize_event_attaches_account_snapshot_without_changing_event_id():
+    snapshot = {
+        "balance": 9768.56,
+        "equity": 9768.56,
+        "currency": "USD",
+        "leverage": 100,
+    }
+    without_snapshot = normalize_event(
+        RAW_TRADE_OPENED, account_number="12345", server="Demo-Server"
+    )
+    with_snapshot = normalize_event(
+        RAW_TRADE_OPENED,
+        account_number="12345",
+        server="Demo-Server",
+        account_snapshot=snapshot,
+    )
+
+    assert with_snapshot["event_id"] == without_snapshot["event_id"]
+    assert {key: with_snapshot[key] for key in snapshot} == snapshot
+
+
 def test_normalize_event_fills_event_time_when_missing():
     raw = {**RAW_TRADE_OPENED}
     del raw["event_time"]

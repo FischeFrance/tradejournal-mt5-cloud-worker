@@ -6,7 +6,8 @@ Campi del payload, esattamente come richiesti dal contratto API:
 event_id, event_type, platform, account_number, server, external_trade_id, symbol, direction,
 volume, price, open_price, close_price, stop_loss, take_profit, previous_stop_loss,
 previous_take_profit, profit, commission, swap, origin_order_ticket, order_type, open_time,
-close_time, event_time.
+close_time, event_time. Gli eventi live possono inoltre includere lo snapshot account validato
+(balance, equity, currency, leverage), senza usarlo nel fingerprint idempotente dell'evento.
 """
 
 from __future__ import annotations
@@ -108,6 +109,7 @@ def normalize_event(
     account_number: Optional[str],
     server: Optional[str],
     platform: str = "mt5",
+    account_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Converte un evento grezzo rilevato da event_detector nel payload dell'ingestion API."""
     event_time = raw_event.get("event_time") or _now_iso()
@@ -139,4 +141,13 @@ def normalize_event(
         "close_time": event.get("close_time"),
         "event_time": event_time,
     }
+    if account_snapshot is not None:
+        payload.update(
+            {
+                "balance": account_snapshot["balance"],
+                "equity": account_snapshot["equity"],
+                "currency": account_snapshot["currency"],
+                "leverage": account_snapshot.get("leverage"),
+            }
+        )
     return payload

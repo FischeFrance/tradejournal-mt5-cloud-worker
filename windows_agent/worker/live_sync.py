@@ -416,9 +416,20 @@ class LiveSync:
             if records
             else detect_windows_events(previous, current)
         )
+        account_snapshot_reader = getattr(self.adapter, "account_snapshot", None)
+        account_snapshot = (
+            account_snapshot_reader()
+            if events and callable(account_snapshot_reader)
+            else None
+        )
         payloads = []
         for event in events:
-            payload = normalize_event(event, account["login"], account["server"])
+            payload = normalize_event(
+                event,
+                account["login"],
+                account["server"],
+                account_snapshot=account_snapshot,
+            )
             if not self.dedup.contains(payload["event_id"]):
                 payloads.append(payload)
         # Persist the complete causal batch before advancing the snapshot. A crash after either

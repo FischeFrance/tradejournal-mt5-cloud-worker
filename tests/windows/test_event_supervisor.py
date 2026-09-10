@@ -84,6 +84,10 @@ def test_event_marker_wakes_one_snapshot_diff_and_status_is_sent_only_on_change(
     supervisor._process(connection_id)
     assert len(sink.events) == 1
     assert sink.events[0]["event_type"] == "trade_opened"
+    assert sink.events[0]["balance"] == 1000
+    assert sink.events[0]["equity"] == 1001
+    assert sink.events[0]["currency"] == "EUR"
+    assert sink.events[0]["leverage"] == 100
     assert not marker.exists()
     assert len(sink.transitions) == 1
 
