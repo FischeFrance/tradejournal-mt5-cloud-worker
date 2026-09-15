@@ -37,7 +37,10 @@ _FINGERPRINT_FIELDS = {
         "previous_stop_loss",
         "previous_take_profit",
     ),
-    "trade_closed": ("close_price", "profit", "commission", "swap", "close_time"),
+    "trade_closed": (
+        "close_price", "profit", "commission", "swap", "close_time",
+        "mae_points", "mfe_points", "excursion_samples",
+    ),
     "pending_order_created": (
         "symbol",
         "direction",
@@ -123,6 +126,13 @@ def normalize_event(
         "close_time": event.get("close_time"),
         "event_time": event_time,
     }
+    for field in (
+        "mae_price_delta", "mfe_price_delta", "mae_points", "mfe_points",
+        "mae_money", "mfe_money", "mae_pct", "mfe_pct", "mae_at", "mfe_at",
+        "excursion_samples", "excursion_sample_ms", "excursion_source",
+    ):
+        if event.get(field) is not None:
+            payload[field] = event[field]
     account_snapshot = {
         "balance": event.get("balance"),
         "equity": event.get("equity"),

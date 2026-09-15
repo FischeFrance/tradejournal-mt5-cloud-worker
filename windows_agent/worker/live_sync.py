@@ -10,6 +10,7 @@ from worker.event_normalizer import normalize_event
 from worker.event_sender import SendResult
 
 from .dedup import PersistentDedup
+from .excursion_tracker import PositionExcursionTracker
 
 
 class LiveSyncDeliveryError(RuntimeError):
@@ -224,6 +225,7 @@ class LiveSync:
         sink: Callable[[dict], None],
         poll_seconds: float = 2.0,
         outbox: EventOutbox | None = None,
+        excursion_store: Any | None = None,
     ) -> None:
         self.adapter, self.snapshot_store, self.dedup, self.sink = (
             adapter,
@@ -233,6 +235,10 @@ class LiveSync:
         )
         self.poll_seconds, self.stop_requested = poll_seconds, False
         self.outbox = outbox or EventOutbox()
+        self.excursions = PositionExcursionTracker(
+            excursion_store,
+            sample_ms=max(250, int(poll_seconds * 1_000)),
+        )
 
     def _drain_outbox(self) -> int:
         result = self.outbox.drain(_CallableSender(self.sink))
@@ -259,6 +265,11 @@ class LiveSync:
             if records
             else detect_windows_events(previous, current)
         )
+        # MAE/MFE stays local for the whole lifetime of the position.  Only the final extrema are
+        # attached to the already-existing close event, so this adds zero Supabase calls per poll.
+        self.excursions.observe_open_events(events)
+        self.excursions.observe_snapshot(current)
+        closed_excursions = self.excursions.enrich_close_events(events)
         payloads = []
         for event in events:
             payload = normalize_event(event, account["login"], account["server"])
@@ -273,6 +284,9 @@ class LiveSync:
                 raise LiveSyncDeliveryError("event stream cannot be acknowledged")
             acknowledge(max(int(record["sequence"]) for record in records))
         self.snapshot_store.save(current)
+        # At this point the enriched close payload is durable in the outbox.  Removing the local
+        # accumulator cannot lose the event even if delivery fails immediately afterwards.
+        self.excursions.discard(closed_excursions)
         delivered += self._drain_outbox()
         for payload in payloads:
             self.dedup.add(payload["event_id"])

@@ -382,12 +382,19 @@ string BuildPositionsJson()
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0)
          continue;
+      long   position_id  = PositionGetInteger(POSITION_IDENTIFIER);
       string symbol       = PositionGetString(POSITION_SYMBOL);
       long   type         = PositionGetInteger(POSITION_TYPE);
       double volume       = PositionGetDouble(POSITION_VOLUME);
       double open_price   = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl           = PositionGetDouble(POSITION_SL);
       double tp           = PositionGetDouble(POSITION_TP);
+      double current_price = type == POSITION_TYPE_BUY
+                             ? SymbolInfoDouble(symbol, SYMBOL_BID)
+                             : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      double floating_profit = PositionGetDouble(POSITION_PROFIT);
+      double point         = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      long   digits        = SymbolInfoInteger(symbol, SYMBOL_DIGITS);
       datetime open_time  = (datetime)PositionGetInteger(POSITION_TIME);
 
       if(!first)
@@ -395,12 +402,17 @@ string BuildPositionsJson()
       first = false;
       json += "{";
       json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
+      json += "\"position_id\":" + JsonString(IntegerToString(position_id)) + ",";
       json += "\"symbol\":" + JsonString(symbol) + ",";
       json += "\"direction\":" + JsonString(DirectionFromType(type)) + ",";
       json += "\"volume\":" + JsonNumber(volume) + ",";
       json += "\"open_price\":" + JsonNumber(open_price) + ",";
       json += "\"stop_loss\":" + JsonNumber(sl) + ",";
       json += "\"take_profit\":" + JsonNumber(tp) + ",";
+      json += "\"current_price\":" + JsonNumber(current_price) + ",";
+      json += "\"floating_profit\":" + JsonNumber(floating_profit) + ",";
+      json += "\"point\":" + JsonNumber(point) + ",";
+      json += "\"digits\":" + IntegerToString(digits) + ",";
       json += "\"open_time\":" + JsonString(Iso8601FromDatetime(open_time));
       json += "}";
      }

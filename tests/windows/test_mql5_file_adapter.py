@@ -78,6 +78,23 @@ def test_reads_versioned_snapshots_and_preserves_sync_interface(tmp_path: Path) 
     assert len(adapter.history_deals(datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc))) == 1
 
 
+def test_snapshot_keys_positions_by_stable_identifier_with_ticket_fallback(tmp_path: Path) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(
+        adapter.files_dir,
+        "positions.json",
+        [
+            {"ticket": "mutable-1", "position_id": "stable-1", "symbol": "EURUSD"},
+            {"ticket": "legacy-2", "symbol": "GBPUSD"},
+        ],
+    )
+
+    snapshot = adapter.snapshot()
+
+    assert set(snapshot["positions"]) == {"stable-1", "legacy-2"}
+    assert snapshot["positions"]["stable-1"]["ticket"] == "mutable-1"
+
+
 def test_rejects_snapshot_composed_from_different_publish_sequences(tmp_path: Path) -> None:
     adapter = _ready_adapter(tmp_path)
     _write(

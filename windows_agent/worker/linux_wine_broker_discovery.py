@@ -227,7 +227,7 @@ class LinuxWineBrokerDiscoveryLauncher:
         exchange_root: Path,
         source_environment: Mapping[str, str] | None = None,
         popen_factory: Callable[..., Any] = subprocess.Popen,
-        kill_process_group: Callable[[int, int], None] = os.killpg,
+        kill_process_group: Callable[[int, int], None] | None = None,
     ) -> None:
         self._runtime = self._validate_runtime(
             wine_binary=wine_binary,
@@ -254,7 +254,10 @@ class LinuxWineBrokerDiscoveryLauncher:
             except OSError:
                 raise LinuxWineDiscoveryError("runtime_unavailable") from None
         self._popen = popen_factory
-        self._kill_process_group = kill_process_group
+        platform_killpg = getattr(os, "killpg", None)
+        if kill_process_group is None and not callable(platform_killpg):
+            raise LinuxWineDiscoveryError("runtime_unavailable")
+        self._kill_process_group = kill_process_group or platform_killpg
 
     @staticmethod
     def _validate_runtime(

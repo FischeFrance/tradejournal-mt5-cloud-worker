@@ -215,6 +215,24 @@ class Mql5FileMt5Adapter:
             },
         )
 
+    @staticmethod
+    def _positions_by_stable_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Key positions like MT5 deal history does, with backwards-compatible fallback.
+
+        ``DEAL_POSITION_ID`` refers to ``POSITION_IDENTIFIER``.  A position ticket may change
+        after broker-side service operations, while the identifier remains stable for the
+        lifetime of the logical trade.  Older EA builds do not publish ``position_id``, so they
+        continue to work through the ticket fallback during a controlled rollout.
+        """
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("position_id") or row.get("ticket")
+            if key is not None:
+                result[str(key)] = row
+        return result
+
     def snapshot(self, lookback_hours: int = 72) -> dict[str, dict[str, Any]]:
         del lookback_hours  # freshness is enforced from the producer's generated_at field.
         for attempt in range(_SNAPSHOT_CONSISTENCY_ATTEMPTS):
@@ -240,7 +258,7 @@ class Mql5FileMt5Adapter:
                 mapped_deals = self._dedupe(deals, "ticket")
                 self._save_checkpoint(int(deals_envelope["sequence"]), list(mapped_deals))
                 return {
-                    "positions": self._dedupe(positions, "ticket"),
+                    "positions": self._positions_by_stable_id(positions),
                     "orders": self._dedupe(orders, "ticket"),
                     "deals": mapped_deals,
                 }

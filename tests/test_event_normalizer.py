@@ -85,6 +85,35 @@ def test_normalize_event_fills_event_time_when_missing():
     assert payload["event_time"]
 
 
+def test_normalize_close_forwards_final_excursion_summary_without_samples():
+    payload = normalize_event(
+        {
+            "event_type": "trade_closed",
+            "ticket": "1",
+            "close_price": 1.105,
+            "profit": 50,
+            "close_time": "2026-09-16T12:00:00Z",
+            "mae_points": 35,
+            "mfe_points": 80,
+            "mae_pct": 0.25,
+            "mfe_pct": 0.75,
+            "excursion_samples": 42,
+            "excursion_sample_ms": 2000,
+            "excursion_source": "mt5_snapshot",
+        },
+        account_number="12345",
+        server="Demo-Server",
+    )
+
+    assert payload["mae_points"] == 35
+    assert payload["mfe_points"] == 80
+    assert payload["mae_pct"] == 0.25
+    assert payload["mfe_pct"] == 0.75
+    assert payload["excursion_samples"] == 42
+    assert payload["excursion_sample_ms"] == 2000
+    assert payload["excursion_source"] == "mt5_snapshot"
+
+
 def test_event_id_is_deterministic_for_identical_events():
     id_1 = build_event_id("12345", RAW_TRADE_OPENED)
     id_2 = build_event_id("12345", RAW_TRADE_OPENED)

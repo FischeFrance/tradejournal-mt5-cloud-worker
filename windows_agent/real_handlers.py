@@ -2055,6 +2055,7 @@ def _run_live_sync_once(adapter: Any, root: Path, sink: Callable[[dict], None] |
             dedup,
             sink or LocalEventSink(root / "data" / "live.jsonl"),
             outbox=EventOutbox(str(root / "state" / "live-outbox.json")),
+            excursion_store=PersistentSnapshot(root / "state" / "position-excursions.json"),
         )
         return live.poll_once()
     finally:
