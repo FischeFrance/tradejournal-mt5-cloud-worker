@@ -63,6 +63,7 @@ from .mtapi_search import (
     MtApiSearchResult,
 )
 from .credential_envelope import decrypt_credential_envelope
+from .event_supervisor import connection_sync_lock
 from .job_runner import LeaseLost
 from .provisioning.instance_layout import InstanceLayout
 from .provisioning.mt5_instance import InstanceProvisioner
@@ -2074,21 +2075,22 @@ def _authenticate_and_sync(
 
 
 def _run_live_sync_once(adapter: Any, root: Path, sink: Callable[[dict], None] | None = None) -> int:
-    """A single poll_once(). Historically this ran exactly once per connection, glued to the tail
-    of provision()/historical_sync() (this architecture runs one job at a time, see
-    docs/windows/architecture.md) -- ongoing monitoring is now driven by the recurring live_sync
-    job (see build_real_handlers.live_sync), which passes its own HTTP-forwarding sink instead of
-    the local-only default used here for the one-shot provisioning-time check."""
-    dedup = PersistentDedup(root / "state" / "live-dedup.sqlite")
-    try:
-        live = LiveSync(
-            adapter,
-            PersistentSnapshot(root / "state" / "live_snapshot.json"),
-            dedup,
-            sink or LocalEventSink(root / "data" / "live.jsonl"),
-            outbox=EventOutbox(str(root / "state" / "live-outbox.json")),
-            excursion_store=PersistentSnapshot(root / "state" / "position-excursions.json"),
-        )
-        return live.poll_once()
-    finally:
-        dedup.close()
+    """Run one serialized local file-bridge cycle.
+
+    Provisioning/history can invoke this while the background event supervisor is active. The
+    shared per-connection lock keeps snapshot, checkpoint, dedup and outbox updates atomic.
+    """
+    with connection_sync_lock(root.name):
+        dedup = PersistentDedup(root / "state" / "live-dedup.sqlite")
+        try:
+            live = LiveSync(
+                adapter,
+                PersistentSnapshot(root / "state" / "live_snapshot.json"),
+                dedup,
+                sink or LocalEventSink(root / "data" / "live.jsonl"),
+                outbox=EventOutbox(str(root / "state" / "live-outbox.json")),
+                excursion_store=PersistentSnapshot(root / "state" / "position-excursions.json"),
+            )
+            return live.poll_once()
+        finally:
+            dedup.close()

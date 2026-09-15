@@ -18,6 +18,7 @@ from .broker_identity import (
 from .broker_wizard import HiddenSessionBrokerWizard
 from .mtapi_search import MtApiSearchClient
 from .job_runner import JobRunner
+from .event_supervisor import Mt5EventSupervisor
 from .provisioning.mt5_instance_pool import Mt5InstancePool
 from .real_handlers import build_real_handlers, reconcile_startup_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
@@ -150,6 +151,13 @@ def build_runner(
         mtapi_search=mtapi_search,
         instance_pool=instance_pool,
     )
+    if handlers is None:
+        event_supervisor = Mt5EventSupervisor(
+            config.instances_root,
+            config.secrets_root,
+            config.trading_ingestion_url,
+        )
+        background_workers = (*background_workers, event_supervisor.run)
     return JobRunner(
         state_path,
         api,
