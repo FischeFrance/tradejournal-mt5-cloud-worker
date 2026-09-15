@@ -227,6 +227,80 @@ class InstanceProvisioner:
             raise ValueError("published managed runtime assets mismatch")
         return actual
 
+    def rotate_managed_expert(
+        self,
+        connection_id: str,
+        expert_binary: Path,
+        expected_sha256: str,
+    ) -> str:
+        """Replace a stopped instance's bridge and atomically reseal its manifests.
+
+        The caller owns process lifecycle and must stop the terminal first.  We accept a
+        rotation only from a currently valid, sealed instance and a digest-pinned source.  A
+        local rollback copy keeps the previous executable and state recoverable if any step
+        before the final reseal fails.
+        """
+        root = self.validate(connection_id, verify_code=False)
+        self.validate_runtime_assets(connection_id)
+        source = Path(expert_binary)
+        expected = str(expected_sha256).strip().lower()
+        if (
+            self._is_reparse_point(source)
+            or not source.is_file()
+            or source.suffix.casefold() != ".ex5"
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+            or self._sha256(source) != expected
+        ):
+            raise ValueError("managed expert source invalid")
+
+        target = root / "terminal" / _MANAGED_RUNTIME_ASSETS[0]
+        if self._is_reparse_point(target) or not target.is_file():
+            raise ValueError("published managed expert invalid")
+        if self._sha256(target) == expected:
+            return self.validate_runtime_assets(connection_id)
+
+        state_path = root / "state" / "instance.json"
+        previous_state = read_json(state_path, {})
+        if not isinstance(previous_state, dict):
+            raise ValueError("published instance state invalid")
+        temporary = target.with_name(f"{target.name}.upgrade")
+        rollback = target.with_name(f"{target.name}.rollback")
+        if temporary.exists() or rollback.exists():
+            raise ValueError("managed expert rotation already pending")
+
+        def durable_copy(source_path: Path, destination_path: Path) -> None:
+            shutil.copy2(source_path, destination_path)
+            with destination_path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+
+        durable_copy(target, rollback)
+        try:
+            durable_copy(source, temporary)
+            if self._sha256(temporary) != expected:
+                raise ValueError("managed expert copy integrity failed")
+            durable_replace(temporary, target)
+            state = dict(previous_state)
+            state["template_code_manifest_sha256"] = self._code_manifest(
+                root / "terminal"
+            )
+            state["runtime_assets_manifest_sha256"] = (
+                self._managed_runtime_assets_manifest(root / "terminal")
+            )
+            state["runtime_assets_manifest_version"] = 1
+            atomic_json(state_path, state)
+            sealed = self.validate_runtime_assets(connection_id)
+        except Exception:
+            if rollback.is_file():
+                durable_replace(rollback, target)
+            atomic_json(state_path, previous_state)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+        rollback.unlink(missing_ok=True)
+        fsync_directory(target.parent)
+        return sealed
+
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()

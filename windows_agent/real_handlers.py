@@ -1449,6 +1449,7 @@ def build_real_handlers(
         terminal = root / "terminal" / "terminal64.exe"
         state_path = root / "state" / "terminal-process.json"
         _verify_binary_pin(terminal, recorded_terminal_sha256)
+        _verify_binary_pin(expert_binary, expert_sha256)
         terminal_is_running = terminal.is_file() and ProcessManager.find(terminal)
         provisioner = InstanceProvisioner(instances_root, secrets_root)
         try:
@@ -1468,6 +1469,38 @@ def build_real_handlers(
                 raise InstanceProvisionFailed(
                     "legacy runtime asset migration failed"
                 ) from seal_exc
+        instance_expert = (
+            root
+            / "terminal"
+            / "MQL5"
+            / "Experts"
+            / "TradeJournal"
+            / "TradeJournalBridge.ex5"
+        )
+        if expert_sha256 is not None:
+            try:
+                current_expert_sha256 = provisioner._sha256(instance_expert)
+            except OSError as exc:
+                raise InstanceProvisionFailed(
+                    "provisioned managed expert unavailable"
+                ) from exc
+            if current_expert_sha256 != expert_sha256:
+                try:
+                    process = process_factory(state_path)
+                    if terminal_is_running:
+                        process.stop()
+                        if not process.cleanup_path(terminal):
+                            raise RuntimeError("instance process survived expert rotation")
+                    provisioner.rotate_managed_expert(
+                        cid,
+                        expert_binary,
+                        expert_sha256,
+                    )
+                    terminal_is_running = False
+                except Exception as exc:
+                    raise InstanceProvisionFailed(
+                        "managed expert rotation failed"
+                    ) from exc
         if not terminal_is_running:
             try:
                 provisioner.validate(
@@ -1478,7 +1511,6 @@ def build_real_handlers(
                 raise InstanceProvisionFailed(
                     "provisioned instance code integrity validation failed"
                 ) from exc
-            _verify_binary_pin(expert_binary, expert_sha256)
             try:
                 runtime = runtime_factory(root, cid)
                 set_cancel_check = getattr(runtime, "set_cancel_check", None)

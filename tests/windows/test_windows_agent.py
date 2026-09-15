@@ -230,6 +230,35 @@ def test_instance_provision_pins_and_records_terminal_digest(tmp_path):
         )
 
 
+def test_instance_rotates_managed_expert_and_reseals_manifests(tmp_path):
+    source = tmp_path / "template"
+    bridge = source / "MQL5" / "Experts" / "TradeJournal" / "TradeJournalBridge.ex5"
+    discovery = source / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalDiscovery.ex5"
+    loader = source / "MQL5" / "Scripts" / "TradeJournal" / "TradeJournalLoader.ex5"
+    for path, value in ((bridge, b"bridge-v1"), (discovery, b"discovery"), (loader, b"loader")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(tmp_path / "instances", tmp_path / "secrets")
+    root = provisioner.provision(connection_id, terminal)
+    provisioner.seal_runtime_assets(connection_id)
+    replacement = tmp_path / "TradeJournalBridge.ex5"
+    replacement.write_bytes(b"bridge-v2")
+    expected = hashlib.sha256(b"bridge-v2").hexdigest()
+
+    sealed = provisioner.rotate_managed_expert(connection_id, replacement, expected)
+
+    assert (root / "terminal" / bridge.relative_to(source)).read_bytes() == b"bridge-v2"
+    assert provisioner.validate_runtime_assets(connection_id) == sealed
+    assert provisioner.validate(connection_id) == root
+    state = read_json(root / "state" / "instance.json")
+    assert state["runtime_assets_manifest_sha256"] == sealed
+    assert not list(root.rglob("*.upgrade"))
+    assert not list(root.rglob("*.rollback"))
+
+
 def test_instance_removes_only_known_mt5_generated_example_code(tmp_path):
     source = tmp_path / "template"
     source.mkdir()
