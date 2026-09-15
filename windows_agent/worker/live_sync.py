@@ -41,6 +41,10 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
         "direction": record.get("direction"),
         "volume": record.get("volume"),
         "event_time": record.get("time"),
+        "balance": record.get("balance"),
+        "equity": record.get("equity"),
+        "currency": record.get("currency"),
+        "leverage": record.get("leverage"),
     }
     if event_type == "DEAL_ADD":
         entry = str(record.get("entry", "")).upper()
@@ -58,6 +62,7 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                 "event_type": "trade_opened",
                 "open_price": record.get("price"),
                 "open_time": record.get("time"),
+                "balance_before_open": record.get("balance_before_open"),
             }
         if entry in ("OUT", "OUT_BY"):
             if current_position is not None:

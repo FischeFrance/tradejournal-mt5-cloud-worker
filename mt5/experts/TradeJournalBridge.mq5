@@ -566,6 +566,11 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
 
    long   login  = AccountInfoInteger(ACCOUNT_LOGIN);
    string server = AccountInfoString(ACCOUNT_SERVER);
+   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double account_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   string account_currency = AccountInfoString(ACCOUNT_CURRENCY);
+   long   account_leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   double balance_before_open = account_balance - profit - commission - swap;
 
    // Composito e deterministico: connection_id + login + server + tipo + ticket + timestamp_msc.
    // Due connessioni/account diversi non possono mai produrre lo stesso event_id anche con
@@ -596,6 +601,14 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
    json += "\"profit\":" + JsonNumber(profit) + ",";
    json += "\"commission\":" + JsonNumber(commission) + ",";
    json += "\"swap\":" + JsonNumber(swap) + ",";
+   json += "\"balance\":" + JsonNumber(account_balance) + ",";
+   json += "\"equity\":" + JsonNumber(account_equity) + ",";
+   json += "\"currency\":" + JsonString(account_currency) + ",";
+   json += "\"leverage\":" + IntegerToString(account_leverage) + ",";
+   json += "\"balance_before_open\":" +
+           (event_type == "DEAL_ADD" && entry == "IN" && balance_before_open > 0.0
+              ? JsonNumber(balance_before_open)
+              : "null") + ",";
    json += "\"magic\":" + IntegerToString(magic) + ",";
    json += "\"comment\":" + JsonString(comment) + ",";
    json += "\"entry\":" + (entry == "" ? "null" : JsonString(entry)) + ",";

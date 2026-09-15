@@ -6,6 +6,8 @@ Campi del payload, esattamente come richiesti dal contratto API:
 event_id, event_type, platform, account_number, server, external_trade_id, symbol, direction,
 volume, price, open_price, close_price, stop_loss, take_profit, previous_stop_loss,
 previous_take_profit, profit, commission, swap, open_time, close_time, event_time.
+When supplied by the native MT5 bridge, the sanitized account snapshot and the balance captured
+immediately before opening are forwarded as optional fields.
 """
 
 from __future__ import annotations
@@ -121,4 +123,14 @@ def normalize_event(
         "close_time": event.get("close_time"),
         "event_time": event_time,
     }
+    account_snapshot = {
+        "balance": event.get("balance"),
+        "equity": event.get("equity"),
+        "currency": event.get("currency"),
+        "leverage": event.get("leverage"),
+    }
+    if all(value is not None for value in account_snapshot.values()):
+        payload.update(account_snapshot)
+    if event.get("balance_before_open") is not None:
+        payload["balance_before_open"] = event["balance_before_open"]
     return payload

@@ -42,6 +42,40 @@ def test_normalize_event_accepts_missing_account_number():
     assert payload["event_id"].startswith("mt5-unknown-")
 
 
+def test_normalize_event_forwards_complete_account_reference_for_new_trade():
+    payload = normalize_event(
+        {
+            **RAW_TRADE_OPENED,
+            "balance": 9_999.25,
+            "equity": 10_001.5,
+            "currency": "EUR",
+            "leverage": 100,
+            "balance_before_open": 10_000.0,
+        },
+        account_number="12345",
+        server="Demo-Server",
+    )
+
+    assert payload["balance"] == 9_999.25
+    assert payload["equity"] == 10_001.5
+    assert payload["currency"] == "EUR"
+    assert payload["leverage"] == 100
+    assert payload["balance_before_open"] == 10_000.0
+
+
+def test_normalize_event_does_not_emit_a_partial_account_snapshot():
+    payload = normalize_event(
+        {**RAW_TRADE_OPENED, "balance": 10_000.0},
+        account_number="12345",
+        server="Demo-Server",
+    )
+
+    assert "balance" not in payload
+    assert "equity" not in payload
+    assert "currency" not in payload
+    assert "leverage" not in payload
+
+
 def test_normalize_event_fills_event_time_when_missing():
     raw = {**RAW_TRADE_OPENED}
     del raw["event_time"]
