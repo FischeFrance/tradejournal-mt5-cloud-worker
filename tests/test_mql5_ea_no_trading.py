@@ -127,6 +127,20 @@ def test_live_deal_cache_races_are_retried_from_the_timer():
     assert "RetryPendingDealEvents();" in text
     assert "EmitDealAddEvent(deal_ticket)" in text
     assert "g_pending_deal_tickets[i] == deal_ticket" in text
+
+
+def test_history_deal_snapshots_include_execution_semantics():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    builder = text[text.index("string BuildDealsJson"):text.index("string BuildCandlesJson")]
+
+    assert "DEAL_ENTRY" in builder
+    assert '"\\\"entry\\\":"' in builder
+    assert "DEAL_TYPE" in builder
+    assert '"\\\"direction\\\":"' in builder
+
+
 def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     text = (MT5_EXPERTS_DIR / "TradeJournalLoader.mq5").read_text(encoding="utf-8")
     assert "int OnInit()" in text

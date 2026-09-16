@@ -517,6 +517,10 @@ string BuildDealsJson()
       json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
       json += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
       json += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
+      long deal_type = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      long entry_raw = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      json += "\"direction\":" + JsonString(deal_type == DEAL_TYPE_SELL ? "sell" : "buy") + ",";
+      json += "\"entry\":" + JsonString(EntryToString(entry_raw)) + ",";
       json += "\"volume\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_VOLUME)) + ",";
       json += "\"price\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PRICE)) + ",";
       json += "\"profit\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PROFIT)) + ",";
