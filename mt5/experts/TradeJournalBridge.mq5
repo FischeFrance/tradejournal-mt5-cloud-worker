@@ -46,6 +46,14 @@ bool   g_new_only      = false;
 ulong  g_new_only_started_ms = 0;
 const ulong NEW_ONLY_STARTUP_GRACE_MS = 5000;
 
+// OnTradeTransaction puo' arrivare qualche millisecondo prima che il deal sia leggibile tramite
+// HistoryDealSelect. Conserviamo i ticket non ancora pubblicabili e li riproviamo dal timer: il
+// ticket e' deduplicato in memoria e l'event_id resta deterministico, quindi anche un errore di
+// scrittura successivo alla costruzione del payload non puo' creare duplicati remoti.
+const int MAX_PENDING_DEAL_EVENTS = 256;
+ulong g_pending_deal_tickets[];
+int   g_pending_deal_attempts[];
+
 //--- Le 6 timeframe pubblicate in file separati candles/<symbol>-<timeframe>.json.
 string           TIMEFRAME_NAMES[6]  = {"M1", "M5", "M15", "H1", "H4", "D1"};
 ENUM_TIMEFRAMES  TIMEFRAME_VALUES[6] = {PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4, PERIOD_D1};
@@ -637,11 +645,10 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
 //| tra i tipi di evento, ogni emettitore rilegge lo stato corrente dal    |
 //| ticket ricevuto invece di fidarsi di uno stato accumulato in memoria.  |
 //+------------------------------------------------------------------------+
-void EmitDealAddEvent(const ulong deal_ticket)
+bool EmitDealAddEvent(const ulong deal_ticket)
   {
    if(!HistoryDealSelect(deal_ticket))
-      return; // il deal potrebbe non essere ancora visibile nella cache storica: evento perso una
-              // tantum, ma posizioni/ordini/account restano comunque corretti al prossimo OnTimer
+      return false; // il deal potrebbe non essere ancora visibile nella cache storica
 
    long     position_id = (long)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
    long     order_id     = (long)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
@@ -667,7 +674,79 @@ void EmitDealAddEvent(const ulong deal_ticket)
                                  symbol, direction, volume, price, 0.0, 0.0,
                                  profit, commission, swap, magic, comment, entry, event_time,
                                  timestamp_msc);
-   WriteEventAtomic(line);
+   return WriteEventAtomic(line);
+  }
+
+bool QueuePendingDealEvent(const ulong deal_ticket)
+  {
+   if(deal_ticket == 0)
+      return false;
+
+   int pending_total = ArraySize(g_pending_deal_tickets);
+   for(int i = 0; i < pending_total; i++)
+     {
+      if(g_pending_deal_tickets[i] == deal_ticket)
+         return true;
+     }
+
+   if(pending_total >= MAX_PENDING_DEAL_EVENTS)
+     {
+      PrintFormat("TradeJournalBridge: coda retry deal piena, ticket %I64u non accodato.",
+                  deal_ticket);
+      return false;
+     }
+
+   if(ArrayResize(g_pending_deal_tickets, pending_total + 1) != pending_total + 1 ||
+      ArrayResize(g_pending_deal_attempts, pending_total + 1) != pending_total + 1)
+     {
+      PrintFormat("TradeJournalBridge: memoria insufficiente per accodare il deal %I64u.",
+                  deal_ticket);
+      ArrayResize(g_pending_deal_tickets, pending_total);
+      ArrayResize(g_pending_deal_attempts, pending_total);
+      return false;
+     }
+
+   g_pending_deal_tickets[pending_total] = deal_ticket;
+   g_pending_deal_attempts[pending_total] = 0;
+   PrintFormat("TradeJournalBridge: deal %I64u non ancora disponibile, retry accodato.",
+               deal_ticket);
+   return true;
+  }
+
+void RemovePendingDealEvent(const int index)
+  {
+   int pending_total = ArraySize(g_pending_deal_tickets);
+   if(index < 0 || index >= pending_total)
+      return;
+
+   for(int i = index; i < pending_total - 1; i++)
+     {
+      g_pending_deal_tickets[i] = g_pending_deal_tickets[i + 1];
+      g_pending_deal_attempts[i] = g_pending_deal_attempts[i + 1];
+     }
+   ArrayResize(g_pending_deal_tickets, pending_total - 1);
+   ArrayResize(g_pending_deal_attempts, pending_total - 1);
+  }
+
+void RetryPendingDealEvents()
+  {
+   // Iteriamo al contrario per poter rimuovere in-place senza saltare elementi.
+   for(int i = ArraySize(g_pending_deal_tickets) - 1; i >= 0; i--)
+     {
+      ulong deal_ticket = g_pending_deal_tickets[i];
+      g_pending_deal_attempts[i]++;
+      if(EmitDealAddEvent(deal_ticket))
+        {
+         PrintFormat("TradeJournalBridge: deal %I64u pubblicato al retry %d.",
+                     deal_ticket, g_pending_deal_attempts[i]);
+         RemovePendingDealEvent(i);
+         continue;
+        }
+
+      if(g_pending_deal_attempts[i] == 1 || g_pending_deal_attempts[i] % 30 == 0)
+         PrintFormat("TradeJournalBridge: deal %I64u ancora non disponibile dopo %d retry.",
+                     deal_ticket, g_pending_deal_attempts[i]);
+     }
   }
 
 void EmitOrderEvent(const string event_type, const ulong order_ticket)
@@ -906,6 +985,7 @@ void OnTimer()
   {
    if(g_new_only && GetTickCount64() - g_new_only_started_ms < NEW_ONLY_STARTUP_GRACE_MS)
       return;
+   RetryPendingDealEvents();
    WriteAllSnapshots();
    SaveCursorState();
   }
@@ -922,7 +1002,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    switch(trans.type)
      {
       case TRADE_TRANSACTION_DEAL_ADD:
-         EmitDealAddEvent(trans.deal);
+         if(!EmitDealAddEvent(trans.deal))
+            QueuePendingDealEvent(trans.deal);
          break;
       case TRADE_TRANSACTION_ORDER_ADD:
          EmitOrderEvent("ORDER_ADD", trans.order);

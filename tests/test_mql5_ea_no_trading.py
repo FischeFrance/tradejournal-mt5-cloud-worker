@@ -101,7 +101,7 @@ def test_expert_declares_versioned_file_bridge_contract():
 
 def test_event_sequence_is_persisted_before_event_publication():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
-    builder = text[text.index("string BuildEventJson"):text.index("void EmitDealAddEvent")]
+    builder = text[text.index("string BuildEventJson"):text.index("bool EmitDealAddEvent")]
     writer = text[text.index("bool WriteEventAtomic"):text.index("long ExtractJsonLong")]
 
     assert builder.index("g_event_seq++") < builder.index("SaveCursorState()")
@@ -118,6 +118,15 @@ def test_new_only_defers_account_reads_until_after_on_init():
     )
 
 
+def test_live_deal_cache_races_are_retried_from_the_timer():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    assert "MAX_PENDING_DEAL_EVENTS = 256" in text
+    assert "QueuePendingDealEvent(trans.deal)" in text
+    assert "RetryPendingDealEvents();" in text
+    assert "EmitDealAddEvent(deal_ticket)" in text
+    assert "g_pending_deal_tickets[i] == deal_ticket" in text
 def test_loader_hands_off_to_bridge_template_after_connection_grace_period():
     text = (MT5_EXPERTS_DIR / "TradeJournalLoader.mq5").read_text(encoding="utf-8")
     assert "int OnInit()" in text
