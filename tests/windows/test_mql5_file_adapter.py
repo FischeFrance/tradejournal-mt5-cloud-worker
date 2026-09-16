@@ -57,7 +57,7 @@ def _ready_adapter(tmp_path: Path) -> Mql5FileMt5Adapter:
     _write(
         root,
         "deals.json",
-        [{"ticket": "3", "position_id": "1", "symbol": "EURUSD", "time": "2026-07-17T10:00:00Z"}],
+        [{"ticket": "3", "position_id": "1", "symbol": "EURUSD", "entry": "OUT", "time": "2026-07-17T10:00:00Z"}],
     )
     return Mql5FileMt5Adapter(root, CONNECTION_ID, 42, "Demo-Server", tmp_path / "state")
 
@@ -76,6 +76,28 @@ def test_reads_versioned_snapshots_and_preserves_sync_interface(tmp_path: Path) 
     assert set(snapshot) == {"positions", "orders", "deals"}
     assert list(snapshot["deals"]) == ["3"]
     assert len(adapter.history_deals(datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc))) == 1
+
+
+def test_history_deals_ignore_non_position_and_unclassified_account_movements(
+    tmp_path: Path,
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(
+        adapter.files_dir,
+        "deals.json",
+        [
+            {"ticket": "balance", "position_id": "0", "symbol": "", "entry": "IN", "time": "2026-07-17T09:00:00Z"},
+            {"ticket": "legacy", "position_id": "8", "symbol": "EURUSD", "time": "2026-07-17T09:30:00Z"},
+            {"ticket": "close", "position_id": "8", "symbol": "EURUSD", "entry": "OUT", "time": "2026-07-17T10:00:00Z"},
+        ],
+    )
+
+    rows = adapter.history_deals(
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+        datetime(2027, 1, 1, tzinfo=timezone.utc),
+    )
+
+    assert [row["ticket"] for row in rows] == ["close"]
 
 
 def test_snapshot_keys_positions_by_stable_identifier_with_ticket_fallback(tmp_path: Path) -> None:

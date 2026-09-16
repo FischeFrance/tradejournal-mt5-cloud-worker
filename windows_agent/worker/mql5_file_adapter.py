@@ -280,7 +280,16 @@ class Mql5FileMt5Adapter:
         return self._history("history_orders.json", start, end)
 
     def history_deals(self, start: datetime, end: datetime) -> tuple[dict[str, Any], ...]:
-        return self._history("deals.json", start, end)
+        rows = self._history("deals.json", start, end)
+        valid_entries = {"0", "1", "2", "3", "IN", "OUT", "INOUT", "OUT_BY"}
+        return tuple(
+            row
+            for row in rows
+            if str(row.get("position_id", "")).strip() not in ("", "0")
+            and isinstance(row.get("symbol"), str)
+            and bool(row["symbol"].strip())
+            and str(row.get("entry", "")).strip().upper() in valid_entries
+        )
 
     def pending_events(self) -> tuple[dict[str, Any], ...]:
         checkpoint = read_json(self.event_checkpoint_path, {})
