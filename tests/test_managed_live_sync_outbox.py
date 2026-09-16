@@ -129,7 +129,28 @@ def test_permanent_rejection_is_visible_and_preserved_in_dead_letter(tmp_path: P
 
 
 def test_mql5_event_stream_is_primary_and_acknowledged_after_outbox_persist(tmp_path: Path) -> None:
-    adapter = StreamAdapter({"positions": {}, "orders": {}, "deals": {}})
+    previous = _snapshot()
+    previous["deals"] = {
+        "899": {
+            "ticket": "899", "position_id": "100", "entry": "IN",
+            "commission": -2.5,
+        },
+    }
+    PersistentSnapshot(tmp_path / "snapshot.json").save(previous)
+    adapter = StreamAdapter({
+        "positions": {},
+        "orders": {},
+        "deals": {
+            "899": {
+                "ticket": "899", "position_id": "100", "entry": "IN",
+                "commission": -2.5,
+            },
+            "900": {
+                "ticket": "900", "position_id": "100", "entry": "OUT",
+                "commission": -1.0,
+            },
+        },
+    })
     sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
     live = LiveSync(
         adapter,
@@ -143,6 +164,46 @@ def test_mql5_event_stream_is_primary_and_acknowledged_after_outbox_persist(tmp_
     assert adapter.acknowledged == 17
     assert sender.payloads[0]["event_type"] == "trade_closed"
     assert sender.payloads[0]["external_trade_id"] == "100"
+    assert sender.payloads[0]["commission"] == -1.0
+    assert sender.payloads[0]["total_commission"] == -3.5
+
+
+def test_stream_open_forwards_the_commission_charged_by_mt5(tmp_path: Path) -> None:
+    current = _snapshot()
+    current["deals"] = {
+        "899": {
+            "ticket": "899", "position_id": "100", "entry": "IN",
+            "commission": -2.5,
+        },
+    }
+    records = ({
+        "sequence": 16,
+        "event_type": "DEAL_ADD",
+        "ticket": "899",
+        "position_id": "100",
+        "entry": "IN",
+        "symbol": "EURUSD",
+        "direction": "buy",
+        "volume": 0.1,
+        "price": 1.1,
+        "profit": 0,
+        "commission": -2.5,
+        "swap": 0,
+        "time": "2026-07-27T10:00:00Z",
+    },)
+    adapter = StreamAdapter(current, records)
+    sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    assert live.poll_once() == 1
+    assert sender.payloads[0]["event_type"] == "trade_opened"
+    assert sender.payloads[0]["commission"] == -2.5
 
 
 def test_partial_close_is_volume_change_and_not_a_duplicate_close(tmp_path: Path) -> None:

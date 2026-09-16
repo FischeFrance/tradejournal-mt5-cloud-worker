@@ -29,6 +29,35 @@ class _CallableSender:
         return SendResult(status="sent", attempts=1)
 
 
+def _position_total_commission(snapshot: dict, position_ticket: str) -> float | None:
+    """Return the exact MT5 commission only for a complete, deduplicated lifecycle.
+
+    ``snapshot['deals']`` is keyed by deal ticket, so repeated snapshot reads cannot multiply a
+    charge. Requiring both an entry and an exit prevents a short history window from turning an
+    incomplete lifecycle into an authoritative zero.
+    """
+    deals = [
+        deal
+        for deal in snapshot.get("deals", {}).values()
+        if isinstance(deal, dict)
+        and str(deal.get("position_id") or deal.get("position_ticket") or "")
+        == str(position_ticket)
+    ]
+    entries = {"0", "IN"}
+    exits = {"1", "2", "3", "OUT", "INOUT", "OUT_BY"}
+    has_entry = any(str(deal.get("entry", "")).upper() in entries for deal in deals)
+    has_exit = any(str(deal.get("entry", "")).upper() in exits for deal in deals)
+    if not has_entry or not has_exit:
+        return None
+    commissions = [
+        float(deal["commission"])
+        for deal in deals
+        if isinstance(deal.get("commission"), (int, float))
+        and not isinstance(deal.get("commission"), bool)
+    ]
+    return sum(commissions) if commissions else None
+
+
 def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
     event_type = str(record.get("event_type", "")).upper()
     position_ticket = record.get("position_id") or record.get("position_ticket")
@@ -57,6 +86,8 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                     "volume": current_position.get("volume"),
                     "previous_volume": previous_position.get("volume"),
                     "partial_close": False,
+                    "commission": record.get("commission"),
+                    "swap": record.get("swap"),
                 }
             return {
                 **base,
@@ -64,6 +95,8 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                 "open_price": record.get("price"),
                 "open_time": record.get("time"),
                 "balance_before_open": record.get("balance_before_open"),
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
             }
         if entry in ("OUT", "OUT_BY"):
             if current_position is not None:
@@ -77,8 +110,13 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                         else None
                     ),
                     "partial_close": True,
+                    "close_price": record.get("price"),
+                    "profit": record.get("profit"),
+                    "commission": record.get("commission"),
+                    "swap": record.get("swap"),
+                    "close_time": record.get("time"),
                 }
-            return {
+            closed = {
                 **base,
                 "event_type": "trade_closed",
                 "close_price": record.get("price"),
@@ -87,6 +125,10 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                 "swap": record.get("swap"),
                 "close_time": record.get("time"),
             }
+            total_commission = _position_total_commission(current, ticket_text)
+            if total_commission is not None:
+                closed["total_commission"] = total_commission
+            return closed
         return {
             **base,
             "event_type": "deal_recorded",
@@ -213,6 +255,14 @@ def detect_windows_events(previous: dict, current: dict) -> list[dict]:
     ):
         deal = current["deals"][ticket]
         events.append({"event_type": "deal_recorded", "ticket": ticket, **deal})
+    for event in events:
+        if event.get("event_type") != "trade_closed":
+            continue
+        total_commission = _position_total_commission(
+            current, str(event.get("ticket", ""))
+        )
+        if total_commission is not None:
+            event["total_commission"] = total_commission
     return events
 
 

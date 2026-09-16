@@ -5,7 +5,8 @@ repository principale -- consultato in sola lettura, non modificato).
 Campi del payload, esattamente come richiesti dal contratto API:
 event_id, event_type, platform, account_number, server, external_trade_id, symbol, direction,
 volume, price, open_price, close_price, stop_loss, take_profit, previous_stop_loss,
-previous_take_profit, profit, commission, swap, open_time, close_time, event_time.
+previous_take_profit, profit, commission, total_commission, swap, open_time, close_time,
+event_time.
 When supplied by the native MT5 bridge, the sanitized account snapshot and the balance captured
 immediately before opening are forwarded as optional fields.
 """
@@ -38,7 +39,7 @@ _FINGERPRINT_FIELDS = {
         "previous_take_profit",
     ),
     "trade_closed": (
-        "close_price", "profit", "commission", "swap", "close_time",
+        "close_price", "profit", "commission", "total_commission", "swap", "close_time",
         "mae_points", "mfe_points", "excursion_samples",
     ),
     "pending_order_created": (
@@ -121,6 +122,7 @@ def normalize_event(
         "previous_take_profit": event.get("previous_take_profit"),
         "profit": event.get("profit"),
         "commission": event.get("commission"),
+        "total_commission": event.get("total_commission"),
         "swap": event.get("swap"),
         "open_time": event.get("open_time"),
         "close_time": event.get("close_time"),

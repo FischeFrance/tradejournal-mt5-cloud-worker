@@ -21,7 +21,7 @@ def test_normalize_event_produces_all_contract_fields():
         "event_id", "event_type", "platform", "account_number", "server", "external_trade_id",
         "symbol", "direction", "volume", "price", "open_price", "close_price", "stop_loss",
         "take_profit", "previous_stop_loss", "previous_take_profit", "profit", "commission",
-        "swap", "open_time", "close_time", "event_time",
+        "total_commission", "swap", "open_time", "close_time", "event_time",
     }
     assert set(payload.keys()) == expected_keys
     assert payload["event_type"] == "trade_opened"
@@ -32,6 +32,23 @@ def test_normalize_event_produces_all_contract_fields():
     assert payload["symbol"] == "EURUSD"
     assert payload["stop_loss"] == 1.0950
     assert payload["take_profit"] == 1.1100
+
+
+def test_normalize_closed_trade_preserves_authoritative_total_commission():
+    payload = normalize_event(
+        {
+            "event_type": "trade_closed",
+            "ticket": "1",
+            "commission": 0,
+            "total_commission": -5.44,
+            "event_time": "2026-01-01T02:00:00+00:00",
+        },
+        account_number="12345",
+        server="Demo-Server",
+    )
+
+    assert payload["commission"] == 0
+    assert payload["total_commission"] == -5.44
 
 
 def test_normalize_event_accepts_missing_account_number():

@@ -1739,6 +1739,8 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
                 "event_type": "trade_opened",
                 "open_price": record.get("price", record.get("open_price")),
                 "open_time": event_time,
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
             }
         elif normalized_entry in ("1", "2", "3", "OUT", "INOUT", "OUT_BY"):
             raw = {
