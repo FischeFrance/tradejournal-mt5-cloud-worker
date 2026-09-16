@@ -598,6 +598,7 @@ def build_real_handlers(
         login: int,
         server: str,
         expected_terminal_sha256: str | None,
+        history_mode: HistoryMode = "new_only",
     ) -> tuple[Path, Path]:
         """Rotate a stale per-instance EA before any managed sync reads its files.
 
@@ -634,6 +635,7 @@ def build_real_handlers(
             / "TradeJournal"
             / "TradeJournalBridge.ex5"
         )
+        expert_needs_rotation = False
         if expert_sha256 is not None:
             try:
                 current_expert_sha256 = provisioner._sha256(instance_expert)
@@ -641,25 +643,39 @@ def build_real_handlers(
                 raise InstanceProvisionFailed(
                     "provisioned managed expert unavailable"
                 ) from exc
-            if current_expert_sha256 != expert_sha256:
-                try:
-                    process = process_factory(state_path)
-                    if terminal_is_running:
-                        process.stop()
-                        if not process.cleanup_path(terminal):
-                            raise RuntimeError(
-                                "instance process survived expert rotation"
-                            )
+            expert_needs_rotation = current_expert_sha256 != expert_sha256
+
+        history_mode_path = (
+            root / "terminal" / "MQL5" / "Files" / "TradeJournal" / "history_mode"
+        )
+        try:
+            active_history_mode = history_mode_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            active_history_mode = ""
+        restart_required = expert_needs_rotation or active_history_mode != history_mode
+        if restart_required:
+            try:
+                process = process_factory(state_path)
+                if terminal_is_running:
+                    process.stop()
+                    if not process.cleanup_path(terminal):
+                        raise RuntimeError(
+                            "instance process survived managed runtime restart"
+                        )
+                if expert_needs_rotation:
                     provisioner.rotate_managed_expert(
                         cid,
                         expert_binary,
                         expert_sha256,
                     )
-                    terminal_is_running = False
-                except Exception as exc:
-                    raise InstanceProvisionFailed(
-                        "managed expert rotation failed"
-                    ) from exc
+                terminal_is_running = False
+            except Exception as exc:
+                message = (
+                    "managed expert rotation failed"
+                    if expert_needs_rotation
+                    else "managed history mode restart failed"
+                )
+                raise InstanceProvisionFailed(message) from exc
 
         if not terminal_is_running:
             try:
@@ -677,6 +693,7 @@ def build_real_handlers(
                     login=login,
                     server=server,
                     expert_binary=expert_binary,
+                    history_mode=history_mode,
                 )
             except NativeMt5Error as exc:
                 code = str(exc)
@@ -1430,20 +1447,41 @@ def build_real_handlers(
             # therefore not read, decrypt or retain the investor password at all.
             _require_lease(api, job)
             with connection_sync_lock(cid):
-                terminal, state_path = _ensure_current_managed_expert(
+                _ensure_current_managed_expert(
                     job,
                     cid,
                     root,
                     login,
                     server,
                     terminal_sha256,
+                    history_mode=mode,
                 )
-            _progress(root, status="importing_history")
-            adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
-            _verify_investor_access(adapter)
-            # The native EA emits an authoritative event file for every backfilled transaction.
-            # Do not synthesize a second event stream from snapshots; consume the files below.
-            counts = _run_history_sync(adapter, root, mode, from_date)
+                try:
+                    _progress(root, status="importing_history")
+                    adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
+                    _verify_investor_access(adapter)
+                    # The native EA emits an authoritative event file for every backfilled
+                    # transaction. Keep the local live supervisor outside this locked window so
+                    # it never interprets a full-history snapshot as a burst of live changes.
+                    counts = _run_history_sync(
+                        adapter,
+                        root,
+                        mode,
+                        from_date,
+                        ingestion_sink,
+                        str(login),
+                        server,
+                    )
+                finally:
+                    _ensure_current_managed_expert(
+                        job,
+                        cid,
+                        root,
+                        login,
+                        server,
+                        terminal_sha256,
+                        history_mode="new_only",
+                    )
             if ingestion_sink is not None:
                 _run_live_sync_once(adapter, root, ingestion_sink)
         else:
