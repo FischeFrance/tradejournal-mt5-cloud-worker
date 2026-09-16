@@ -128,6 +128,17 @@ def test_new_only_restart_recovers_only_a_bounded_downtime_gap():
     assert "g_new_only_recovery_pending && !RunNewOnlyRecovery()" in text
 
 
+def test_live_deal_cache_races_are_retried_from_the_timer():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    assert "MAX_PENDING_DEAL_EVENTS = 256" in text
+    assert "QueuePendingDealEvent(trans.deal)" in text
+    assert "RetryPendingDealEvents();" in text
+    assert "EmitDealAddEvent(deal_ticket)" in text
+    assert "g_pending_deal_tickets[i] == deal_ticket" in text
+
+
 def test_pending_order_fill_has_a_distinct_terminal_source_event():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
     for order_type in (
