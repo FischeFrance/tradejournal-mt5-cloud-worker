@@ -379,10 +379,16 @@ class InstanceProvisioner:
 
     @classmethod
     def _managed_runtime_assets_manifest(cls, terminal_root: Path) -> str:
-        cls._validate_source_tree(terminal_root)
+        if cls._is_reparse_point(terminal_root) or not terminal_root.is_dir():
+            raise ValueError("published terminal root invalid")
         entries: list[str] = []
         for relative in _MANAGED_RUNTIME_ASSETS:
             asset = terminal_root / relative
+            current = terminal_root
+            for component in relative.parts[:-1]:
+                current /= component
+                if cls._is_reparse_point(current) or not current.is_dir():
+                    raise ValueError("published managed runtime asset path invalid")
             if cls._is_reparse_point(asset) or not asset.is_file():
                 raise ValueError("published managed runtime asset missing")
             entries.append(f"{relative.as_posix()}:{cls._sha256(asset)}")
