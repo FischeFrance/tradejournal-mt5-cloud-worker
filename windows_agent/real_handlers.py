@@ -591,6 +591,107 @@ def build_real_handlers(
             terminal_sha256,
         )
 
+    def _ensure_current_managed_expert(
+        job: dict,
+        cid: str,
+        root: Path,
+        login: int,
+        server: str,
+        expected_terminal_sha256: str | None,
+    ) -> tuple[Path, Path]:
+        """Rotate a stale per-instance EA before any managed sync reads its files.
+
+        Event-driven accounts no longer receive recurring ``live_sync`` jobs.  History sync is
+        therefore also the supported rollout boundary for an already provisioned terminal: it
+        stops only the affected instance, atomically reseals the managed assets, and resumes the
+        same authenticated terminal without reading the investor password.
+        """
+        terminal = root / "terminal" / "terminal64.exe"
+        state_path = root / "state" / "terminal-process.json"
+        _verify_binary_pin(terminal, expected_terminal_sha256)
+        _verify_binary_pin(expert_binary, expert_sha256)
+        terminal_is_running = terminal.is_file() and ProcessManager.find(terminal)
+        provisioner = InstanceProvisioner(instances_root, secrets_root)
+        try:
+            provisioner.validate_runtime_assets(cid)
+        except ValueError as exc:
+            if "asset pin missing" not in str(exc) or not terminal_is_running:
+                raise InstanceProvisionFailed(
+                    "provisioned managed runtime assets invalid"
+                ) from exc
+            try:
+                provisioner.seal_runtime_assets(cid)
+            except Exception as seal_exc:
+                raise InstanceProvisionFailed(
+                    "legacy runtime asset migration failed"
+                ) from seal_exc
+
+        instance_expert = (
+            root
+            / "terminal"
+            / "MQL5"
+            / "Experts"
+            / "TradeJournal"
+            / "TradeJournalBridge.ex5"
+        )
+        if expert_sha256 is not None:
+            try:
+                current_expert_sha256 = provisioner._sha256(instance_expert)
+            except OSError as exc:
+                raise InstanceProvisionFailed(
+                    "provisioned managed expert unavailable"
+                ) from exc
+            if current_expert_sha256 != expert_sha256:
+                try:
+                    process = process_factory(state_path)
+                    if terminal_is_running:
+                        process.stop()
+                        if not process.cleanup_path(terminal):
+                            raise RuntimeError(
+                                "instance process survived expert rotation"
+                            )
+                    provisioner.rotate_managed_expert(
+                        cid,
+                        expert_binary,
+                        expert_sha256,
+                    )
+                    terminal_is_running = False
+                except Exception as exc:
+                    raise InstanceProvisionFailed(
+                        "managed expert rotation failed"
+                    ) from exc
+
+        if not terminal_is_running:
+            try:
+                provisioner.validate(cid, verify_code=False)
+            except Exception as exc:
+                raise InstanceProvisionFailed(
+                    "provisioned instance code integrity validation failed"
+                ) from exc
+            try:
+                runtime = runtime_factory(root, cid)
+                set_cancel_check = getattr(runtime, "set_cancel_check", None)
+                if callable(set_cancel_check):
+                    set_cancel_check(job.get("_lease_guard"))
+                runtime.resume(
+                    login=login,
+                    server=server,
+                    expert_binary=expert_binary,
+                )
+            except NativeMt5Error as exc:
+                code = str(exc)
+                if code in ("identity_mismatch", "server_identity_mismatch"):
+                    raise AccountIdentityMismatch(code) from exc
+                if code == "terminal_start_failed":
+                    raise TerminalStartFailed(code) from exc
+                raise Mt5InitializeFailed(code) from exc
+            try:
+                process_factory(state_path).adopt(terminal)
+            except (AttributeError, RuntimeError):
+                pass
+
+        return terminal, state_path
+
     def _provision_once(job: dict) -> dict:
         cid = canonical_uuid(str(job["connection_id"]))
         payload = job.get("payload") or {}
@@ -1328,6 +1429,15 @@ def build_real_handlers(
             # The default adapter consumes only the EA's files.  A later history job must
             # therefore not read, decrypt or retain the investor password at all.
             _require_lease(api, job)
+            with connection_sync_lock(cid):
+                terminal, state_path = _ensure_current_managed_expert(
+                    job,
+                    cid,
+                    root,
+                    login,
+                    server,
+                    terminal_sha256,
+                )
             _progress(root, status="importing_history")
             adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
             _verify_investor_access(adapter)
@@ -1447,92 +1557,14 @@ def build_real_handlers(
             raise SecretStoreFailed("trading_ingestion_url not configured on this agent")
         _require_lease(api, job)
 
-        terminal = root / "terminal" / "terminal64.exe"
-        state_path = root / "state" / "terminal-process.json"
-        _verify_binary_pin(terminal, recorded_terminal_sha256)
-        _verify_binary_pin(expert_binary, expert_sha256)
-        terminal_is_running = terminal.is_file() and ProcessManager.find(terminal)
-        provisioner = InstanceProvisioner(instances_root, secrets_root)
-        try:
-            provisioner.validate_runtime_assets(cid)
-        except ValueError as exc:
-            # Legacy instances predate the per-instance runtime asset pin.  A
-            # one-time seal is permitted only while their exact terminal is
-            # already running and its immutable terminal pin has passed above.
-            # The operation never overwrites an existing asset pin.
-            if "asset pin missing" not in str(exc) or not terminal_is_running:
-                raise InstanceProvisionFailed(
-                    "provisioned managed runtime assets invalid"
-                ) from exc
-            try:
-                provisioner.seal_runtime_assets(cid)
-            except Exception as seal_exc:
-                raise InstanceProvisionFailed(
-                    "legacy runtime asset migration failed"
-                ) from seal_exc
-        instance_expert = (
-            root
-            / "terminal"
-            / "MQL5"
-            / "Experts"
-            / "TradeJournal"
-            / "TradeJournalBridge.ex5"
+        terminal, state_path = _ensure_current_managed_expert(
+            job,
+            cid,
+            root,
+            login,
+            server,
+            recorded_terminal_sha256,
         )
-        if expert_sha256 is not None:
-            try:
-                current_expert_sha256 = provisioner._sha256(instance_expert)
-            except OSError as exc:
-                raise InstanceProvisionFailed(
-                    "provisioned managed expert unavailable"
-                ) from exc
-            if current_expert_sha256 != expert_sha256:
-                try:
-                    process = process_factory(state_path)
-                    if terminal_is_running:
-                        process.stop()
-                        if not process.cleanup_path(terminal):
-                            raise RuntimeError("instance process survived expert rotation")
-                    provisioner.rotate_managed_expert(
-                        cid,
-                        expert_binary,
-                        expert_sha256,
-                    )
-                    terminal_is_running = False
-                except Exception as exc:
-                    raise InstanceProvisionFailed(
-                        "managed expert rotation failed"
-                    ) from exc
-        if not terminal_is_running:
-            try:
-                provisioner.validate(
-                    cid,
-                    verify_code=False,
-                )
-            except Exception as exc:
-                raise InstanceProvisionFailed(
-                    "provisioned instance code integrity validation failed"
-                ) from exc
-            try:
-                runtime = runtime_factory(root, cid)
-                set_cancel_check = getattr(runtime, "set_cancel_check", None)
-                if callable(set_cancel_check):
-                    set_cancel_check(job.get("_lease_guard"))
-                runtime.resume(
-                    login=login,
-                    server=server,
-                    expert_binary=expert_binary,
-                )
-            except NativeMt5Error as exc:
-                code = str(exc)
-                if code in ("identity_mismatch", "server_identity_mismatch"):
-                    raise AccountIdentityMismatch(code) from exc
-                if code == "terminal_start_failed":
-                    raise TerminalStartFailed(code) from exc
-                raise Mt5InitializeFailed(code) from exc
-            try:
-                process_factory(state_path).adopt(terminal)
-            except (AttributeError, RuntimeError):
-                pass
 
         adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
         try:
