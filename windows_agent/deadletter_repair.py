@@ -15,7 +15,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -28,12 +28,15 @@ from worker.event_outbox import EventOutbox, OutboxError, _restrict_file_access
 from worker.event_sender import SendResult
 
 from .event_supervisor import connection_sync_lock
+from .provisioning.process_manager import ProcessManager
 from .provisioning.secret_store import WindowsSecretStore
 from .security import canonical_uuid
 from .worker.history_balance import (
     CREDIT_DEAL_TYPE,
     KNOWN_BALANCE_DEAL_TYPES,
     TRADE_DEAL_TYPES,
+    balance_ledger_snapshot_bytes,
+    balance_ledger_snapshot_filename,
 )
 from .worker.mt5_broker_discovery import BrokerDiscoveryError, normalize_server_name
 
@@ -53,6 +56,7 @@ _REQUEST_KEYS = frozenset(
         "expected_outbox_sha256",
         "expected_dead_letter_count",
         "expected_record_sha256",
+        "expected_ledger_snapshot_sha256",
     }
 )
 _TRADE_DEAL_TYPES = TRADE_DEAL_TYPES
@@ -62,6 +66,8 @@ _ACCOUNTING_DEAL_TYPES = frozenset(
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _MOVEFILE_WRITE_THROUGH = 0x00000008
 _MAX_JSON_BYTES = 512 * 1024 * 1024
+_LEDGER_EVIDENCE_MAX_AGE = timedelta(minutes=30)
+_LEDGER_EVIDENCE_MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
 class DeadLetterRepairError(RuntimeError):
@@ -81,6 +87,7 @@ class RepairRequest:
     deployment_id: str
     expected_outbox_sha256: str
     expected_record_sha256: str
+    expected_ledger_snapshot_sha256: str
     expected_dead_letter_count: int = 1
 
     @classmethod
@@ -96,6 +103,7 @@ class RepairRequest:
         deployment_id = document.get("deployment_id")
         expected_outbox = document.get("expected_outbox_sha256")
         expected_record = document.get("expected_record_sha256")
+        expected_ledger = document.get("expected_ledger_snapshot_sha256")
         count = document.get("expected_dead_letter_count")
         if (
             not isinstance(deployment_id, str)
@@ -104,6 +112,8 @@ class RepairRequest:
             or not _SHA256.fullmatch(expected_outbox)
             or not isinstance(expected_record, str)
             or not _SHA256.fullmatch(expected_record)
+            or not isinstance(expected_ledger, str)
+            or not _SHA256.fullmatch(expected_ledger)
             or count != 1
             or isinstance(count, bool)
         ):
@@ -113,6 +123,7 @@ class RepairRequest:
             deployment_id=deployment_id,
             expected_outbox_sha256=expected_outbox,
             expected_record_sha256=expected_record,
+            expected_ledger_snapshot_sha256=expected_ledger,
         )
 
 
@@ -121,6 +132,7 @@ class LedgerDecision:
     classification: str
     row: dict[str, Any]
     replacement_payload: dict[str, Any] | None
+    ledger_snapshot_sha256: str
 
 
 class RepairHttpSender:
@@ -260,6 +272,16 @@ def repair_live_dead_letter(
     backup_path = _backup_path(rollback_root, request)
 
     with connection_sync_lock(request.connection_id):
+        _require_terminal_target_stopped(instance_root)
+        completed = _completed_receipt_result(
+            request,
+            outbox_path=outbox_path,
+            audit_path=audit_path,
+            receipt_path=receipt_path,
+            backup_path=backup_path,
+        )
+        if completed is not None:
+            return completed
         existing_audit = _read_optional_json(audit_path)
         if existing_audit is None:
             outbox_bytes = _read_regular_bytes(outbox_path)
@@ -269,7 +291,12 @@ def repair_live_dead_letter(
             event_id, dead_record = _select_dead_letter(outbox, request)
             if outbox.pending_count() != 0:
                 raise DeadLetterRepairError("outbox_not_quiescent")
-            decision = _classify_from_coherent_ledger(instance_root, dead_record, request)
+            decision = _classify_from_coherent_ledger(
+                instance_root,
+                dead_record,
+                request,
+                require_fresh_evidence=True,
+            )
             audit_document = _audit_document(request, dead_record, decision)
             audit_bytes = _canonical_json_bytes(audit_document)
             _write_private_once(backup_path, outbox_bytes)
@@ -289,19 +316,29 @@ def repair_live_dead_letter(
                 classification=str(audit_document["classification"]),
                 row=copy.deepcopy(audit_document["ledger_record"]),
                 replacement_payload=copy.deepcopy(audit_document.get("replacement_payload")),
+                ledger_snapshot_sha256=str(
+                    audit_document["ledger_snapshot_sha256"]
+                ),
             )
-            decision = _classify_from_coherent_ledger(instance_root, dead_record, request)
+            decision = _classify_from_coherent_ledger(
+                instance_root,
+                dead_record,
+                request,
+                require_fresh_evidence=False,
+            )
             if _canonical_json_bytes(
                 {
                     "classification": decision.classification,
                     "row": decision.row,
                     "replacement_payload": decision.replacement_payload,
+                    "ledger_snapshot_sha256": decision.ledger_snapshot_sha256,
                 }
             ) != _canonical_json_bytes(
                 {
                     "classification": audited_decision.classification,
                     "row": audited_decision.row,
                     "replacement_payload": audited_decision.replacement_payload,
+                    "ledger_snapshot_sha256": audited_decision.ledger_snapshot_sha256,
                 }
             ):
                 raise DeadLetterRepairError("resolution_audit_invalid")
@@ -343,6 +380,7 @@ def repair_live_dead_letter(
             "schema_version": 1,
             "classification": result["classification"],
             "record_sha256": request.expected_record_sha256,
+            "ledger_snapshot_sha256": request.expected_ledger_snapshot_sha256,
             "audit_sha256": audit_sha256,
             "action": result["action"],
             "http_status": result.get("http_status"),
@@ -358,12 +396,109 @@ def repair_live_dead_letter(
             "http_status": result.get("http_status"),
             "outcome": result.get("outcome"),
             "record_sha256": request.expected_record_sha256,
+            "ledger_snapshot_sha256": request.expected_ledger_snapshot_sha256,
             "audit_sha256": audit_sha256,
             "backup_sha256": request.expected_outbox_sha256,
             "outbox_after_sha256": _sha256(_read_regular_bytes(outbox_path)),
             "pending_count": refreshed.pending_count(),
             "dead_letter_count": refreshed.dead_letter_count(),
         }
+
+
+def _require_terminal_target_stopped(instance_root: Path) -> None:
+    try:
+        pids = ProcessManager.find_under(instance_root / "terminal")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DeadLetterRepairError("terminal_state_unavailable") from exc
+    if pids:
+        raise DeadLetterRepairError("terminal_must_be_stopped")
+
+
+def _completed_receipt_result(
+    request: RepairRequest,
+    *,
+    outbox_path: Path,
+    audit_path: Path,
+    receipt_path: Path,
+    backup_path: Path,
+) -> dict[str, Any] | None:
+    receipt = _read_optional_json(receipt_path)
+    if receipt is None:
+        return None
+    receipt_bytes = _read_regular_bytes(receipt_path)
+    if _canonical_json_bytes(receipt) != receipt_bytes:
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    expected_keys = {
+        "schema_version",
+        "classification",
+        "record_sha256",
+        "ledger_snapshot_sha256",
+        "audit_sha256",
+        "action",
+        "http_status",
+        "outcome",
+    }
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != expected_keys
+        or receipt.get("schema_version") != 1
+        or receipt.get("record_sha256") != request.expected_record_sha256
+        or receipt.get("ledger_snapshot_sha256")
+        != request.expected_ledger_snapshot_sha256
+        or not isinstance(receipt.get("audit_sha256"), str)
+        or not _SHA256.fullmatch(receipt["audit_sha256"])
+        or receipt.get("classification")
+        not in ("real_trade", "non_trading_accounting")
+        or not isinstance(receipt.get("action"), str)
+    ):
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    audit = _validate_existing_audit(_read_json(audit_path), request)
+    audit_bytes = _read_regular_bytes(audit_path)
+    if (
+        _canonical_json_bytes(audit) != audit_bytes
+        or _sha256(audit_bytes) != receipt["audit_sha256"]
+    ):
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    if _sha256(_read_regular_bytes(backup_path)) != request.expected_outbox_sha256:
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    if audit.get("classification") != receipt["classification"]:
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    payload = audit["dead_letter_record"].get("payload")
+    event_id = payload.get("event_id") if isinstance(payload, dict) else None
+    if not isinstance(event_id, str):
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    outbox = EventOutbox(str(outbox_path))
+    if event_id in outbox.pending_payloads() or event_id in outbox.dead_letters():
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    if receipt["classification"] == "real_trade":
+        if (
+            receipt["action"]
+            not in ("corrected_event_delivered", "delivery_confirmed_after_recovery")
+            or receipt.get("http_status") != 200
+            or receipt.get("outcome") not in ("ok", "duplicate")
+        ):
+            raise DeadLetterRepairError("resolution_receipt_invalid")
+    elif (
+        receipt["action"] != "audit_archived_barrier_removed"
+        or receipt.get("http_status") is not None
+        or receipt.get("outcome") is not None
+    ):
+        raise DeadLetterRepairError("resolution_receipt_invalid")
+    return {
+        "schema_version": 1,
+        "status": "resolved",
+        "classification": receipt["classification"],
+        "action": receipt["action"],
+        "http_status": receipt.get("http_status"),
+        "outcome": receipt.get("outcome"),
+        "record_sha256": request.expected_record_sha256,
+        "ledger_snapshot_sha256": request.expected_ledger_snapshot_sha256,
+        "audit_sha256": receipt["audit_sha256"],
+        "backup_sha256": request.expected_outbox_sha256,
+        "outbox_after_sha256": _sha256(_read_regular_bytes(outbox_path)),
+        "pending_count": outbox.pending_count(),
+        "dead_letter_count": outbox.dead_letter_count(),
+    }
 
 
 def _resolve_non_trading(
@@ -493,45 +628,240 @@ def _select_dead_letter(
     return event_id, record
 
 
+def _is_canonical_ticket_list(value: Any) -> bool:
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(ticket, str)
+            or not re.fullmatch(r"[0-9]{1,32}", ticket)
+            for ticket in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        return False
+    return value == sorted(value, key=lambda ticket: (len(ticket), ticket))
+
+
+def _history_archive_tickets(document: dict[str, Any]) -> list[str]:
+    trades = document.get("trades")
+    if not isinstance(trades, list):
+        raise DeadLetterRepairError("ledger_handoff_not_active")
+    tickets: set[str] = set()
+    for group in trades:
+        events = group.get("events") if isinstance(group, dict) else None
+        if not isinstance(events, list):
+            raise DeadLetterRepairError("ledger_handoff_not_active")
+        for event in events:
+            ticket = event.get("native_deal_ticket") if isinstance(event, dict) else None
+            ticket_text = str(ticket) if ticket is not None else ""
+            if not re.fullmatch(r"[0-9]{1,32}", ticket_text):
+                raise DeadLetterRepairError("ledger_handoff_not_active")
+            tickets.add(ticket_text)
+    return sorted(tickets, key=lambda ticket: (len(ticket), ticket))
+
+
 def _classify_from_coherent_ledger(
     instance_root: Path,
     dead_record: dict[str, Any],
     request: RepairRequest,
+    *,
+    require_fresh_evidence: bool,
 ) -> LedgerDecision:
-    checkpoint = _read_json(instance_root / "state" / "history.json")
     report = _read_json(instance_root / "data" / "history-balance-backfill.json")
     anchor = report.get("anchor") if isinstance(report, dict) else None
+    binding = report.get("ledger_snapshot") if isinstance(report, dict) else None
     if (
-        not isinstance(checkpoint, dict)
-        or not isinstance(report, dict)
+        not isinstance(report, dict)
         or report.get("schema_version") != 1
         or report.get("source") != "mt5_historical_ledger"
         or not isinstance(anchor, dict)
         or anchor.get("coherent") is not True
     ):
         raise DeadLetterRepairError("ledger_not_coherent")
+    if (
+        not isinstance(binding, dict)
+        or set(binding)
+        != {
+            "job_id",
+            "filename",
+            "sha256",
+            "deal_count",
+            "history_mode",
+            "through",
+            "captured_at_utc",
+        }
+        or not isinstance(binding.get("job_id"), str)
+        or binding.get("filename")
+        != balance_ledger_snapshot_filename(
+            binding.get("job_id", ""), str(binding.get("sha256", ""))
+        )
+        or not isinstance(binding.get("sha256"), str)
+        or not _SHA256.fullmatch(binding["sha256"])
+        or binding.get("history_mode") != "all_available"
+        or not isinstance(binding.get("deal_count"), int)
+        or isinstance(binding.get("deal_count"), bool)
+        or binding["deal_count"] <= 0
+        or not isinstance(binding.get("through"), str)
+        or not isinstance(binding.get("captured_at_utc"), str)
+    ):
+        raise DeadLetterRepairError("ledger_snapshot_binding_invalid")
+    if binding["sha256"] != request.expected_ledger_snapshot_sha256:
+        raise DeadLetterRepairError("ledger_snapshot_preimage_mismatch")
+
+    active = _read_json(instance_root / "state" / "history-live-handoff.json")
+    pending = _read_json(instance_root / "state" / "history-handoff-pending.json")
+    active_archive_sha256 = (
+        active.get("history_document_sha256") if isinstance(active, dict) else None
+    )
+    active_sequence = active.get("anchor_sequence") if isinstance(active, dict) else None
+    pending_sequence = pending.get("anchor_sequence") if isinstance(pending, dict) else None
+    active_archived = active.get("archived_deal_tickets") if isinstance(active, dict) else None
+    pending_archived = pending.get("archived_deal_tickets") if isinstance(pending, dict) else None
+    active_imported = active.get("imported_deal_tickets") if isinstance(active, dict) else None
+    pending_imported = pending.get("imported_deal_tickets") if isinstance(pending, dict) else None
+    expected_archive_name = (
+        "history-import-"
+        + hashlib.sha256(binding["job_id"].encode("utf-8")).hexdigest()[:16]
+        + ".json"
+    )
+    if (
+        not isinstance(active, dict)
+        or active.get("schema_version") != 2
+        or active.get("connection_id") != request.connection_id
+        or active.get("job_id") != binding["job_id"]
+        or active.get("history_mode") != "all_available"
+        or active.get("ledger_evidence") != binding
+        or not isinstance(active_archive_sha256, str)
+        or not _SHA256.fullmatch(active_archive_sha256)
+        or not isinstance(pending, dict)
+        or pending.get("schema_version") != 1
+        or pending.get("connection_id") != request.connection_id
+        or pending.get("job_id") != binding["job_id"]
+        or pending.get("history_mode") != "all_available"
+        or pending.get("ledger_evidence") != binding
+        or pending.get("history_document_sha256") != active_archive_sha256
+        or pending.get("history_document") != expected_archive_name
+        or not isinstance(active_sequence, int)
+        or isinstance(active_sequence, bool)
+        or active_sequence < 0
+        or pending_sequence != active_sequence
+        or not _is_canonical_ticket_list(active_archived)
+        or pending_archived != active_archived
+        or not _is_canonical_ticket_list(active_imported)
+        or pending_imported != active_imported
+        or not set(active_imported).issubset(set(active_archived))
+        or not isinstance(pending.get("history_counts"), dict)
+        or pending["history_counts"].get("accounting_deals")
+        != binding["deal_count"]
+    ):
+        raise DeadLetterRepairError("ledger_handoff_not_active")
+
+    archive_path = instance_root / "state" / expected_archive_name
+    try:
+        archive_bytes = _read_regular_bytes(archive_path)
+    except DeadLetterRepairError as exc:
+        raise DeadLetterRepairError("ledger_handoff_not_active") from exc
+    if _sha256(archive_bytes) != active_archive_sha256:
+        raise DeadLetterRepairError("ledger_handoff_not_active")
+    try:
+        archive = json.loads(archive_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DeadLetterRepairError("ledger_handoff_not_active") from exc
+    if (
+        not isinstance(archive, dict)
+        or archive.get("schema_version") != 1
+        or archive.get("job_id") != binding["job_id"]
+        or archive.get("connection_id") != request.connection_id
+        or archive.get("history_mode") != "all_available"
+        or _history_archive_tickets(archive) != active_imported
+        or pending.get("history_document_payload") != archive
+    ):
+        raise DeadLetterRepairError("ledger_handoff_not_active")
+
+    snapshot_path = instance_root / "data" / binding["filename"]
+    try:
+        snapshot_bytes = _read_regular_bytes(snapshot_path)
+    except DeadLetterRepairError as exc:
+        raise DeadLetterRepairError("ledger_snapshot_unavailable") from exc
+    if _sha256(snapshot_bytes) != binding["sha256"]:
+        raise DeadLetterRepairError("ledger_snapshot_digest_mismatch")
+    try:
+        snapshot = json.loads(snapshot_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DeadLetterRepairError("ledger_snapshot_invalid") from exc
+    if not isinstance(snapshot, dict):
+        raise DeadLetterRepairError("ledger_snapshot_invalid")
+    try:
+        canonical_snapshot = balance_ledger_snapshot_bytes(snapshot)
+    except (TypeError, ValueError) as exc:
+        raise DeadLetterRepairError("ledger_snapshot_invalid") from exc
+    if canonical_snapshot != snapshot_bytes:
+        raise DeadLetterRepairError("ledger_snapshot_noncanonical")
+    if (
+        set(snapshot)
+        != {
+            "schema_version",
+            "job_id",
+            "connection_id",
+            "account_number",
+            "server",
+            "history_mode",
+            "through",
+            "captured_at_utc",
+            "deal_count",
+            "anchor",
+            "rows",
+        }
+        or snapshot.get("schema_version") != 1
+        or snapshot.get("job_id") != binding["job_id"]
+        or snapshot.get("history_mode") != "all_available"
+        or snapshot.get("through") != binding["through"]
+        or snapshot.get("captured_at_utc") != binding["captured_at_utc"]
+        or snapshot.get("deal_count") != binding["deal_count"]
+        or snapshot.get("anchor") != anchor
+        or not isinstance(snapshot.get("rows"), list)
+        or any(not isinstance(row, dict) for row in snapshot["rows"])
+        or len(snapshot["rows"]) != binding["deal_count"]
+    ):
+        raise DeadLetterRepairError("ledger_snapshot_invalid")
+
     payload = dead_record["payload"]
-    _require_ledger_identity(request, report, payload)
+    _require_ledger_identity(request, report, snapshot, payload)
     deal_count = anchor.get("deal_count")
-    accounting_count = checkpoint.get("accounting_deals")
     if (
         not isinstance(deal_count, int)
         or isinstance(deal_count, bool)
         or deal_count <= 0
-        or accounting_count != deal_count
-        or isinstance(accounting_count, bool)
+        or deal_count != binding["deal_count"]
+        or anchor.get("order_basis") != "mt5_history_index_v1"
     ):
         raise DeadLetterRepairError("ledger_not_coherent")
     event_time = _parse_aware_datetime(payload.get("event_time"))
-    through = _parse_aware_datetime(checkpoint.get("through"))
+    # ``through`` is worker UTC acquisition metadata, while MT5 DEAL_TIME and anchor.as_of use
+    # unresolved broker-server time despite their legacy Z suffix. Never compare those clocks.
+    _parse_aware_datetime(snapshot.get("through"))
+    captured_at_utc = _parse_aware_datetime(snapshot.get("captured_at_utc"))
+    if captured_at_utc.utcoffset() != timedelta(0):
+        raise DeadLetterRepairError("ledger_time_invalid")
+    if require_fresh_evidence:
+        now_utc = datetime.now(timezone.utc)
+        if (
+            captured_at_utc > now_utc + _LEDGER_EVIDENCE_MAX_FUTURE_SKEW
+            or now_utc - captured_at_utc > _LEDGER_EVIDENCE_MAX_AGE
+        ):
+            raise DeadLetterRepairError("ledger_snapshot_stale")
     anchor_as_of = _parse_aware_datetime(anchor.get("as_of"))
-    if through < event_time or anchor_as_of < event_time:
+    if anchor_as_of < event_time:
         raise DeadLetterRepairError("ledger_not_fresh")
 
-    rows = _read_accounting_rows(instance_root / "data" / "history-accounting.jsonl")
-    if len(rows) != deal_count:
-        raise DeadLetterRepairError("ledger_not_complete")
-    row = _match_ledger_row(payload, tuple(rows.values()))
+    rows = _validated_snapshot_rows(snapshot["rows"], anchor)
+    snapshot_tickets = sorted(
+        (str(row["ticket"]) for row in rows),
+        key=lambda value: (len(value), value),
+    )
+    if snapshot_tickets != active_archived:
+        raise DeadLetterRepairError("ledger_handoff_not_active")
+    row = _match_ledger_row(payload, rows)
     deal_type = row.get("deal_type")
     position_id = row.get("position_id")
     order_id = row.get("order_id")
@@ -541,7 +871,9 @@ def _classify_from_coherent_ledger(
         raise DeadLetterRepairError("ledger_classification_ambiguous")
     if deal_type in _ACCOUNTING_DEAL_TYPES:
         if _has_strict_accounting_shape(row):
-            return LedgerDecision("non_trading_accounting", row, None)
+            return LedgerDecision(
+                "non_trading_accounting", row, None, binding["sha256"]
+            )
         raise DeadLetterRepairError("ledger_classification_ambiguous")
     if deal_type not in _TRADE_DEAL_TYPES:
         raise DeadLetterRepairError("ledger_classification_ambiguous")
@@ -578,26 +910,36 @@ def _classify_from_coherent_ledger(
         replacement["time_msc"] = row["time_msc"]
     if replacement.get("event_id") != payload.get("event_id"):
         raise DeadLetterRepairError("event_identity_changed")
-    return LedgerDecision("real_trade", row, replacement)
+    return LedgerDecision("real_trade", row, replacement, binding["sha256"])
 
 
 def _require_ledger_identity(
     request: RepairRequest,
     report: dict[str, Any],
+    snapshot: dict[str, Any],
     payload: dict[str, Any],
 ) -> None:
     try:
         report_connection_id = canonical_uuid(report.get("connection_id"))
+        snapshot_connection_id = canonical_uuid(snapshot.get("connection_id"))
         report_account = _normalize_account_number(report.get("account_number"))
+        snapshot_account = _normalize_account_number(snapshot.get("account_number"))
         payload_account = _normalize_account_number(payload.get("account_number"))
         report_server = _normalize_server(report.get("server"))
+        snapshot_server = _normalize_server(snapshot.get("server"))
         payload_server = _normalize_server(payload.get("server"))
     except (TypeError, ValueError, BrokerDiscoveryError) as exc:
         raise DeadLetterRepairError("ledger_identity_mismatch") from exc
     if (
         report_connection_id != request.connection_id
+        or snapshot_connection_id != request.connection_id
+        or snapshot_connection_id != report_connection_id
         or report_account != payload_account
+        or snapshot_account != payload_account
+        or snapshot_account != report_account
         or report_server != payload_server
+        or snapshot_server != payload_server
+        or snapshot_server != report_server
     ):
         raise DeadLetterRepairError("ledger_identity_mismatch")
 
@@ -643,26 +985,28 @@ def _number_is_positive(value: Any) -> bool:
     return parsed is not None and parsed > 0
 
 
-def _read_accounting_rows(path: Path) -> dict[str, dict[str, Any]]:
-    raw = _read_regular_bytes(path, max_bytes=_MAX_JSON_BYTES)
-    rows: dict[str, dict[str, Any]] = {}
-    for encoded_line in raw.splitlines():
-        if not encoded_line.strip():
-            continue
-        try:
-            document = json.loads(encoded_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DeadLetterRepairError("ledger_audit_invalid") from exc
-        record = document.get("record") if isinstance(document, dict) else None
-        if document.get("kind") != "accounting_deals" or not isinstance(record, dict):
-            raise DeadLetterRepairError("ledger_audit_invalid")
-        ticket = str(record.get("ticket", "")).strip()
-        if not ticket:
-            raise DeadLetterRepairError("ledger_audit_invalid")
-        previous = rows.get(ticket)
-        if previous is not None and _canonical_json_bytes(previous) != _canonical_json_bytes(record):
-            raise DeadLetterRepairError("ledger_audit_conflict")
-        rows[ticket] = record
+def _validated_snapshot_rows(
+    raw_rows: list[dict[str, Any]], anchor: dict[str, Any]
+) -> tuple[dict[str, Any], ...]:
+    rows = tuple(copy.deepcopy(row) for row in raw_rows)
+    tickets: set[str] = set()
+    for expected_index, row in enumerate(rows):
+        ticket = str(row.get("ticket", "")).strip()
+        if (
+            not ticket.isdecimal()
+            or int(ticket) <= 0
+            or ticket in tickets
+            or row.get("history_index") != expected_index
+        ):
+            raise DeadLetterRepairError("ledger_snapshot_invalid")
+        tickets.add(ticket)
+    last = rows[-1] if rows else {}
+    if (
+        str(anchor.get("last_deal_ticket", "0"))
+        != str(last.get("ticket", "0"))
+        or anchor.get("last_deal_time_msc", 0) != last.get("time_msc", 0)
+    ):
+        raise DeadLetterRepairError("ledger_not_coherent")
     return rows
 
 
@@ -735,6 +1079,7 @@ def _audit_document(
         "deployment_id": request.deployment_id,
         "classification": decision.classification,
         "record_sha256": request.expected_record_sha256,
+        "ledger_snapshot_sha256": decision.ledger_snapshot_sha256,
         "event_id_sha256": hashlib.sha256(payload["event_id"].encode("utf-8")).hexdigest(),
         "dead_letter_record": copy.deepcopy(dead_record),
         "ledger_record": copy.deepcopy(decision.row),
@@ -749,6 +1094,8 @@ def _validate_existing_audit(document: Any, request: RepairRequest) -> dict[str,
         or document.get("connection_id") != request.connection_id
         or document.get("deployment_id") != request.deployment_id
         or document.get("record_sha256") != request.expected_record_sha256
+        or document.get("ledger_snapshot_sha256")
+        != request.expected_ledger_snapshot_sha256
         or document.get("classification") not in ("real_trade", "non_trading_accounting")
         or not isinstance(document.get("dead_letter_record"), dict)
         or not isinstance(document.get("ledger_record"), dict)

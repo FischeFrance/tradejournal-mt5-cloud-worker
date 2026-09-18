@@ -7,7 +7,11 @@ import pytest
 
 from windows_agent import real_handlers
 from windows_agent.real_handlers import _run_history_sync
-from windows_agent.worker.history_balance import reconstruct_trade_deals
+from windows_agent.worker.history_balance import (
+    balance_ledger_snapshot_bytes,
+    balance_ledger_snapshot_filename,
+    reconstruct_trade_deals,
+)
 from windows_agent.worker.history_archive import history_document_bytes
 from windows_agent.worker.mql5_file_adapter import Mql5FileMt5Adapter
 from windows_agent.worker.history_sync import HistorySync
@@ -45,6 +49,8 @@ def test_history_sync_delivers_only_safe_projection_through_lease_archive(
         _deal(5, base + 5_000, 0, "B", "IN", commission=-1),
         _deal(6, base + 6_000, 1, "B", "INOUT", profit=5, commission=-1),
     ]
+    for history_index, row in enumerate(ledger):
+        row["history_index"] = history_index
     anchor = {
         "balance": 1_012,
         "credit": 0,
@@ -52,6 +58,10 @@ def test_history_sync_delivers_only_safe_projection_through_lease_archive(
         "deal_count": len(ledger),
         "last_deal_ticket": "6",
         "last_deal_time_msc": base + 6_000,
+        "order_basis": "mt5_history_index_v1",
+        "as_of": datetime.fromtimestamp(
+            (base + 7_000) / 1000, timezone.utc
+        ).isoformat(),
     }
     enriched = reconstruct_trade_deals(ledger, anchor)
 
@@ -154,6 +164,224 @@ def test_history_sync_delivers_only_safe_projection_through_lease_archive(
     report = json.loads((tmp_path / "data" / "history-balance-backfill.json").read_text())
     assert report["entries"]["A"]["source"] == "mt5_historical_ledger"
     assert report["entries"]["B"]["source"] == "not_available"
+    binding = report["ledger_snapshot"]
+    snapshot_path = tmp_path / "data" / binding["filename"]
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot = json.loads(snapshot_bytes)
+    assert snapshot_bytes == balance_ledger_snapshot_bytes(snapshot)
+    assert snapshot["history_mode"] == "all_available"
+    assert snapshot["deal_count"] == len(snapshot["rows"]) == 6
+    # The exact ledger evidence includes the accounting row excluded from report projection.
+    assert snapshot["rows"][0]["deal_type"] == 2
+    assert report["ledger_snapshot"] == {
+        "job_id": job["job_id"],
+        "filename": balance_ledger_snapshot_filename(
+            job["job_id"], hashlib.sha256(snapshot_bytes).hexdigest()
+        ),
+        "sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+        "deal_count": 6,
+        "history_mode": "all_available",
+        "through": snapshot["through"],
+        "captured_at_utc": snapshot["captured_at_utc"],
+    }
+
+
+def test_ledger_snapshot_is_durable_before_digest_bound_report(tmp_path, monkeypatch):
+    root = tmp_path / "instance"
+    (root / "state").mkdir(parents=True)
+    (root / "state" / "history.json").write_text(
+        json.dumps({"through": "2026-09-18T12:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    first = {
+        **_deal(1, 1_789_700_000_000, 0, "A", "IN"),
+        "history_index": 0,
+    }
+    first_anchor = {
+        "coherent": True,
+        "order_basis": "mt5_history_index_v1",
+        "deal_count": 1,
+        "last_deal_ticket": "1",
+        "last_deal_time_msc": first["time_msc"],
+        "as_of": "2026-09-18T11:59:00+00:00",
+    }
+    real_handlers._publish_balance_ledger_evidence(
+        root,
+        report_rows=[first],
+        ledger_rows=[first],
+        connection_id="33333333-3333-4333-8333-333333333333",
+        job_id="11111111-1111-4111-8111-111111111111",
+        account_number="42",
+        server="Demo",
+        anchor=first_anchor,
+    )
+    report_path = root / "data" / "history-balance-backfill.json"
+    old_report = report_path.read_bytes()
+
+    second = {**first, "deal_type": 13, "symbol": ""}
+    real_atomic_json = real_handlers.atomic_json
+
+    def crash_before_report(path, payload):
+        if Path(path).name == "history-balance-backfill.json":
+            raise OSError("simulated crash before report")
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(real_handlers, "atomic_json", crash_before_report)
+    with pytest.raises(OSError, match="simulated crash"):
+        real_handlers._publish_balance_ledger_evidence(
+            root,
+            report_rows=[],
+            ledger_rows=[second],
+            connection_id="33333333-3333-4333-8333-333333333333",
+            job_id="11111111-1111-4111-8111-111111111111",
+            account_number="42",
+            server="Demo",
+            anchor={**first_anchor, "last_deal_time_msc": second["time_msc"]},
+        )
+
+    assert report_path.read_bytes() == old_report
+    report = json.loads(old_report)
+    current_snapshot = (root / "data" / report["ledger_snapshot"]["filename"]).read_bytes()
+    assert hashlib.sha256(current_snapshot).hexdigest() == report["ledger_snapshot"][
+        "sha256"
+    ]
+    # A crash can leave an unreferenced candidate, but cannot rewrite the last committed
+    # content-addressed evidence bundle.
+    assert len(list((root / "data").glob("history-balance-ledger-*.json"))) == 2
+
+
+def test_handoff_rejects_same_ticket_with_changed_ledger_content(tmp_path):
+    root = tmp_path / "instance"
+    state = root / "state"
+    state.mkdir(parents=True)
+    state.joinpath("history.json").write_text(
+        json.dumps({"through": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+    job_id = "11111111-1111-4111-8111-111111111111"
+    connection_id = "33333333-3333-4333-8333-333333333333"
+    opening = {
+        **_deal(1, 1_789_700_000_000, 0, "A", "IN"),
+        "history_index": 0,
+    }
+    anchor = {
+        "coherent": True,
+        "order_basis": "mt5_history_index_v1",
+        "deal_count": 1,
+        "last_deal_ticket": "1",
+        "last_deal_time_msc": opening["time_msc"],
+        "as_of": "2026-09-18T15:06:00+00:00",
+    }
+    evidence = real_handlers._publish_balance_ledger_evidence(
+        root,
+        report_rows=[opening],
+        ledger_rows=[opening],
+        connection_id=connection_id,
+        job_id=job_id,
+        account_number="42",
+        server="Demo",
+        anchor=anchor,
+    )
+    assert evidence is not None
+    cancelled = {**opening, "deal_type": 13, "symbol": "", "position_id": "0"}
+
+    class Adapter:
+        snapshot = staticmethod(
+            lambda: {
+                "positions": {},
+                "orders": {},
+                "deals": {"1": cancelled},
+            }
+        )
+        checkpoint = staticmethod(lambda: {"sequence": 7})
+        acknowledge_events = staticmethod(lambda _sequence: None)
+
+    document = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "connection_id": connection_id,
+        "account_number": "42",
+        "server": "Demo",
+        "history_mode": "all_available",
+        "from_date": None,
+        "trades": [
+            {
+                "external_trade_id": "A",
+                "events": [{"native_deal_ticket": "1"}],
+            }
+        ],
+    }
+
+    with pytest.raises(
+        real_handlers.HistorySyncFailed,
+        match="history handoff ledger evidence boundary mismatch",
+    ):
+        real_handlers._persist_history_handoff_artifact(
+            Adapter(),
+            root,
+            job_id=job_id,
+            connection_id=connection_id,
+            archive_path=state / "history-import-test.json",
+            archive_preexisting=False,
+            document=document,
+            history_counts={"orders": 0, "deals": 1, "accounting_deals": 1},
+            ledger_evidence=evidence,
+        )
+
+
+@pytest.mark.parametrize("mode", ["new_only", "from_date"])
+def test_partial_history_modes_do_not_overwrite_full_ledger_evidence(tmp_path, mode):
+    root = tmp_path / mode
+    data = root / "data"
+    data.mkdir(parents=True)
+    snapshot_path = data / "history-balance-ledger-existing.json"
+    report_path = data / "history-balance-backfill.json"
+    snapshot_path.write_bytes(b'{"full":"snapshot"}\n')
+    report_path.write_bytes(b'{"bound":"report"}\n')
+    before = (snapshot_path.read_bytes(), report_path.read_bytes())
+
+    class Adapter:
+        history_snapshot_atomic = True
+        history_orders = staticmethod(lambda _start, _end: ())
+        history_deals = staticmethod(lambda _start, _end: ())
+        history_accounting_deals = staticmethod(lambda _start, _end: ())
+        history_anchor = staticmethod(lambda: None)
+        history_balance_rows = staticmethod(lambda: ())
+        snapshot = staticmethod(lambda: {"positions": {}, "orders": {}, "deals": {}})
+        checkpoint = staticmethod(lambda: {"sequence": 0})
+        acknowledge_events = staticmethod(lambda _sequence: None)
+
+    class Api:
+        @staticmethod
+        def import_history_file(_job_id, _lease_id, document):
+            accepted = sum(len(group["events"]) for group in document["trades"])
+            return {
+                "api_version": "1",
+                "accepted": accepted,
+                "inserted": accepted,
+                "duplicates": 0,
+                "object_deleted": True,
+            }
+
+    if mode == "new_only":
+        _run_history_sync(Adapter(), root, mode, None)
+    else:
+        _run_history_sync(
+            Adapter(),
+            root,
+            mode,
+            datetime(2026, 9, 17, tzinfo=timezone.utc),
+            Api(),
+            {
+                "job_id": "11111111-1111-4111-8111-111111111111",
+                "lease_id": "22222222-2222-4222-8222-222222222222",
+            },
+            "33333333-3333-4333-8333-333333333333",
+            "42",
+            "Demo",
+        )
+
+    assert (snapshot_path.read_bytes(), report_path.read_bytes()) == before
 
 
 def test_from_date_fails_closed_without_verified_broker_timezone(tmp_path):

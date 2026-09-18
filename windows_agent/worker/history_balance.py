@@ -10,6 +10,8 @@ marked unavailable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
@@ -32,6 +34,53 @@ OPEN_ENTRIES = frozenset({"0", "IN"})
 EXIT_ENTRIES = frozenset({"1", "2", "3", "OUT", "INOUT", "OUT_BY"})
 ECONOMIC_FIELDS = ("profit", "commission", "swap", "fee")
 VOLUME_TOLERANCE = Decimal("0.00000001")
+BALANCE_LEDGER_SNAPSHOT_PREFIX = "history-balance-ledger-"
+
+
+def balance_ledger_snapshot_filename(job_id: str, snapshot_sha256: str) -> str:
+    job_key = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
+    return f"{BALANCE_LEDGER_SNAPSHOT_PREFIX}{job_key}-{snapshot_sha256}.json"
+
+
+def balance_ledger_snapshot_bytes(document: dict[str, Any]) -> bytes:
+    """Return the exact canonical bytes persisted by ``state_store.atomic_json``."""
+
+    return (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def balance_ledger_snapshot_sha256(document: dict[str, Any]) -> str:
+    return hashlib.sha256(balance_ledger_snapshot_bytes(document)).hexdigest()
+
+
+def build_balance_ledger_snapshot(
+    rows: Iterable[dict[str, Any]],
+    *,
+    connection_id: str,
+    job_id: str,
+    account_number: str,
+    server: str,
+    through: str,
+    captured_at_utc: str,
+    anchor: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze the exact full-ledger projection used by privileged repair tooling."""
+
+    materialized = [dict(row) for row in rows]
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "connection_id": connection_id,
+        "account_number": account_number,
+        "server": server,
+        "history_mode": "all_available",
+        "through": through,
+        "captured_at_utc": captured_at_utc,
+        "deal_count": len(materialized),
+        "anchor": dict(anchor),
+        "rows": materialized,
+    }
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -344,6 +393,7 @@ def build_balance_backfill_report(
     account_number: str,
     server: str,
     anchor: dict[str, Any] | None,
+    ledger_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entries: dict[str, dict[str, Any]] = {}
     for row in projected_deals:
@@ -361,7 +411,7 @@ def build_balance_backfill_report(
             "opening_order_id": str(row.get("order_id", "")),
             "opening_time_msc": row.get("time_msc"),
         }
-    return {
+    report = {
         "schema_version": 1,
         "connection_id": connection_id,
         "account_number": account_number,
@@ -370,3 +420,6 @@ def build_balance_backfill_report(
         "source": "mt5_historical_ledger",
         "entries": entries,
     }
+    if ledger_snapshot is not None:
+        report["ledger_snapshot"] = dict(ledger_snapshot)
+    return report
