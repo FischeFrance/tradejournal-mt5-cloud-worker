@@ -87,7 +87,13 @@ from .worker.history_archive import (
     load_or_create_history_document,
     validate_history_document,
 )
-from .worker.history_balance import build_balance_backfill_report
+from .worker.history_balance import (
+    balance_ledger_snapshot_bytes,
+    balance_ledger_snapshot_filename,
+    balance_ledger_snapshot_sha256,
+    build_balance_backfill_report,
+    build_balance_ledger_snapshot,
+)
 from .worker.history_sync import HistoryMode, HistorySync
 from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
@@ -1829,6 +1835,99 @@ def _rematerialize_canonical_history_stage(path: Path, document: dict[str, Any])
         atomic_json(path, document)
 
 
+def _publish_balance_ledger_evidence(
+    root: Path,
+    *,
+    report_rows: list[dict[str, Any]],
+    ledger_rows: list[dict[str, Any]],
+    connection_id: str,
+    job_id: str,
+    account_number: str,
+    server: str,
+    anchor: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Publish snapshot before its digest-bound report so every crash fails closed."""
+
+    if not isinstance(anchor, dict) or anchor.get("coherent") is not True:
+        return None
+    deal_count = anchor.get("deal_count")
+    if (
+        not isinstance(deal_count, int)
+        or isinstance(deal_count, bool)
+        or deal_count != len(ledger_rows)
+        or anchor.get("order_basis") != "mt5_history_index_v1"
+        or [row.get("history_index") for row in ledger_rows]
+        != list(range(len(ledger_rows)))
+    ):
+        raise HistorySyncFailed("history ledger snapshot incoherent")
+    last = ledger_rows[-1] if ledger_rows else {}
+    if (
+        str(anchor.get("last_deal_ticket", "0"))
+        != str(last.get("ticket", "0"))
+        or anchor.get("last_deal_time_msc", 0) != last.get("time_msc", 0)
+    ):
+        raise HistorySyncFailed("history ledger snapshot high-water mismatch")
+
+    checkpoint = read_json(root / "state" / "history.json", {})
+    through = checkpoint.get("through")
+    if not isinstance(through, str) or not through:
+        raise HistorySyncFailed("history ledger checkpoint invalid")
+    snapshot = build_balance_ledger_snapshot(
+        ledger_rows,
+        connection_id=connection_id,
+        job_id=job_id,
+        account_number=account_number,
+        server=server,
+        through=through,
+        captured_at_utc=datetime.now(timezone.utc).isoformat(),
+        anchor=anchor,
+    )
+    snapshot_bytes = balance_ledger_snapshot_bytes(snapshot)
+    snapshot_sha256 = balance_ledger_snapshot_sha256(snapshot)
+    snapshot_filename = balance_ledger_snapshot_filename(job_id, snapshot_sha256)
+    snapshot_path = root / "data" / snapshot_filename
+
+    # Publish immutable content-addressed bytes before moving the report pointer. A crash can
+    # leave an unreferenced candidate, but it cannot damage the last committed bundle.
+    if snapshot_path.exists():
+        try:
+            existing_snapshot = snapshot_path.read_bytes()
+        except OSError as exc:
+            raise HistorySyncFailed("history ledger snapshot unavailable") from exc
+        if existing_snapshot != snapshot_bytes:
+            raise HistorySyncFailed("history ledger snapshot immutable conflict")
+    else:
+        atomic_json(snapshot_path, snapshot)
+    try:
+        persisted_snapshot = snapshot_path.read_bytes()
+    except OSError as exc:
+        raise HistorySyncFailed("history ledger snapshot unavailable") from exc
+    if persisted_snapshot != snapshot_bytes or hashlib.sha256(
+        persisted_snapshot
+    ).hexdigest() != snapshot_sha256:
+        raise HistorySyncFailed("history ledger snapshot digest mismatch")
+
+    binding = {
+        "job_id": job_id,
+        "filename": snapshot_filename,
+        "sha256": snapshot_sha256,
+        "deal_count": len(ledger_rows),
+        "history_mode": "all_available",
+        "through": through,
+        "captured_at_utc": snapshot["captured_at_utc"],
+    }
+    report = build_balance_backfill_report(
+        report_rows,
+        connection_id=connection_id,
+        account_number=account_number,
+        server=server,
+        anchor=anchor,
+        ledger_snapshot=binding,
+    )
+    atomic_json(root / "data" / "history-balance-backfill.json", report)
+    return binding
+
+
 def _run_history_sync(
     adapter: Any,
     root: Path,
@@ -1868,6 +1967,7 @@ def _run_history_sync(
     history_events: list[dict[str, Any]] = []
     history_event_ids: set[str] = set()
     projected_deals: list[dict[str, Any]] = []
+    accounting_rows: list[dict[str, Any]] = []
     local_persist = _deduped_sink(dedup, local_sink)
     local_accounting_persist = _deduped_sink(dedup, accounting_sink)
 
@@ -1893,12 +1993,20 @@ def _run_history_sync(
                 history_event_ids.add(event_id)
                 history_events.append(event)
 
+    def persist_accounting(entry: dict) -> None:
+        record = dict(entry.get("record") or {})
+        if entry.get("kind") == "accounting_deals":
+            # This in-memory list is the exact current adapter scan. Keep the append-only sink
+            # for diagnostics, but never use its ticket-deduplicated contents as repair evidence.
+            accounting_rows.append(record)
+        local_accounting_persist(entry)
+
     try:
         counts = HistorySync(
             adapter,
             root / "state" / "history.json",
             persist,
-            local_accounting_persist,
+            persist_accounting,
         ).run(mode, from_date)
         anchor_reader = getattr(adapter, "history_anchor", None)
         anchor = anchor_reader() if callable(anchor_reader) else None
@@ -1908,15 +2016,24 @@ def _run_history_sync(
             if callable(report_rows_reader)
             else projected_deals
         )
-        if login is not None and server is not None and connection_id is not None:
-            report = build_balance_backfill_report(
-                report_rows,
+        ledger_evidence: dict[str, Any] | None = None
+        if (
+            mode == "all_available"
+            and login is not None
+            and server is not None
+            and connection_id is not None
+            and bool(getattr(adapter, "history_snapshot_atomic", False))
+        ):
+            ledger_evidence = _publish_balance_ledger_evidence(
+                root,
+                report_rows=report_rows,
+                ledger_rows=accounting_rows,
                 connection_id=connection_id,
+                job_id=str(job["job_id"]),
                 account_number=login,
                 server=server,
                 anchor=anchor,
             )
-            atomic_json(root / "data" / "history-balance-backfill.json", report)
         if mode != "new_only":
             if api is None or job is None or connection_id is None or login is None or server is None:
                 raise HistorySyncFailed("lease-bound history delivery context missing")
@@ -1944,6 +2061,7 @@ def _run_history_sync(
                     archive_path=archive_path,
                     archive_preexisting=True,
                     document=document,
+                    ledger_evidence=ledger_evidence,
                 )
             else:
                 # The pending bundle is the first durable commit: it contains both the exact
@@ -2004,6 +2122,7 @@ def _run_history_sync(
                         ),
                         archive_preexisting=True,
                         document=document,
+                        ledger_evidence=ledger_evidence,
                     )
                     if not handoff_persisted:
                         raise HistorySyncFailed(
@@ -2033,6 +2152,7 @@ def _run_history_sync(
                         archive_preexisting=False,
                         document=document,
                         history_counts=counts,
+                        ledger_evidence=ledger_evidence,
                     )
                 if not staged_preexisting:
                     atomic_json(staged_archive_path, document)
@@ -2265,6 +2385,94 @@ def _resume_committed_history_delivery(
     return counts
 
 
+def _validated_handoff_ledger_evidence(
+    root: Path,
+    value: object,
+    *,
+    job_id: str,
+    history_mode: object,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if (
+        history_mode != "all_available"
+        or not isinstance(value, dict)
+        or set(value)
+        != {
+            "job_id",
+            "filename",
+            "sha256",
+            "deal_count",
+            "history_mode",
+            "through",
+            "captured_at_utc",
+        }
+        or value.get("job_id") != job_id
+        or value.get("filename")
+        != balance_ledger_snapshot_filename(job_id, str(value.get("sha256", "")))
+        or value.get("history_mode") != "all_available"
+        or not isinstance(value.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+        or not isinstance(value.get("deal_count"), int)
+        or isinstance(value.get("deal_count"), bool)
+        or value["deal_count"] < 0
+        or not isinstance(value.get("through"), str)
+        or not isinstance(value.get("captured_at_utc"), str)
+    ):
+        raise HistorySyncFailed("history handoff ledger evidence invalid")
+    snapshot_path = root / "data" / value["filename"]
+    try:
+        digest = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise HistorySyncFailed("history handoff ledger evidence unavailable") from exc
+    if digest != value["sha256"]:
+        raise HistorySyncFailed("history handoff ledger evidence digest mismatch")
+    return dict(value)
+
+
+def _handoff_ledger_rows_by_ticket(
+    root: Path, evidence: dict[str, Any], *, connection_id: str
+) -> dict[str, dict[str, Any]]:
+    snapshot = read_json(root / "data" / evidence["filename"], {})
+    rows = snapshot.get("rows") if isinstance(snapshot, dict) else None
+    anchor = snapshot.get("anchor") if isinstance(snapshot, dict) else None
+    if (
+        snapshot.get("schema_version") != 1
+        or snapshot.get("job_id") != evidence["job_id"]
+        or snapshot.get("connection_id") != connection_id
+        or snapshot.get("history_mode") != "all_available"
+        or snapshot.get("deal_count") != evidence["deal_count"]
+        or snapshot.get("through") != evidence["through"]
+        or snapshot.get("captured_at_utc") != evidence["captured_at_utc"]
+        or not isinstance(anchor, dict)
+        or anchor.get("coherent") is not True
+        or anchor.get("deal_count") != evidence["deal_count"]
+        or not isinstance(rows, list)
+        or len(rows) != evidence["deal_count"]
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise HistorySyncFailed("history handoff ledger snapshot invalid")
+    tickets = [str(row.get("ticket", "")) for row in rows]
+    if (
+        any(not re.fullmatch(r"[0-9]{1,32}", ticket) for ticket in tickets)
+        or len(set(tickets)) != len(tickets)
+    ):
+        raise HistorySyncFailed("history handoff ledger tickets invalid")
+    return {
+        ticket: dict(row)
+        for ticket, row in zip(tickets, rows)
+    }
+
+
+def _handoff_ledger_tickets(
+    root: Path, evidence: dict[str, Any], *, connection_id: str
+) -> list[str]:
+    rows = _handoff_ledger_rows_by_ticket(
+        root, evidence, connection_id=connection_id
+    )
+    return sorted(rows, key=lambda value: (len(value), value))
+
+
 def _persist_history_handoff_artifact(
     adapter: Any,
     root: Path,
@@ -2276,6 +2484,7 @@ def _persist_history_handoff_artifact(
     archive_preexisting: bool,
     document: dict[str, Any],
     history_counts: dict[str, int] | None = None,
+    ledger_evidence: dict[str, Any] | None = None,
 ) -> bool:
     """Bind the frozen position baseline to the immutable uploaded history bytes.
 
@@ -2307,8 +2516,32 @@ def _persist_history_handoff_artifact(
         except OSError as exc:
             raise HistorySyncFailed("history archive digest unavailable") from exc
     pending_path = root / "state" / "history-handoff-pending.json"
+    history_mode = document.get("history_mode")
     if archive_preexisting:
         artifact = read_json(pending_path, {})
+        artifact_ledger_evidence = _validated_handoff_ledger_evidence(
+            root,
+            artifact.get("ledger_evidence"),
+            job_id=job_id,
+            history_mode=history_mode,
+        )
+        expected_ledger_evidence = (
+            _validated_handoff_ledger_evidence(
+                root,
+                ledger_evidence,
+                job_id=job_id,
+                history_mode=history_mode,
+            )
+            if ledger_evidence is not None
+            else artifact_ledger_evidence
+        )
+        artifact_ledger_tickets = (
+            _handoff_ledger_tickets(
+                root, artifact_ledger_evidence, connection_id=connection_id
+            )
+            if artifact_ledger_evidence is not None
+            else None
+        )
         expected_archive_name = archive_path.name
         artifact_counts = _validated_history_counts(
             artifact.get("history_counts"), document
@@ -2324,6 +2557,17 @@ def _persist_history_handoff_artifact(
             or artifact.get("connection_id") != connection_id
             or artifact.get("history_document") != expected_archive_name
             or artifact.get("history_document_sha256") != archive_digest
+            or artifact.get("history_mode") != history_mode
+            or artifact_ledger_evidence != expected_ledger_evidence
+            or (
+                artifact_ledger_evidence is not None
+                and (
+                    artifact_ledger_evidence["deal_count"]
+                    != artifact_counts["accounting_deals"]
+                    or artifact_ledger_tickets
+                    != artifact.get("archived_deal_tickets")
+                )
+            )
             or "history_counts" not in artifact
             or artifact_counts != expected_counts
             or (
@@ -2335,6 +2579,12 @@ def _persist_history_handoff_artifact(
         return True
 
     normalized_counts = _validated_history_counts(history_counts, document)
+    normalized_ledger_evidence = _validated_handoff_ledger_evidence(
+        root,
+        ledger_evidence,
+        job_id=job_id,
+        history_mode=history_mode,
+    )
     snapshot = snapshot_reader()
     checkpoint = checkpoint_reader()
     sequence = checkpoint.get("sequence") if isinstance(checkpoint, dict) else None
@@ -2346,6 +2596,8 @@ def _persist_history_handoff_artifact(
     orders = snapshot.get("orders")
     deals = snapshot.get("deals")
     if not all(isinstance(value, dict) for value in (positions, orders, deals)):
+        raise HistorySyncFailed("history handoff snapshot invalid")
+    if any(not isinstance(row, dict) for row in deals.values()):
         raise HistorySyncFailed("history handoff snapshot invalid")
 
     imported_deal_tickets = _history_document_deal_tickets(document)
@@ -2359,6 +2611,21 @@ def _persist_history_handoff_artifact(
         raise HistorySyncFailed("history handoff ledger identity invalid")
     if not set(imported_deal_tickets).issubset(set(anchored_deal_tickets)):
         raise HistorySyncFailed("history handoff ledger membership mismatch")
+    if normalized_ledger_evidence is not None:
+        evidence_rows = _handoff_ledger_rows_by_ticket(
+            root,
+            normalized_ledger_evidence,
+            connection_id=connection_id,
+        )
+        if (
+            normalized_ledger_evidence["deal_count"]
+            != normalized_counts["accounting_deals"]
+            or sorted(evidence_rows, key=lambda value: (len(value), value))
+            != anchored_deal_tickets
+            or evidence_rows
+            != {str(ticket): dict(row) for ticket, row in deals.items()}
+        ):
+            raise HistorySyncFailed("history handoff ledger evidence boundary mismatch")
     atomic_json(
         pending_path,
         {
@@ -2367,6 +2634,8 @@ def _persist_history_handoff_artifact(
             "connection_id": connection_id,
             "history_document": archive_path.name,
             "history_document_sha256": archive_digest,
+            "history_mode": history_mode,
+            "ledger_evidence": normalized_ledger_evidence,
             # The document and the frozen baseline form one atomic recovery bundle. Keeping the
             # payload here lets a retry materialize missing staging bytes without querying MT5
             # again or moving the history/live boundary.
@@ -2396,10 +2665,17 @@ def _prepare_history_to_live_handoff(adapter: Any, root: Path) -> int:
     acknowledge = getattr(adapter, "acknowledge_events", None)
     archive_name = artifact.get("history_document")
     archive_digest = artifact.get("history_document_sha256")
+    history_mode = artifact.get("history_mode")
     sequence = artifact.get("anchor_sequence")
     snapshot = artifact.get("snapshot")
     tickets = artifact.get("archived_deal_tickets")
     imported_tickets = artifact.get("imported_deal_tickets")
+    ledger_evidence = _validated_handoff_ledger_evidence(
+        root,
+        artifact.get("ledger_evidence"),
+        job_id=str(artifact.get("job_id", "")),
+        history_mode=history_mode,
+    )
     if (
         artifact.get("schema_version") != 1
         or artifact.get("connection_id") != root.name
@@ -2443,6 +2719,8 @@ def _prepare_history_to_live_handoff(adapter: Any, root: Path) -> int:
             and active.get("job_id") == artifact["job_id"]
             and active.get("connection_id") == root.name
             and active.get("history_document_sha256") == archive_digest
+            and active.get("history_mode") == history_mode
+            and active.get("ledger_evidence") == ledger_evidence
             and active.get("anchor_sequence") == sequence
             and active.get("archived_deal_tickets") == tickets
             and active.get("imported_deal_tickets") == imported_tickets
@@ -2466,6 +2744,8 @@ def _prepare_history_to_live_handoff(adapter: Any, root: Path) -> int:
             "job_id": artifact["job_id"],
             "connection_id": root.name,
             "history_document_sha256": archive_digest,
+            "history_mode": history_mode,
+            "ledger_evidence": ledger_evidence,
             "anchor_sequence": sequence,
             "archived_deal_tickets": tickets,
             "imported_deal_tickets": imported_tickets,

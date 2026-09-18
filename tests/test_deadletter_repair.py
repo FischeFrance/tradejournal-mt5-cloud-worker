@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -16,9 +18,23 @@ from windows_agent.deadletter_repair import (
     RepairRequest,
     repair_live_dead_letter,
 )
+from windows_agent.worker.history_balance import (
+    balance_ledger_snapshot_bytes,
+    balance_ledger_snapshot_filename,
+)
 
 
 CID = "0973451f-9b9c-4da7-ac53-8de1bc5b5949"
+JOB_ID = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture(autouse=True)
+def _model_stopped_terminal(monkeypatch):
+    monkeypatch.setattr(
+        repair_module.ProcessManager,
+        "find_under",
+        staticmethod(lambda _root: []),
+    )
 
 
 class _PermanentReject:
@@ -80,7 +96,7 @@ def _payload(**overrides):
 
 def _ledger_row(**overrides):
     value = {
-        "history_index": 9,
+        "history_index": 0,
         "ticket": "9001",
         "position_id": "7001",
         "order_id": "8001",
@@ -106,6 +122,13 @@ def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
+def _write_ledger_snapshot(path: Path, value) -> str:
+    payload = balance_ledger_snapshot_bytes(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _fixture(tmp_path: Path, *, row=None, payload=None):
     instances = tmp_path / "instances"
     instance = instances / CID
@@ -113,6 +136,7 @@ def _fixture(tmp_path: Path, *, row=None, payload=None):
     data = instance / "data"
     state.mkdir(parents=True)
     data.mkdir(parents=True)
+    (instance / "terminal").mkdir()
     payload = payload or _payload()
     row = row or _ledger_row()
     outbox_path = state / "live-outbox.json"
@@ -132,26 +156,128 @@ def _fixture(tmp_path: Path, *, row=None, payload=None):
             "accounting_deals": 1,
         },
     )
+    captured_at_utc = datetime.now(timezone.utc).isoformat()
+    through = captured_at_utc
+    anchor = {
+        "coherent": True,
+        "order_basis": "mt5_history_index_v1",
+        "deal_count": 1,
+        "last_deal_ticket": str(row["ticket"]),
+        "last_deal_time_msc": row["time_msc"],
+        "balance": 10000.0,
+        "credit": 0.0,
+        "as_of": "2026-09-18T15:06:00+00:00",
+    }
+    snapshot = {
+        "schema_version": 1,
+        "job_id": JOB_ID,
+        "connection_id": CID,
+        "account_number": "sensitive-account",
+        "server": "Sensitive Broker",
+        "history_mode": "all_available",
+        "through": through,
+        "captured_at_utc": captured_at_utc,
+        "deal_count": 1,
+        "anchor": anchor,
+        "rows": [row],
+    }
+    snapshot_digest = hashlib.sha256(balance_ledger_snapshot_bytes(snapshot)).hexdigest()
+    snapshot_filename = balance_ledger_snapshot_filename(JOB_ID, snapshot_digest)
+    snapshot_path = data / snapshot_filename
+    assert _write_ledger_snapshot(snapshot_path, snapshot) == snapshot_digest
+    binding = {
+        "job_id": JOB_ID,
+        "filename": snapshot_filename,
+        "sha256": snapshot_digest,
+        "deal_count": 1,
+        "history_mode": "all_available",
+        "through": through,
+        "captured_at_utc": captured_at_utc,
+    }
+    report = {
+        "schema_version": 1,
+        "connection_id": CID,
+        "account_number": "sensitive-account",
+        "server": "Sensitive Broker",
+        "source": "mt5_historical_ledger",
+        "anchor": anchor,
+        "ledger_snapshot": binding,
+        "entries": {},
+    }
+    _write_json(data / "history-balance-backfill.json", report)
+    imported_tickets = (
+        [str(row["ticket"])]
+        if row.get("deal_type") in (0, 1)
+        and str(row.get("position_id", "0")) != "0"
+        and str(row.get("symbol", "")).strip()
+        else []
+    )
+    archive = {
+        "schema_version": 1,
+        "job_id": JOB_ID,
+        "connection_id": CID,
+        "account_number": "sensitive-account",
+        "server": "Sensitive Broker",
+        "history_mode": "all_available",
+        "from_date": None,
+        "trades": (
+            [
+                {
+                    "external_trade_id": str(row.get("position_id", "0")),
+                    "events": [
+                        {
+                            "event_id": "fixture-history-event",
+                            "native_deal_ticket": str(row["ticket"]),
+                        }
+                    ],
+                }
+            ]
+            if imported_tickets
+            else []
+        ),
+    }
+    archive_key = hashlib.sha256(JOB_ID.encode("utf-8")).hexdigest()[:16]
+    archive_path = state / f"history-import-{archive_key}.json"
+    _write_json(archive_path, archive)
+    archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    handoff_common = {
+        "schema_version": 1,
+        "job_id": JOB_ID,
+        "connection_id": CID,
+        "history_mode": "all_available",
+        "history_document_sha256": archive_sha256,
+        "ledger_evidence": binding,
+        "anchor_sequence": 7,
+        "archived_deal_tickets": [str(row["ticket"])],
+        "imported_deal_tickets": imported_tickets,
+    }
     _write_json(
-        data / "history-balance-backfill.json",
+        state / "history-handoff-pending.json",
         {
-            "schema_version": 1,
-            "connection_id": CID,
-            "account_number": "sensitive-account",
-            "server": "Sensitive Broker",
-            "source": "mt5_historical_ledger",
-            "anchor": {
-                "coherent": True,
-                "deal_count": 1,
-                "balance": 10000.0,
-                "credit": 0.0,
-                "as_of": "2026-09-18T11:59:00+00:00",
+            **handoff_common,
+            "history_document": archive_path.name,
+            "history_document_payload": archive,
+            "history_counts": {
+                "orders": 0,
+                "deals": len(imported_tickets),
+                "accounting_deals": 1,
             },
-            "entries": {},
         },
     )
+    _write_json(
+        state / "history-live-handoff.json",
+        {**handoff_common, "schema_version": 2},
+    )
+    # Deliberately stale diagnostics must never participate in repair classification.
     (data / "history-accounting.jsonl").write_text(
-        json.dumps({"kind": "accounting_deals", "record": row}, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                "kind": "accounting_deals",
+                "record": {**row, "deal_type": 13, "symbol": ""},
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     request = RepairRequest(
@@ -159,6 +285,7 @@ def _fixture(tmp_path: Path, *, row=None, payload=None):
         deployment_id="test-deployment",
         expected_outbox_sha256=outbox_digest,
         expected_record_sha256=record_digest,
+        expected_ledger_snapshot_sha256=snapshot_digest,
     )
     return {
         "instances": instances,
@@ -168,7 +295,63 @@ def _fixture(tmp_path: Path, *, row=None, payload=None):
         "payload": payload,
         "record": record,
         "outbox_path": outbox_path,
+        "snapshot_path": snapshot_path,
+        "report_path": data / "history-balance-backfill.json",
+        "archive_path": archive_path,
     }
+
+
+def _replace_snapshot(env, rows) -> None:
+    snapshot = json.loads(env["snapshot_path"].read_text(encoding="utf-8"))
+    snapshot["rows"] = rows
+    snapshot["deal_count"] = len(rows)
+    snapshot["anchor"]["deal_count"] = len(rows)
+    last = rows[-1] if rows else {}
+    snapshot["anchor"]["last_deal_ticket"] = str(last.get("ticket", "0"))
+    snapshot["anchor"]["last_deal_time_msc"] = last.get("time_msc", 0)
+    _bind_snapshot(env, snapshot)
+
+
+def _bind_snapshot(env, snapshot, *, update_boundary=True) -> None:
+    """Install a new intentional evidence preimage without mutating the old bundle."""
+
+    snapshot_bytes = balance_ledger_snapshot_bytes(snapshot)
+    digest = hashlib.sha256(snapshot_bytes).hexdigest()
+    filename = balance_ledger_snapshot_filename(snapshot["job_id"], digest)
+    snapshot_path = env["instance"] / "data" / filename
+    assert _write_ledger_snapshot(snapshot_path, snapshot) == digest
+    binding = {
+        "job_id": snapshot["job_id"],
+        "filename": filename,
+        "sha256": digest,
+        "deal_count": snapshot["deal_count"],
+        "history_mode": snapshot["history_mode"],
+        "through": snapshot["through"],
+        "captured_at_utc": snapshot["captured_at_utc"],
+    }
+    report = json.loads(env["report_path"].read_text(encoding="utf-8"))
+    report["anchor"] = snapshot["anchor"]
+    report["ledger_snapshot"] = binding
+    report["account_number"] = snapshot["account_number"]
+    report["server"] = snapshot["server"]
+    _write_json(env["report_path"], report)
+    for name in ("history-handoff-pending.json", "history-live-handoff.json"):
+        path = env["instance"] / "state" / name
+        handoff = json.loads(path.read_text(encoding="utf-8"))
+        handoff["ledger_evidence"] = binding
+        if update_boundary:
+            tickets = sorted(
+                (str(row["ticket"]) for row in snapshot["rows"]),
+                key=lambda value: (len(value), value),
+            )
+            handoff["archived_deal_tickets"] = tickets
+            if name == "history-handoff-pending.json":
+                handoff["history_counts"]["accounting_deals"] = len(tickets)
+        _write_json(path, handoff)
+    env["request"] = replace(
+        env["request"], expected_ledger_snapshot_sha256=digest
+    )
+    env["snapshot_path"] = snapshot_path
 
 
 def _assert_private(path: Path) -> None:
@@ -235,6 +418,172 @@ def test_duplicate_acknowledgement_is_success(tmp_path):
 
     assert result["outcome"] == "duplicate"
     assert result["dead_letter_count"] == result["pending_count"] == 0
+
+
+def test_completed_real_trade_receipt_short_circuits_without_resend(tmp_path):
+    env = _fixture(tmp_path)
+    sender = _RepairSender(outcome="ok")
+
+    first = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=sender,
+    )
+    second = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=sender,
+    )
+
+    assert second == first
+    assert len(sender.payloads) == 1
+
+
+def test_running_terminal_target_blocks_repair_before_mutation(tmp_path, monkeypatch):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    monkeypatch.setattr(
+        repair_module.ProcessManager,
+        "find_under",
+        staticmethod(lambda _root: [4242]),
+    )
+
+    with pytest.raises(DeadLetterRepairError, match="terminal_must_be_stopped"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert not env["rollback"].exists()
+
+
+def test_stale_full_ledger_evidence_blocks_first_attempt(tmp_path):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    snapshot = json.loads(env["snapshot_path"].read_text(encoding="utf-8"))
+    snapshot["captured_at_utc"] = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat()
+    _bind_snapshot(env, snapshot)
+
+    with pytest.raises(DeadLetterRepairError, match="ledger_snapshot_stale"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert not env["rollback"].exists()
+
+
+def test_worker_utc_through_is_not_compared_to_broker_clock(tmp_path):
+    env = _fixture(tmp_path)
+    snapshot = json.loads(env["snapshot_path"].read_text(encoding="utf-8"))
+    # The worker acquisition cursor can be behind a broker-server timestamp by hours.
+    snapshot["through"] = "2026-09-17T12:00:00+00:00"
+    _bind_snapshot(env, snapshot)
+
+    result = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=_RepairSender(),
+    )
+
+    assert result["classification"] == "real_trade"
+
+
+def test_stale_append_only_ledger_is_ignored_in_favor_of_bound_snapshot(tmp_path):
+    env = _fixture(tmp_path)
+    # The fixture deliberately stores BUY_CANCELED in the legacy JSONL while the current,
+    # digest-bound full snapshot contains the exact BUY opening.
+    sender = _RepairSender()
+
+    result = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=sender,
+    )
+
+    assert result["classification"] == "real_trade"
+    assert sender.payloads[0]["symbol"] == "EURUSD"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "digest-mismatch"])
+def test_missing_or_mutated_bound_snapshot_never_mutates(tmp_path, mutation):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    if mutation == "missing":
+        env["snapshot_path"].unlink()
+        expected = "ledger_snapshot_unavailable"
+    else:
+        env["snapshot_path"].write_bytes(env["snapshot_path"].read_bytes() + b" ")
+        expected = "ledger_snapshot_digest_mismatch"
+
+    with pytest.raises(DeadLetterRepairError, match=expected):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert not env["rollback"].exists()
+    assert not (env["instance"] / "state" / "dead-letter-resolutions").exists()
+
+
+def test_current_cancelled_snapshot_wins_over_stale_buy_jsonl(tmp_path):
+    cancelled = _ledger_row(
+        deal_type=13,
+        position_id="0",
+        order_id="0",
+        symbol="",
+        volume=0,
+        price=0,
+    )
+    env = _fixture(
+        tmp_path,
+        row=cancelled,
+        payload=_payload(external_trade_id="9001", volume=0, open_price=0),
+    )
+    legacy = env["instance"] / "data" / "history-accounting.jsonl"
+    legacy.write_text(
+        json.dumps(
+            {"kind": "accounting_deals", "record": _ledger_row()}, sort_keys=True
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original = env["outbox_path"].read_bytes()
+    sender = _RepairSender()
+
+    with pytest.raises(DeadLetterRepairError, match="ledger_classification_ambiguous"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=sender,
+        )
+
+    assert sender.payloads == []
+    assert env["outbox_path"].read_bytes() == original
 
 
 def test_real_trade_delivery_never_drains_successor_enqueued_during_send(tmp_path):
@@ -461,11 +810,10 @@ def test_ledger_report_identity_mismatch_never_mutates(tmp_path, field, value):
 
 def test_ledger_report_identity_uses_existing_exact_normalizers(tmp_path):
     env = _fixture(tmp_path)
-    report_path = env["instance"] / "data" / "history-balance-backfill.json"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    report["account_number"] = "  sensitive-account  "
-    report["server"] = "  SENSITIVE   broker  "
-    _write_json(report_path, report)
+    snapshot = json.loads(env["snapshot_path"].read_text(encoding="utf-8"))
+    snapshot["account_number"] = "  sensitive-account  "
+    snapshot["server"] = "  SENSITIVE   broker  "
+    _bind_snapshot(env, snapshot)
 
     result = repair_live_dead_letter(
         env["request"],
@@ -482,7 +830,7 @@ def test_ledger_report_identity_uses_existing_exact_normalizers(tmp_path):
     "mutation,expected_error",
     [
         ("incoherent", "ledger_not_coherent"),
-        ("incomplete", "ledger_not_complete"),
+        ("incomplete", "ledger_snapshot_invalid"),
         ("ambiguous", "ledger_match_ambiguous"),
     ],
 )
@@ -492,32 +840,24 @@ def test_ambiguous_or_unverified_ledger_never_mutates_outbox(
     env = _fixture(tmp_path)
     original = env["outbox_path"].read_bytes()
     report_path = env["instance"] / "data" / "history-balance-backfill.json"
-    audit_path = env["instance"] / "data" / "history-accounting.jsonl"
     if mutation == "incoherent":
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["anchor"]["coherent"] = False
         _write_json(report_path, report)
     elif mutation == "incomplete":
-        audit_path.write_text("", encoding="utf-8")
+        snapshot = json.loads(env["snapshot_path"].read_text(encoding="utf-8"))
+        snapshot["rows"] = []
+        # Keep the bound count unchanged to model a truncated but freshly hashed snapshot.
+        _bind_snapshot(env, snapshot, update_boundary=False)
     else:
         first = _ledger_row()
-        second = {**first, "ticket": "9002", "order_id": "7001"}
-        audit_path.write_text(
-            "\n".join(
-                json.dumps({"kind": "accounting_deals", "record": row}, sort_keys=True)
-                for row in (first, second)
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-        report["anchor"]["deal_count"] = 2
-        _write_json(report_path, report)
-        checkpoint = json.loads(
-            (env["instance"] / "state" / "history.json").read_text(encoding="utf-8")
-        )
-        checkpoint["accounting_deals"] = 2
-        _write_json(env["instance"] / "state" / "history.json", checkpoint)
+        second = {
+            **first,
+            "history_index": 1,
+            "ticket": "9002",
+            "order_id": "7001",
+        }
+        _replace_snapshot(env, [first, second])
 
     with pytest.raises(DeadLetterRepairError, match=expected_error):
         repair_live_dead_letter(
@@ -540,6 +880,9 @@ def test_outbox_preimage_mismatch_fails_before_backup_or_audit(tmp_path):
         deployment_id="test-deployment",
         expected_outbox_sha256="0" * 64,
         expected_record_sha256=env["request"].expected_record_sha256,
+        expected_ledger_snapshot_sha256=(
+            env["request"].expected_ledger_snapshot_sha256
+        ),
     )
 
     with pytest.raises(DeadLetterRepairError, match="outbox_preimage_mismatch"):
@@ -591,6 +934,92 @@ def test_transient_delivery_stays_dead_lettered_and_rerun_can_confirm_duplicate(
     )
     assert result["outcome"] == "duplicate"
     assert EventOutbox(str(env["outbox_path"])).pending_count() == 0
+
+
+def test_retry_is_pinned_to_audited_ledger_preimage_after_new_full_scan(tmp_path):
+    env = _fixture(tmp_path)
+    audited_request = env["request"]
+    transient = _RepairSender(
+        result=SendResult(
+            status="failed",
+            http_status=503,
+            error="delivery_unavailable",
+            attempts=1,
+            failure_type="transient",
+        )
+    )
+    with pytest.raises(DeadLetterRepairError, match="corrected_delivery_incomplete"):
+        repair_live_dead_letter(
+            audited_request,
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=transient,
+        )
+
+    # A newer all-available job can publish a different immutable bundle, but the existing
+    # audit/request must never silently follow the moving report pointer.
+    cancelled = _ledger_row(
+        deal_type=13,
+        position_id="0",
+        order_id="0",
+        symbol="",
+        volume=0,
+        price=0,
+    )
+    _replace_snapshot(env, [cancelled])
+    original = env["outbox_path"].read_bytes()
+    retry_sender = _RepairSender(outcome="duplicate")
+
+    with pytest.raises(
+        DeadLetterRepairError, match="ledger_snapshot_preimage_mismatch"
+    ):
+        repair_live_dead_letter(
+            audited_request,
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=retry_sender,
+        )
+
+    assert retry_sender.payloads == []
+    assert env["outbox_path"].read_bytes() == original
+    assert EventOutbox(str(env["outbox_path"])).dead_letter_count() == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["active-sequence", "archived-membership", "archive-digest", "partial-active"],
+)
+def test_incomplete_or_superseded_handoff_never_mutates(tmp_path, mutation):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    active_path = env["instance"] / "state" / "history-live-handoff.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    if mutation == "active-sequence":
+        active["anchor_sequence"] += 1
+        _write_json(active_path, active)
+    elif mutation == "archived-membership":
+        active["archived_deal_tickets"] = []
+        _write_json(active_path, active)
+    elif mutation == "archive-digest":
+        env["archive_path"].write_bytes(env["archive_path"].read_bytes() + b" ")
+    else:
+        active["history_mode"] = "from_date"
+        active["ledger_evidence"] = None
+        _write_json(active_path, active)
+
+    with pytest.raises(DeadLetterRepairError, match="ledger_handoff_not_active"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert not env["rollback"].exists()
 
 
 def test_private_write_recovers_partial_orphan_and_rerun_cleans_orphan(tmp_path):
