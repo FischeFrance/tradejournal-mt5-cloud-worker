@@ -9,9 +9,11 @@ la serializzazione ordinata per chiave del vecchio formato poteva avere alterato
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -30,6 +32,7 @@ logger = logging.getLogger("mt5_worker.event_outbox")
 _FORMAT_VERSION = 2
 _LEGACY_FORMAT_VERSION = 1
 _SECURE_FILE_MODE = 0o600
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class OutboxError(RuntimeError):
@@ -114,6 +117,92 @@ class EventOutbox:
 
     def dead_letters(self) -> Dict[str, Dict[str, Any]]:
         return copy.deepcopy(self._state["dead_letter"])
+
+    @staticmethod
+    def record_sha256(record: Any) -> str:
+        """Return the stable digest used by guarded dead-letter maintenance.
+
+        The digest covers the complete dead-letter record, including its payload and delivery
+        metadata.  Operators can therefore compare-and-swap one exact rejected event without
+        placing its sensitive event id or payload on a command line.
+        """
+
+        try:
+            encoded = json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise OutboxError("Record dead-letter non serializzabile.") from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    def requeue_dead_letter_first(
+        self,
+        event_id: str,
+        replacement_payload: Dict[str, Any],
+        *,
+        expected_record_sha256: str,
+    ) -> Dict[str, Any]:
+        """Move one exact dead-letter back to the head of the FIFO.
+
+        The caller must own the connection-level maintenance lock.  This method refreshes the
+        persisted state immediately before comparing the record digest, then publishes one
+        atomic replacement.  The event identity is immutable even when authoritative fields in
+        the payload are repaired.
+        """
+
+        self._validate_expected_sha256(expected_record_sha256)
+        self._validate_payload(replacement_payload)
+        if replacement_payload["event_id"] != event_id:
+            raise OutboxError("Il requeue non puo cambiare event_id.")
+        state = self._refresh_for_guarded_mutation()
+        record = self._guarded_dead_letter(
+            state,
+            event_id,
+            expected_record_sha256,
+        )
+        if any(payload["event_id"] == event_id for payload in state["pending"]):
+            raise OutboxError("Evento dead-letter gia presente nei pending.")
+        new_state = copy.deepcopy(state)
+        del new_state["dead_letter"][event_id]
+        new_state["pending"].insert(0, copy.deepcopy(replacement_payload))
+        self._validate_state(new_state)
+        self._replace_state(new_state)
+        return copy.deepcopy(record)
+
+    def resolve_non_trading_dead_letter(
+        self,
+        event_id: str,
+        *,
+        expected_record_sha256: str,
+        audit_path: str,
+        expected_audit_sha256: str,
+    ) -> Dict[str, Any]:
+        """Remove one exact non-trading dead-letter after a durable audit exists.
+
+        The outbox never decides whether an MT5 ledger row is a trade.  A privileged maintenance
+        tool must make that decision from a coherent ledger and first publish an immutable audit
+        artifact.  Requiring the artifact digest here makes an unaudited removal fail closed.
+        """
+
+        self._validate_expected_sha256(expected_record_sha256)
+        self._validate_expected_sha256(expected_audit_sha256)
+        if self._regular_file_sha256(audit_path) != expected_audit_sha256:
+            raise OutboxError("Audit dead-letter assente o non corrispondente.")
+        state = self._refresh_for_guarded_mutation()
+        record = self._guarded_dead_letter(
+            state,
+            event_id,
+            expected_record_sha256,
+        )
+        new_state = copy.deepcopy(state)
+        del new_state["dead_letter"][event_id]
+        self._validate_state(new_state)
+        self._replace_state(new_state)
+        return copy.deepcopy(record)
 
     def enqueue_many(self, payloads: Iterable[Dict[str, Any]]) -> int:
         """Accoda atomicamente un batch, in ordine, deduplicandolo per ``event_id``."""
@@ -328,6 +417,68 @@ class EventOutbox:
         if self.file_path:
             self._persist(new_state)
         self._state = new_state
+
+    @staticmethod
+    def _validate_expected_sha256(value: str) -> None:
+        if not isinstance(value, str) or not _SHA256.fullmatch(value):
+            raise OutboxError("Digest di manutenzione non valido.")
+
+    def _refresh_for_guarded_mutation(self) -> Dict[str, Any]:
+        if not self.file_path:
+            raise OutboxError("La manutenzione dead-letter richiede un outbox persistente.")
+        state, migration_required = self._load()
+        if migration_required:
+            # A maintenance decision must never silently combine schema migration and removal.
+            raise OutboxError("Migrare l'outbox prima della manutenzione dead-letter.")
+        self._state = state
+        return copy.deepcopy(state)
+
+    @classmethod
+    def _guarded_dead_letter(
+        cls,
+        state: Dict[str, Any],
+        event_id: str,
+        expected_record_sha256: str,
+    ) -> Dict[str, Any]:
+        if not isinstance(event_id, str) or not event_id:
+            raise OutboxError("event_id dead-letter non valido.")
+        record = state["dead_letter"].get(event_id)
+        if not isinstance(record, dict):
+            raise OutboxError("Record dead-letter non disponibile.")
+        if cls.record_sha256(record) != expected_record_sha256:
+            raise OutboxError("Record dead-letter cambiato durante la manutenzione.")
+        return record
+
+    @staticmethod
+    def _regular_file_sha256(path: str) -> str:
+        descriptor = -1
+        try:
+            path_stat = os.lstat(path)
+            if stat.S_ISLNK(path_stat.st_mode):
+                raise OutboxError("Audit dead-letter non sicuro.")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            file_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (file_stat.st_dev, file_stat.st_ino)
+            ):
+                raise OutboxError("Audit dead-letter non sicuro.")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
+        except OutboxError:
+            raise
+        except OSError as exc:
+            raise OutboxError("Audit dead-letter non leggibile.") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _persist(self, state: Dict[str, Any]) -> None:
         assert self.file_path is not None

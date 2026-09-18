@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -298,3 +299,95 @@ def test_persisted_format_contains_no_sender_credentials(tmp_path):
     serialized = json.dumps(state)
     assert "password" not in serialized.lower()
     assert "token" not in serialized.lower()
+
+
+def _dead_lettered_outbox(path, payload=None):
+    payload = payload or _payload()
+    outbox = EventOutbox(str(path))
+    outbox.enqueue_many([payload])
+    outbox.drain(
+        _Sender(
+            [
+                SendResult(
+                    status="failed",
+                    http_status=422,
+                    error="rejected_by_api",
+                    attempts=1,
+                    failure_type="permanent",
+                )
+            ]
+        )
+    )
+    record = outbox.dead_letters()[payload["event_id"]]
+    return outbox, payload, record
+
+
+def test_guarded_requeue_moves_same_event_id_to_fifo_head(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    outbox, payload, record = _dead_lettered_outbox(path)
+    later = _payload("later-event", "2026-01-01T00:00:02Z")
+    outbox.enqueue_many([later])
+    replacement = {**payload, "symbol": "EURUSD"}
+
+    returned = outbox.requeue_dead_letter_first(
+        payload["event_id"],
+        replacement,
+        expected_record_sha256=EventOutbox.record_sha256(record),
+    )
+
+    restarted = EventOutbox(str(path))
+    assert returned == record
+    assert list(restarted.pending_payloads()) == [payload["event_id"], "later-event"]
+    assert restarted.pending_payloads()[payload["event_id"]] == replacement
+    assert restarted.dead_letter_count() == 0
+
+
+def test_guarded_requeue_rejects_changed_record_and_event_identity(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    outbox, payload, record = _dead_lettered_outbox(path)
+    digest = EventOutbox.record_sha256(record)
+
+    with pytest.raises(OutboxError, match="event_id"):
+        outbox.requeue_dead_letter_first(
+            payload["event_id"],
+            {**payload, "event_id": "different-event"},
+            expected_record_sha256=digest,
+        )
+    with pytest.raises(OutboxError, match="cambiato"):
+        outbox.requeue_dead_letter_first(
+            payload["event_id"],
+            {**payload, "symbol": "EURUSD"},
+            expected_record_sha256="0" * 64,
+        )
+
+    restarted = EventOutbox(str(path))
+    assert restarted.dead_letters()[payload["event_id"]] == record
+    assert restarted.pending_count() == 0
+
+
+def test_non_trading_resolution_requires_matching_durable_audit(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    outbox, payload, record = _dead_lettered_outbox(path)
+    record_digest = EventOutbox.record_sha256(record)
+    audit = tmp_path / "resolution.json"
+    audit.write_bytes(b'{"classification":"non_trading_accounting"}')
+    audit.chmod(0o600)
+    audit_digest = hashlib.sha256(audit.read_bytes()).hexdigest()
+
+    with pytest.raises(OutboxError, match="Audit"):
+        outbox.resolve_non_trading_dead_letter(
+            payload["event_id"],
+            expected_record_sha256=record_digest,
+            audit_path=str(audit),
+            expected_audit_sha256="0" * 64,
+        )
+    assert EventOutbox(str(path)).dead_letter_count() == 1
+
+    returned = outbox.resolve_non_trading_dead_letter(
+        payload["event_id"],
+        expected_record_sha256=record_digest,
+        audit_path=str(audit),
+        expected_audit_sha256=audit_digest,
+    )
+    assert returned == record
+    assert EventOutbox(str(path)).dead_letter_count() == 0
