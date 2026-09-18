@@ -1,8 +1,13 @@
+import hashlib
 from datetime import datetime, timezone
 
 import pytest
 
-from windows_agent.worker.history_archive import load_or_create_history_document
+from windows_agent.worker.history_archive import (
+    history_document_bytes,
+    history_document_sha256,
+    load_or_create_history_document,
+)
 
 
 def test_history_archive_chunks_same_trade_and_is_immutable_on_retry(tmp_path):
@@ -34,6 +39,10 @@ def test_history_archive_chunks_same_trade_and_is_immutable_on_retry(tmp_path):
 
     assert [len(group["events"]) for group in first["trades"]] == [4, 1]
     assert retry == first
+    persisted = path.read_bytes()
+    assert persisted == history_document_bytes(first)
+    assert b"\r\n" not in persisted
+    assert hashlib.sha256(persisted).hexdigest() == history_document_sha256(first)
 
 
 @pytest.mark.parametrize(

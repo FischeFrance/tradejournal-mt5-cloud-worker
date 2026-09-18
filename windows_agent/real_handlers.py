@@ -82,6 +82,7 @@ from .worker.adapter_errors import (
 from .worker.dedup import PersistentDedup
 from .worker.history_archive import (
     build_history_document,
+    history_document_bytes,
     history_document_sha256,
     load_or_create_history_document,
     validate_history_document,
@@ -1815,6 +1816,19 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
     return normalize_event(raw, login, server)
 
 
+def _rematerialize_canonical_history_stage(path: Path, document: dict[str, Any]) -> None:
+    """Repair a semantically verified legacy stage from its committed pending payload."""
+
+    try:
+        persisted = path.read_bytes()
+    except OSError as exc:
+        raise HistorySyncFailed("history staged archive unavailable") from exc
+    if persisted != history_document_bytes(document):
+        # The pending payload was durably committed before the stage and is authoritative.  Keep
+        # the SHA check strict; replace legacy CRLF/non-canonical bytes, then verify normally.
+        atomic_json(path, document)
+
+
 def _run_history_sync(
     adapter: Any,
     root: Path,
@@ -1976,6 +1990,9 @@ def _run_history_sync(
                             raise HistorySyncFailed(
                                 "history handoff staged archive mismatched"
                             )
+                        _rematerialize_canonical_history_stage(
+                            staged_archive_path, document
+                        )
                     handoff_persisted = _persist_history_handoff_artifact(
                         adapter,
                         root,
@@ -2216,6 +2233,7 @@ def _resume_committed_history_delivery(
             )
             if staged_document != document:
                 raise HistorySyncFailed("history handoff staged archive mismatched")
+            _rematerialize_canonical_history_stage(staged_archive_path, document)
         if not _persist_history_handoff_artifact(
             adapter,
             root,

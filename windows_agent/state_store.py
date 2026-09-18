@@ -19,7 +19,10 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # ``newline='\n'`` disables Windows' implicit LF -> CRLF translation.  Callers may hash
+        # the canonical JSON bytes before publication, so durability also requires byte identity
+        # across operating systems.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(encoded + "\n")
             handle.flush()
             os.fsync(handle.fileno())

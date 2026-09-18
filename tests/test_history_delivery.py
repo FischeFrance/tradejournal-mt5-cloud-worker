@@ -8,6 +8,7 @@ import pytest
 from windows_agent import real_handlers
 from windows_agent.real_handlers import _run_history_sync
 from windows_agent.worker.history_balance import reconstruct_trade_deals
+from windows_agent.worker.history_archive import history_document_bytes
 from windows_agent.worker.mql5_file_adapter import Mql5FileMt5Adapter
 from windows_agent.worker.history_sync import HistorySync
 
@@ -579,8 +580,13 @@ def test_history_publication_retry_reuses_prepared_boundary_without_recapture(
     assert api.calls == 1
 
 
-def test_history_publication_retry_materializes_missing_stage_from_pending_only(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "legacy_crlf_stage",
+    (False, True),
+    ids=("missing-stage", "legacy-crlf-stage"),
+)
+def test_history_publication_retry_materializes_stage_from_pending_only(
+    tmp_path, monkeypatch, legacy_crlf_stage
 ):
     connection_id = "33333333-3333-4333-8333-333333333333"
     root = tmp_path / connection_id
@@ -676,6 +682,16 @@ def test_history_publication_retry_materializes_missing_stage_from_pending_only(
     assert not list((root / "state").glob(".history-import-*.json.staged"))
     assert not list((root / "state").glob("history-import-*.json"))
 
+    pending = json.loads(pending_before_retry)
+    canonical = history_document_bytes(pending["history_document_payload"])
+    if legacy_crlf_stage:
+        archive_key = hashlib.sha256(job["job_id"].encode("utf-8")).hexdigest()[:16]
+        legacy_stage = root / "state" / f".history-import-{archive_key}.json.staged"
+        legacy_stage.write_bytes(canonical[:-1] + b"\r\n")
+        assert hashlib.sha256(legacy_stage.read_bytes()).hexdigest() != pending[
+            "history_document_sha256"
+        ]
+
     monkeypatch.setattr(real_handlers, "atomic_json", real_atomic_json)
     _run_history_sync(
         Adapter(),
@@ -691,7 +707,7 @@ def test_history_publication_retry_materializes_missing_stage_from_pending_only(
 
     archives = list((root / "state").glob("history-import-*.json"))
     assert len(archives) == 1
-    pending = json.loads(pending_before_retry)
+    assert archives[0].read_bytes() == canonical
     assert hashlib.sha256(archives[0].read_bytes()).hexdigest() == pending[
         "history_document_sha256"
     ]
