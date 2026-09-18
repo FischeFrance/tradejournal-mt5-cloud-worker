@@ -41,6 +41,7 @@ class StreamAdapter(Adapter):
     def __init__(self, snapshot: dict, records: tuple[dict, ...] | None = None) -> None:
         super().__init__(snapshot)
         self.acknowledged: int | None = None
+        self.handoff_completed = False
         self._records = records
 
     def pending_events(self) -> tuple[dict, ...]:
@@ -64,6 +65,9 @@ class StreamAdapter(Adapter):
 
     def acknowledge_events(self, through_sequence: int) -> None:
         self.acknowledged = through_sequence
+
+    def complete_history_handoff(self) -> None:
+        self.handoff_completed = True
 
 
 def _snapshot() -> dict:
@@ -165,34 +169,60 @@ def test_mql5_event_stream_is_primary_and_acknowledged_after_outbox_persist(tmp_
     assert sender.payloads[0]["event_type"] == "trade_closed"
     assert sender.payloads[0]["external_trade_id"] == "100"
     assert sender.payloads[0]["commission"] == -1.0
-    assert sender.payloads[0]["total_commission"] == -3.5
+    # The rolling live snapshot is not proof of a complete lifecycle.  The native close fill
+    # remains authoritative; an aggregate is emitted only by the verified historical ledger.
+    assert sender.payloads[0]["total_commission"] is None
+    assert "commission_complete" not in sender.payloads[0]
 
 
-def test_stream_open_forwards_the_commission_charged_by_mt5(tmp_path: Path) -> None:
-    current = _snapshot()
-    current["deals"] = {
-        "899": {
-            "ticket": "899", "position_id": "100", "entry": "IN",
+def test_live_deal_fills_preserve_the_authoritative_lifecycle_commission(
+    tmp_path: Path,
+) -> None:
+    records = (
+        {
+            "sequence": 16,
+            "event_type": "DEAL_ADD",
+            "ticket": "899",
+            "deal_id": "899",
+            "position_id": "100",
+            "entry": "IN",
+            "symbol": "EURUSD",
+            "direction": "buy",
+            "volume": 0.1,
+            "price": 1.1,
+            "profit": 0.0,
             "commission": -2.5,
+            "swap": 0.0,
+            "time": "2026-07-27T10:00:00Z",
+            "timestamp_msc": 1_722_074_400_000,
         },
-    }
-    records = ({
-        "sequence": 16,
-        "event_type": "DEAL_ADD",
-        "ticket": "899",
-        "position_id": "100",
-        "entry": "IN",
-        "symbol": "EURUSD",
-        "direction": "buy",
-        "volume": 0.1,
-        "price": 1.1,
-        "profit": 0,
-        "commission": -2.5,
-        "swap": 0,
-        "time": "2026-07-27T10:00:00Z",
-    },)
-    adapter = StreamAdapter(current, records)
-    sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+        {
+            "sequence": 17,
+            "event_type": "DEAL_ADD",
+            "ticket": "900",
+            "deal_id": "900",
+            "position_id": "100",
+            "entry": "OUT",
+            "symbol": "EURUSD",
+            "direction": "sell",
+            "volume": 0.1,
+            "price": 1.2,
+            "profit": 10.0,
+            "commission": -1.0,
+            "swap": 0.0,
+            "time": "2026-07-27T10:05:00Z",
+            "timestamp_msc": 1_722_074_700_000,
+        },
+    )
+    adapter = StreamAdapter(
+        {"positions": {}, "orders": {}, "deals": {}}, records
+    )
+    sender = Sender(
+        [
+            SendResult(status="sent", http_status=200, attempts=1),
+            SendResult(status="sent", http_status=200, attempts=1),
+        ]
+    )
     live = LiveSync(
         adapter,
         PersistentSnapshot(tmp_path / "snapshot.json"),
@@ -201,12 +231,22 @@ def test_stream_open_forwards_the_commission_charged_by_mt5(tmp_path: Path) -> N
         outbox=EventOutbox(str(tmp_path / "outbox.json")),
     )
 
-    assert live.poll_once() == 1
-    assert sender.payloads[0]["event_type"] == "trade_opened"
-    assert sender.payloads[0]["commission"] == -2.5
+    assert live.poll_once() == 2
+    assert [payload["event_type"] for payload in sender.payloads] == [
+        "trade_opened",
+        "trade_closed",
+    ]
+    assert [payload["native_deal_ticket"] for payload in sender.payloads] == [
+        "899",
+        "900",
+    ]
+    assert [payload["commission"] for payload in sender.payloads] == [-2.5, -1.0]
+    assert sum(payload["commission"] for payload in sender.payloads) == -3.5
 
 
-def test_partial_close_is_volume_change_and_not_a_duplicate_close(tmp_path: Path) -> None:
+def test_partial_close_is_economic_fill_and_not_a_duplicate_volume_change(
+    tmp_path: Path,
+) -> None:
     previous = _snapshot()
     previous["positions"]["100"]["volume"] = 0.2
     PersistentSnapshot(tmp_path / "snapshot.json").save(previous)
@@ -223,7 +263,11 @@ def test_partial_close_is_volume_change_and_not_a_duplicate_close(tmp_path: Path
             "direction": "sell",
             "volume": 0.1,
             "price": 1.2,
+            "profit": 10.0,
+            "commission": -1.0,
+            "swap": -0.2,
             "time": "2026-07-27T10:06:00Z",
+            "timestamp_msc": 1_722_074_760_123,
         },
     )
     adapter = StreamAdapter(current, records)
@@ -238,9 +282,150 @@ def test_partial_close_is_volume_change_and_not_a_duplicate_close(tmp_path: Path
 
     assert live.poll_once() == 1
     assert [payload["event_type"] for payload in sender.payloads] == [
-        "trade_volume_changed"
+        "trade_partial_closed"
     ]
     assert sender.payloads[0]["volume"] == 0.1
+    assert sender.payloads[0]["native_deal_ticket"] == "901"
+    assert sender.payloads[0]["time_msc"] == 1_722_074_760_123
+    assert sender.payloads[0]["profit"] == 10.0
+    assert sender.payloads[0]["commission"] == -1.0
+    assert sender.payloads[0]["swap"] == -0.2
+
+
+def test_two_close_fills_between_polls_are_partial_then_final(tmp_path: Path) -> None:
+    previous = _snapshot()
+    previous["positions"]["100"]["volume"] = 0.2
+    PersistentSnapshot(tmp_path / "snapshot.json").save(previous)
+    records = (
+        {
+            "sequence": 21,
+            "event_type": "DEAL_ADD",
+            "ticket": "903",
+            "deal_id": "903",
+            "position_id": "100",
+            "entry": "OUT",
+            "symbol": "EURUSD",
+            "direction": "sell",
+            "volume": 0.1,
+            "price": 1.2,
+            "profit": 10.0,
+            "commission": -0.5,
+            "swap": 0.0,
+            "time": "2026-07-27T10:08:00Z",
+            "timestamp_msc": 1_722_074_880_001,
+        },
+        {
+            "sequence": 22,
+            "event_type": "DEAL_ADD",
+            "ticket": "904",
+            "deal_id": "904",
+            "position_id": "100",
+            "entry": "OUT",
+            "symbol": "EURUSD",
+            "direction": "sell",
+            "volume": 0.1,
+            "price": 1.21,
+            "profit": 11.0,
+            "commission": -0.5,
+            "swap": 0.0,
+            "time": "2026-07-27T10:09:00Z",
+            "timestamp_msc": 1_722_074_940_001,
+        },
+    )
+    adapter = StreamAdapter({"positions": {}, "orders": {}, "deals": {}}, records)
+    sender = Sender(
+        [
+            SendResult(status="sent", http_status=200, attempts=1),
+            SendResult(status="sent", http_status=200, attempts=1),
+        ]
+    )
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    assert live.poll_once() == 2
+    assert [payload["event_type"] for payload in sender.payloads] == [
+        "trade_partial_closed",
+        "trade_closed",
+    ]
+    assert [payload["native_deal_ticket"] for payload in sender.payloads] == [
+        "903",
+        "904",
+    ]
+
+
+def test_history_handoff_skips_archived_open_and_keeps_fresh_scale_in(
+    tmp_path: Path,
+) -> None:
+    previous = _snapshot()
+    PersistentSnapshot(tmp_path / "snapshot.json").save(previous)
+    current = _snapshot()
+    current["positions"]["100"]["volume"] = 0.2
+    current["positions"]["100"]["open_price"] = 1.15
+    records = (
+        {
+            "sequence": 30,
+            "event_type": "DEAL_ADD",
+            "ticket": "900",
+            "deal_id": "900",
+            "position_id": "100",
+            "entry": "IN",
+            "symbol": "EURUSD",
+            "direction": "buy",
+            "volume": 0.1,
+            "price": 1.1,
+            "profit": 0.0,
+            "commission": -1.0,
+            "swap": 0.0,
+            "time": "2026-07-27T10:00:00Z",
+            "timestamp_msc": 1_722_074_400_000,
+            "history_archived": True,
+        },
+        {
+            "sequence": 31,
+            "event_type": "DEAL_ADD",
+            "ticket": "901",
+            "deal_id": "901",
+            "position_id": "100",
+            "entry": "IN",
+            "symbol": "EURUSD",
+            "direction": "buy",
+            "volume": 0.1,
+            "price": 1.2,
+            "profit": 0.0,
+            "commission": -1.5,
+            "swap": 0.0,
+            "time": "2026-07-27T10:01:00Z",
+            "timestamp_msc": 1_722_074_460_000,
+        },
+    )
+    adapter = StreamAdapter(current, records)
+    sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    assert live.poll_once() == 1
+    assert adapter.acknowledged == 31
+    # The native-ticket membership marker must outlive the first poll: MT5 may deliver
+    # a callback for an archived deal in any later timer cycle.
+    assert adapter.handoff_completed is False
+    assert len(sender.payloads) == 1
+    payload = sender.payloads[0]
+    assert payload["event_type"] == "trade_volume_changed"
+    assert payload["native_deal_ticket"] == "901"
+    assert payload["previous_volume"] == 0.1
+    assert payload["volume"] == 0.2
+    assert payload["open_price"] == pytest.approx(1.15)
+    assert payload["commission"] == -1.5
 
 
 def test_position_stream_event_preserves_snapshot_modification(tmp_path: Path) -> None:

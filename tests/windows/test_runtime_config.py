@@ -5,6 +5,7 @@ import pytest
 from windows_agent.agent_secrets import AGENT_SCOPE_ID
 from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.runtime_config import (
+    DEFAULT_BROKER_IDENTITY_MODEL,
     DEFAULT_INSTANCE_POOL_ROOT,
     build_api_client,
     load_agent_token,
@@ -41,7 +42,7 @@ def test_load_runtime_config_defaults(tmp_path):
     assert not hasattr(config, "broker_registry_ttl_seconds")
     assert config.broker_identity_cache.name == "broker-identity-cache.json"
     assert config.broker_identity_cache_ttl_seconds == 86_400
-    assert config.broker_identity_model == "gpt-5.6"
+    assert config.broker_identity_model == DEFAULT_BROKER_IDENTITY_MODEL
     assert config.broker_wizard_enabled is False
     assert config.mtapi_search_enabled is True
     assert config.mt5_interactive_user == ""

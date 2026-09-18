@@ -93,6 +93,17 @@ def test_normalize_event_does_not_emit_a_partial_account_snapshot():
     assert "leverage" not in payload
 
 
+def test_normalize_event_keeps_native_fee_as_audit_only_field():
+    payload = normalize_event(
+        {**RAW_TRADE_OPENED, "commission": -1.25, "fee": -0.15},
+        account_number="12345",
+        server="Demo-Server",
+    )
+
+    assert payload["commission"] == -1.25
+    assert payload["fee"] == -0.15
+
+
 def test_normalize_event_fills_event_time_when_missing():
     raw = {**RAW_TRADE_OPENED}
     del raw["event_time"]
@@ -171,6 +182,71 @@ def test_event_id_differs_across_event_types_for_same_ticket():
               "commission": -0.5, "swap": -0.1, "close_time": "t2"}
 
     assert build_event_id("12345", opened) != build_event_id("12345", closed)
+
+
+def test_distinct_partial_fills_have_distinct_ids_and_retries_are_stable():
+    partial = {
+        "event_type": "trade_partial_closed",
+        "ticket": "position-1",
+        "native_deal_ticket": "1001",
+        "time_msc": 1_767_225_600_000,
+        "time_basis": "broker_server_unresolved",
+        "volume": 0.5,
+        "close_price": 1.11,
+        "profit": 10,
+        "commission": -1,
+        "swap": 0,
+        "close_time": "2026-01-01T00:00:00Z",
+    }
+    other_fill = {**partial, "native_deal_ticket": "1002"}
+
+    first_id = build_event_id("12345", partial)
+    assert first_id == build_event_id("12345", dict(partial))
+    assert first_id != build_event_id("12345", other_fill)
+
+    payload = normalize_event(partial, account_number="12345", server="Demo-Server")
+    assert payload["native_deal_ticket"] == "1001"
+    assert payload["time_msc"] == 1_767_225_600_000
+    assert payload["time_basis"] == "broker_server_unresolved"
+
+
+def test_native_close_identity_is_stable_when_broker_economics_are_enriched():
+    close = {
+        "event_type": "trade_closed",
+        "ticket": "position-1",
+        "native_deal_ticket": "1003",
+        "time_msc": 1_767_225_600_000,
+        "volume": 0.5,
+        "close_price": 1.11,
+        "profit": 10.0,
+        "commission": 0.0,
+        "swap": 0.0,
+        "close_time": "2026-01-01T00:00:00Z",
+    }
+    enriched = {
+        **close,
+        "profit": 9.75,
+        "commission": -1.25,
+        "swap": -0.10,
+    }
+
+    assert build_event_id("12345", close) == build_event_id("12345", enriched)
+
+
+def test_native_scale_in_identity_is_stable_when_history_enriches_projection():
+    scale_in = {
+        "event_type": "trade_volume_changed",
+        "ticket": "position-1",
+        "native_deal_ticket": "1000",
+        "volume": 0.5,
+        "previous_volume": 0.25,
+        "partial_close": False,
+        "open_price": 1.10,
+        "commission": -1,
+    }
+    enriched = {**scale_in, "open_price": 1.105, "commission": -1.25}
+
+    assert build_event_id("12345", scale_in) == build_event_id("12345", enriched)
 
 
 def test_normalize_all_seven_event_types_yields_valid_payload():

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
 import random
 import re
 import time
 from datetime import datetime
 from typing import Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from uuid import UUID
 
 import httpx
@@ -34,10 +37,44 @@ PROGRESS_EVENT_STATUSES = frozenset(
     ("started", "completed", "failed", "skipped", "info")
 )
 PROGRESS_DETAIL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+MAX_HISTORY_COMPRESSED_BYTES = 6 * 1024 * 1024
+MAX_HISTORY_UNCOMPRESSED_BYTES = 48 * 1024 * 1024
+MAX_HISTORY_EVENTS = 50_000
+HISTORY_BUCKET = "mt5-history-imports"
+HISTORY_OBJECT_PATTERN = re.compile(
+    r"^[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9a-f-]{36}/history\.json\.gz$"
+)
 
 
 class AgentContractError(RuntimeError):
     """The control plane returned a response outside the pinned V1 contract."""
+
+
+def _normalized_origin(parsed) -> tuple[str, str | None, int | None]:
+    port = parsed.port
+    if (parsed.scheme == "https" and port == 443) or (
+        parsed.scheme == "http" and port == 80
+    ):
+        port = None
+    return parsed.scheme, parsed.hostname, port
+
+
+def _history_upload_origins(parsed) -> frozenset[tuple[str, str | None, int | None]]:
+    """Return the exact origins allowed for a signed historical archive upload.
+
+    Supabase Edge Functions and Storage intentionally use two different hosts for
+    the same project.  A control plane at ``<ref>.functions.supabase.co`` may
+    therefore issue a signed upload URL at ``<ref>.supabase.co``.  No other
+    cross-origin upload is accepted.
+    """
+    origins = {_normalized_origin(parsed)}
+    hostname = parsed.hostname or ""
+    functions_suffix = ".functions.supabase.co"
+    if parsed.scheme == "https" and hostname.endswith(functions_suffix):
+        project_ref = hostname[: -len(functions_suffix)]
+        if project_ref and "." not in project_ref:
+            origins.add(("https", f"{project_ref}.supabase.co", None))
+    return frozenset(origins)
 
 
 def _uuid(value: object, field: str) -> None:
@@ -54,6 +91,50 @@ def _timestamp(value: object, field: str) -> None:
         datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise AgentContractError(f"{field} is not a timestamp") from exc
+
+
+def _non_negative_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_history_prepare(
+    prepared: dict, *, job_id: str, connection_id: str
+) -> tuple[str, str | None]:
+    required = {
+        "api_version", "already_imported", "object_path", "upload_url",
+        "expires_in", "accepted", "inserted", "duplicates",
+    }
+    object_path = prepared.get("object_path")
+    counts = tuple(prepared.get(field) for field in ("accepted", "inserted", "duplicates"))
+    if (
+        set(prepared) != required
+        or prepared.get("api_version") != "1"
+        or not isinstance(prepared.get("already_imported"), bool)
+        or not isinstance(object_path, str)
+        or HISTORY_OBJECT_PATTERN.fullmatch(object_path) is None
+        or not all(_non_negative_integer(value) for value in counts)
+        or counts[1] + counts[2] != counts[0]
+        or not _non_negative_integer(prepared.get("expires_in"))
+        or prepared["expires_in"] > 7200
+    ):
+        raise AgentContractError("history upload response does not match contract V1")
+    path_parts = object_path.split("/")
+    if path_parts[1] != connection_id or path_parts[2] != job_id:
+        raise AgentContractError("history upload object identity mismatch")
+    for value in path_parts[:3]:
+        try:
+            if str(UUID(value)) != value:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise AgentContractError("history upload object identity mismatch") from None
+    upload_url = prepared.get("upload_url")
+    if prepared["already_imported"]:
+        if upload_url is not None or prepared["expires_in"] != 0:
+            raise AgentContractError("history upload response does not match contract V1")
+        return object_path, None
+    if not isinstance(upload_url, str) or prepared["expires_in"] <= 0 or counts != (0, 0, 0):
+        raise AgentContractError("history upload response does not match contract V1")
+    return object_path, upload_url
 
 
 def _validate_claim(job: dict) -> dict:
@@ -174,13 +255,18 @@ class AgentApiClient:
             raise ValueError("HTTPS required except loopback tests")
         self.base_url, self._origin = (
             base_url.rstrip("/") + "/",
-            (parsed.scheme, parsed.hostname, parsed.port),
+            _normalized_origin(parsed),
         )
+        self._history_upload_origins = _history_upload_origins(parsed)
         self.client = httpx.Client(
             transport=transport,
             timeout=10,
             follow_redirects=False,
             headers={"Authorization": f"Bearer {token}"},
+        )
+        # Signed Storage uploads must not inherit the control-plane bearer token.
+        self._upload_client = httpx.Client(
+            transport=transport, timeout=30, follow_redirects=False
         )
         self._max_retries = max_retries
         self._sleep = sleep_fn
@@ -267,3 +353,109 @@ class AgentApiClient:
                 },
             )
         )
+
+    def import_history_file(
+        self, job_id: str, lease_id: str, document: dict
+    ) -> dict:
+        """Import one immutable, lease-bound historical archive.
+
+        The server-derived Storage path and the content hash make retries
+        idempotent.  History never traverses the live/rate-limited endpoint.
+        """
+        trades = document.get("trades") if isinstance(document, dict) else None
+        connection_id = document.get("connection_id") if isinstance(document, dict) else None
+        if (
+            not isinstance(trades, list)
+            or document.get("job_id") != job_id
+            or not isinstance(connection_id, str)
+        ):
+            raise ValueError("history document is invalid")
+        _uuid(job_id, "job_id")
+        _uuid(connection_id, "connection_id")
+        event_count = sum(
+            len(group.get("events", ()))
+            for group in trades
+            if isinstance(group, dict) and isinstance(group.get("events"), list)
+        )
+        if event_count > MAX_HISTORY_EVENTS:
+            raise ValueError("history event limit exceeded")
+        raw = json.dumps(
+            document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        compressed = gzip.compress(raw, compresslevel=9, mtime=0)
+        if len(raw) > MAX_HISTORY_UNCOMPRESSED_BYTES or len(compressed) > MAX_HISTORY_COMPRESSED_BYTES:
+            raise ValueError("history archive limit exceeded")
+        metadata = {
+            "api_version": self.API_VERSION,
+            "lease_id": lease_id,
+            "compressed_sha256": hashlib.sha256(compressed).hexdigest(),
+            "compressed_bytes": len(compressed),
+            "uncompressed_bytes": len(raw),
+            "event_count": event_count,
+        }
+        prepared = self.request("POST", f"jobs/{job_id}/history-upload", metadata)
+        if prepared.get("error_code") == "lease_lost":
+            return prepared
+        object_path, upload_url = _validate_history_prepare(
+            prepared, job_id=job_id, connection_id=connection_id
+        )
+        if upload_url is not None:
+            parsed = urlparse(upload_url) if isinstance(upload_url, str) else None
+            query = parse_qs(parsed.query, keep_blank_values=True) if parsed is not None else {}
+            expected_path = (
+                f"/storage/v1/object/upload/sign/{HISTORY_BUCKET}/{object_path}"
+            )
+            if (
+                parsed is None
+                or parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or _normalized_origin(parsed) not in self._history_upload_origins
+                or unquote(parsed.path) != expected_path
+                or set(query) != {"token"}
+                or len(query["token"]) != 1
+                or not query["token"][0]
+            ):
+                raise AgentContractError("history upload URL is invalid")
+            try:
+                response = self._upload_client.put(
+                    upload_url,
+                    content=compressed,
+                    headers={
+                        "Cache-Control": "max-age=3600",
+                        "Content-Type": "application/gzip",
+                        "x-upsert": "true",
+                    },
+                )
+            except httpx.HTTPError:
+                raise AgentContractError("history upload failed") from None
+            if response.is_redirect:
+                raise AgentContractError("history upload redirect refused")
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                raise AgentContractError("history upload failed") from None
+        imported = self.request(
+            "POST",
+            f"jobs/{job_id}/history-import",
+            {"api_version": self.API_VERSION, "lease_id": lease_id},
+        )
+        if imported.get("error_code") == "lease_lost":
+            return imported
+        required = {"api_version", "accepted", "inserted", "duplicates", "object_deleted"}
+        if (
+            set(imported) != required
+            or imported.get("api_version") != self.API_VERSION
+            or not all(
+                isinstance(imported.get(field), int)
+                and not isinstance(imported.get(field), bool)
+                and imported[field] >= 0
+                for field in ("accepted", "inserted", "duplicates")
+            )
+            or imported["inserted"] + imported["duplicates"] != imported["accepted"]
+            or imported.get("object_deleted") is not True
+        ):
+            raise AgentContractError("history import response does not match contract V1")
+        return imported

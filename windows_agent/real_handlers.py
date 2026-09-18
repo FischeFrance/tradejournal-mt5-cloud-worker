@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from worker.atomic_file import durable_replace
 from worker.event_normalizer import normalize_event
 from worker.event_outbox import EventOutbox
 
@@ -79,6 +80,13 @@ from .worker.adapter_errors import (
     Mt5ProcessCrashed,
 )
 from .worker.dedup import PersistentDedup
+from .worker.history_archive import (
+    build_history_document,
+    history_document_sha256,
+    load_or_create_history_document,
+    validate_history_document,
+)
+from .worker.history_balance import build_balance_backfill_report
 from .worker.history_sync import HistoryMode, HistorySync
 from .worker.live_sync import LiveSync
 from .worker.local_event_sink import LocalEventSink
@@ -425,7 +433,8 @@ def _ensure_no_stale_process(
 ) -> None:
     """Remove only an orphan using this isolated terminal path before a new job."""
     if terminal.is_file() and ProcessManager.find(terminal):
-        process_factory(state_path).cleanup_path(terminal)
+        if not process_factory(state_path).cleanup_path(terminal):
+            raise TerminalStartFailed("stale terminal cleanup failed")
 
 
 @dataclass(frozen=True)
@@ -1366,6 +1375,15 @@ def build_real_handlers(
         cid = canonical_uuid(str(job["connection_id"]))
         root = InstanceLayout(instances_root, cid).path
         protected_at_start = _is_protected_instance(root, cid)
+        # Withdraw an existing account from the background supervisor before any reprovision
+        # work begins.  It becomes visible again only when the full history/live handoff writes
+        # `connected`; an interrupted attempt therefore fails closed across service restarts.
+        if root.exists() and protected_at_start:
+            _progress(
+                root,
+                status="provisioning",
+                connection_id=cid,
+            )
         stale_secrets = secrets_root / cid
         if not protected_at_start and (
             root.exists() or stale_secrets.exists()
@@ -1425,14 +1443,6 @@ def build_real_handlers(
         terminal = root / "terminal" / "terminal64.exe"
         _verify_binary_pin(terminal, terminal_sha256)
         state_path = root / "state" / "terminal-process.json"
-        ingestion_sink = None
-        if trading_ingestion_url:
-            try:
-                ingestion_sink = TradingIngestionSink(
-                    root, trading_ingestion_url, store.read(cid, "bridge_token")
-                )
-            except Exception as exc:
-                raise SecretStoreFailed("history ingestion token unavailable") from exc
         _record_checkpoint(
             api,
             job,
@@ -1460,30 +1470,32 @@ def build_real_handlers(
                     _progress(root, status="importing_history")
                     adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
                     _verify_investor_access(adapter)
-                    # The native EA emits an authoritative event file for every backfilled
-                    # transaction. Keep the local live supervisor outside this locked window so
-                    # it never interprets a full-history snapshot as a burst of live changes.
+                    # Full history is delivered only through the current job's lease-bound
+                    # archive route. The live supervisor stays outside this locked window.
                     counts = _run_history_sync(
                         adapter,
                         root,
                         mode,
                         from_date,
-                        ingestion_sink,
+                        api,
+                        job,
+                        cid,
                         str(login),
                         server,
                     )
+                    if mode != "new_only":
+                        _prepare_history_to_live_handoff(adapter, root)
                 finally:
-                    _ensure_current_managed_expert(
-                        job,
-                        cid,
-                        root,
-                        login,
-                        server,
-                        terminal_sha256,
-                        history_mode="new_only",
-                    )
-            if ingestion_sink is not None:
-                _run_live_sync_once(adapter, root, ingestion_sink)
+                    if mode != "new_only":
+                        runtime = runtime_factory(root, cid)
+                        set_cancel_check = getattr(runtime, "set_cancel_check", None)
+                        if callable(set_cancel_check):
+                            set_cancel_check(job.get("_lease_guard"))
+                        _require_lease(api, job)
+                        try:
+                            runtime.switch_to_new_only()
+                        except NativeMt5Error as exc:
+                            raise Mt5InitializeFailed(str(exc)) from exc
         else:
             _require_lease(api, job)
             _progress(root, status="authenticating")
@@ -1506,7 +1518,15 @@ def build_real_handlers(
                     _progress(root, status="importing_history")
                     _require_lease(api, job)
                     counts = _run_history_sync(
-                        adapter, root, mode, from_date, ingestion_sink, str(login), server
+                        adapter,
+                        root,
+                        mode,
+                        from_date,
+                        api,
+                        job,
+                        cid,
+                        str(login),
+                        server,
                     )
             except Mt5Error as exc:
                 raise _map_mt5_error(exc) from exc
@@ -1722,6 +1742,9 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
         "volume": record.get("volume", record.get("volume_current")),
         "stop_loss": record.get("sl", record.get("stop_loss")),
         "take_profit": record.get("tp", record.get("take_profit")),
+        "native_deal_ticket": record.get("ticket"),
+        "time_msc": record.get("time_msc"),
+        "time_basis": "broker_server_unresolved",
         "event_time": event_time,
     }
     if kind == "orders":
@@ -1733,22 +1756,48 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
     else:
         entry_value = record.get("entry")
         normalized_entry = str(entry_value).upper() if entry_value is not None else ""
-        if normalized_entry in ("0", "IN"):
+        projected_type = record.get("history_event_type")
+        if projected_type == "trade_opened" or (
+            projected_type is None and normalized_entry in ("0", "IN")
+        ):
             raw = {
                 **base,
                 "event_type": "trade_opened",
                 "open_price": record.get("price", record.get("open_price")),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "fee": record.get("fee"),
+                "swap": record.get("swap"),
+                "balance_before_open": record.get("balance_before_open"),
                 "open_time": event_time,
                 "commission": record.get("commission"),
                 "swap": record.get("swap"),
             }
-        elif normalized_entry in ("1", "2", "3", "OUT", "INOUT", "OUT_BY"):
+        elif projected_type == "trade_volume_changed":
             raw = {
                 **base,
-                "event_type": "trade_closed",
+                "event_type": "trade_volume_changed",
+                "previous_volume": record.get("previous_volume"),
+                "partial_close": False,
+                "open_price": record.get("open_price"),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "fee": record.get("fee"),
+                "swap": record.get("swap"),
+            }
+        elif projected_type in ("trade_closed", "trade_partial_closed") or (
+            projected_type is None
+            and normalized_entry in ("1", "2", "3", "OUT", "INOUT", "OUT_BY")
+        ):
+            raw = {
+                **base,
+                "event_type": projected_type or "trade_closed",
                 "close_price": record.get("price", record.get("close_price")),
                 "profit": record.get("profit"),
                 "commission": record.get("commission"),
+                "fee": record.get("fee"),
+                "total_commission": record.get("total_commission"),
+                "commission_complete": record.get("commission_complete"),
                 "swap": record.get("swap"),
                 "close_time": event_time,
             }
@@ -1759,6 +1808,7 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
                 "close_price": record.get("price", record.get("close_price")),
                 "profit": record.get("profit"),
                 "commission": record.get("commission"),
+                "fee": record.get("fee"),
                 "swap": record.get("swap"),
                 "close_time": event_time,
             }
@@ -1770,43 +1820,681 @@ def _run_history_sync(
     root: Path,
     mode: HistoryMode,
     from_date: "datetime | None",
-    ingestion_sink: TradingIngestionSink | None = None,
+    api: Any | None = None,
+    job: dict | None = None,
+    connection_id: str | None = None,
     login: str | None = None,
     server: str | None = None,
 ) -> dict:
+    if mode != "new_only":
+        if api is None or job is None or connection_id is None or login is None or server is None:
+            raise HistorySyncFailed("lease-bound history delivery context missing")
+        try:
+            resumed = _resume_committed_history_delivery(
+                adapter,
+                root,
+                mode=mode,
+                from_date=from_date,
+                api=api,
+                job=job,
+                connection_id=connection_id,
+                login=login,
+                server=server,
+            )
+        except Exception as exc:
+            if isinstance(exc, (HistorySyncFailed, LeaseLost)):
+                raise
+            raise HistorySyncFailed("history import failed") from exc
+        if resumed is not None:
+            return resumed
+
     dedup = PersistentDedup(root / "state" / "history-dedup.sqlite")
     local_sink = LocalEventSink(root / "data" / "history.jsonl")
-    outbox = EventOutbox(str(root / "state" / "history-outbox.json"))
+    accounting_sink = LocalEventSink(root / "data" / "history-accounting.jsonl")
+    history_events: list[dict[str, Any]] = []
+    history_event_ids: set[str] = set()
+    projected_deals: list[dict[str, Any]] = []
+    local_persist = _deduped_sink(dedup, local_sink)
+    local_accounting_persist = _deduped_sink(dedup, accounting_sink)
 
     def persist(entry: dict) -> None:
-        local_sink(entry)
-        if ingestion_sink is not None:
-            if login is None or server is None:
-                raise HistorySyncFailed("history ingestion identity missing")
-            outbox.enqueue_many([_history_event(entry, login, server)])
+        local_persist(entry)
+        record = dict(entry.get("record") or {})
+        if entry.get("kind") == "deals":
+            projected_deals.append(record)
+        # The history endpoint accepts journal trade events, not the raw MT5 order
+        # stream. Only rows explicitly approved by the ledger projector may leave
+        # the instance; ambiguous reversals remain in the local audit artifacts.
+        # Scale-ins are first-class immutable events because their native deal
+        # identity and opening costs are required for exact journal economics.
+        if (
+            entry.get("kind") == "deals"
+            and record.get("project_as_trade") is True
+            and login is not None
+            and server is not None
+        ):
+            event = _history_event(entry, login, server)
+            event_id = str(event.get("event_id", ""))
+            if event_id not in history_event_ids:
+                history_event_ids.add(event_id)
+                history_events.append(event)
 
-    sink = _deduped_sink(dedup, persist)
     try:
-        counts = HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
-        if ingestion_sink is not None:
-            result = outbox.drain(ingestion_sink)
-            dead_lettered = outbox.dead_letter_count()
-            if result.pending or dead_lettered or result.dry_run:
-                raise HistorySyncFailed(
-                    "history delivery incomplete: "
-                    f"pending={result.pending}, dead_lettered={dead_lettered}, "
-                    f"dry_run={result.dry_run}"
+        counts = HistorySync(
+            adapter,
+            root / "state" / "history.json",
+            persist,
+            local_accounting_persist,
+        ).run(mode, from_date)
+        anchor_reader = getattr(adapter, "history_anchor", None)
+        anchor = anchor_reader() if callable(anchor_reader) else None
+        report_rows_reader = getattr(adapter, "history_balance_rows", None)
+        report_rows = (
+            list(report_rows_reader())
+            if callable(report_rows_reader)
+            else projected_deals
+        )
+        if login is not None and server is not None and connection_id is not None:
+            report = build_balance_backfill_report(
+                report_rows,
+                connection_id=connection_id,
+                account_number=login,
+                server=server,
+                anchor=anchor,
+            )
+            atomic_json(root / "data" / "history-balance-backfill.json", report)
+        if mode != "new_only":
+            if api is None or job is None or connection_id is None or login is None or server is None:
+                raise HistorySyncFailed("lease-bound history delivery context missing")
+            archive_key = hashlib.sha256(str(job["job_id"]).encode("utf-8")).hexdigest()[:16]
+            archive_path = root / "state" / f"history-import-{archive_key}.json"
+            pending_path = root / "state" / "history-handoff-pending.json"
+            job_id = str(job["job_id"])
+            archive_preexisting = archive_path.is_file()
+            if archive_preexisting:
+                document = load_or_create_history_document(
+                    archive_path,
+                    job_id=job_id,
+                    connection_id=connection_id,
+                    account_number=login,
+                    server=server,
+                    history_mode=mode,
+                    from_date=from_date,
+                    events=history_events,
                 )
+                _persist_history_handoff_artifact(
+                    adapter,
+                    root,
+                    job_id=job_id,
+                    connection_id=connection_id,
+                    archive_path=archive_path,
+                    archive_preexisting=True,
+                    document=document,
+                )
+            else:
+                # The pending bundle is the first durable commit: it contains both the exact
+                # document and the frozen history/live boundary. Only after that commit do we
+                # materialize staging and promote it to the immutable uploader name. Therefore
+                # no crash point can leave archive bytes without the baseline they require.
+                staged_archive_path = archive_path.with_name(
+                    f".{archive_path.name}.staged"
+                )
+                staged_preexisting = staged_archive_path.is_file()
+                pending = read_json(pending_path, {})
+                pending_for_job = (
+                    pending.get("job_id") == job_id
+                    and pending.get("connection_id") == connection_id
+                    and pending.get("history_document") == archive_path.name
+                )
+                if pending_for_job:
+                    document = pending.get("history_document_payload")
+                    if not isinstance(document, dict):
+                        raise HistorySyncFailed(
+                            "history handoff prepared archive unavailable"
+                        )
+                    validate_history_document(
+                        document,
+                        job_id=job_id,
+                        connection_id=connection_id,
+                        account_number=login,
+                        server=server,
+                        history_mode=mode,
+                        from_date=from_date,
+                    )
+                    if staged_preexisting:
+                        staged_document = load_or_create_history_document(
+                            staged_archive_path,
+                            job_id=job_id,
+                            connection_id=connection_id,
+                            account_number=login,
+                            server=server,
+                            history_mode=mode,
+                            from_date=from_date,
+                            events=(),
+                        )
+                        if staged_document != document:
+                            raise HistorySyncFailed(
+                                "history handoff staged archive mismatched"
+                            )
+                    handoff_persisted = _persist_history_handoff_artifact(
+                        adapter,
+                        root,
+                        job_id=job_id,
+                        connection_id=connection_id,
+                        archive_path=archive_path,
+                        archive_content_path=(
+                            staged_archive_path if staged_preexisting else None
+                        ),
+                        archive_preexisting=True,
+                        document=document,
+                    )
+                    if not handoff_persisted:
+                        raise HistorySyncFailed(
+                            "history handoff adapter support changed"
+                        )
+                else:
+                    if staged_preexisting:
+                        # Stage-only is not a committed boundary. It may come from the old
+                        # stage-first protocol; replace it together with a newly captured
+                        # pending bundle. Once pending exists, retries never recapture.
+                        staged_preexisting = False
+                    document = build_history_document(
+                        job_id=job_id,
+                        connection_id=connection_id,
+                        account_number=login,
+                        server=server,
+                        history_mode=mode,
+                        from_date=from_date,
+                        events=history_events,
+                    )
+                    handoff_persisted = _persist_history_handoff_artifact(
+                        adapter,
+                        root,
+                        job_id=job_id,
+                        connection_id=connection_id,
+                        archive_path=archive_path,
+                        archive_preexisting=False,
+                        document=document,
+                        history_counts=counts,
+                    )
+                if not staged_preexisting:
+                    atomic_json(staged_archive_path, document)
+                try:
+                    staged_digest = hashlib.sha256(
+                        staged_archive_path.read_bytes()
+                    ).hexdigest()
+                except OSError as exc:
+                    raise HistorySyncFailed(
+                        "history staged archive unavailable"
+                    ) from exc
+                if handoff_persisted:
+                    committed_pending = read_json(pending_path, {})
+                    expected_digest = committed_pending.get(
+                        "history_document_sha256"
+                    )
+                    if (
+                        committed_pending.get("job_id") != job_id
+                        or committed_pending.get("connection_id") != connection_id
+                        or not isinstance(expected_digest, str)
+                        or staged_digest != expected_digest
+                    ):
+                        raise HistorySyncFailed("history staged archive digest mismatch")
+                elif staged_digest != history_document_sha256(document):
+                    raise HistorySyncFailed("history staged archive digest mismatch")
+                try:
+                    durable_replace(staged_archive_path, archive_path)
+                except OSError as exc:
+                    raise HistorySyncFailed("history archive publication failed") from exc
+            _deliver_history_document(api, job, document)
         return counts
     except Exception as exc:
-        if isinstance(exc, HistorySyncFailed):
+        if isinstance(exc, (HistorySyncFailed, LeaseLost)):
             raise
         raise HistorySyncFailed("history import failed") from exc
     finally:
         dedup.close()
 
 
+def _history_document_deal_tickets(document: dict[str, Any]) -> list[str]:
+    """Return the exact native deal membership committed by one history document."""
+
+    trades = document.get("trades")
+    if not isinstance(trades, list):
+        raise HistorySyncFailed("history archive trades invalid")
+    tickets: set[str] = set()
+    for group in trades:
+        if not isinstance(group, dict) or not isinstance(group.get("events"), list):
+            raise HistorySyncFailed("history archive events invalid")
+        for event in group["events"]:
+            if not isinstance(event, dict):
+                raise HistorySyncFailed("history archive event invalid")
+            ticket = event.get("native_deal_ticket")
+            if ticket is None:
+                raise HistorySyncFailed("history archive native deal identity missing")
+            ticket_text = str(ticket)
+            if not re.fullmatch(r"[0-9]{1,32}", ticket_text):
+                raise HistorySyncFailed("history archive native deal identity invalid")
+            tickets.add(ticket_text)
+    return sorted(tickets, key=lambda value: (len(value), value))
+
+
+def _history_document_event_count(document: dict[str, Any]) -> int:
+    trades = document.get("trades")
+    if not isinstance(trades, list):
+        raise HistorySyncFailed("history archive trades invalid")
+    count = 0
+    for group in trades:
+        if not isinstance(group, dict) or not isinstance(group.get("events"), list):
+            raise HistorySyncFailed("history archive events invalid")
+        if any(not isinstance(event, dict) for event in group["events"]):
+            raise HistorySyncFailed("history archive event invalid")
+        count += len(group["events"])
+    return count
+
+
+def _validated_history_counts(
+    value: object, document: dict[str, Any]
+) -> dict[str, int]:
+    event_count = _history_document_event_count(document)
+    if value is None:
+        # Compatibility for injected/non-file adapters and direct helper tests. Production file
+        # handoffs always persist the exact HistorySync counters in the committed bundle.
+        return {"orders": 0, "deals": event_count, "accounting_deals": 0}
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"orders", "deals", "accounting_deals"}
+        or any(
+            not isinstance(value.get(field), int)
+            or isinstance(value.get(field), bool)
+            or value[field] < 0
+            for field in ("orders", "deals", "accounting_deals")
+        )
+        or value["deals"] != event_count
+    ):
+        raise HistorySyncFailed("history handoff counters invalid")
+    return {
+        "orders": value["orders"],
+        "deals": value["deals"],
+        "accounting_deals": value["accounting_deals"],
+    }
+
+
+def _deliver_history_document(api: Any, job: dict, document: dict[str, Any]) -> None:
+    importer = getattr(api, "import_history_file", None)
+    if not callable(importer):
+        raise HistorySyncFailed("lease-bound history route unavailable")
+    result = importer(str(job["job_id"]), str(job["lease_id"]), document)
+    if not isinstance(result, dict):
+        raise HistorySyncFailed("history archive acknowledgement invalid")
+    if result.get("error_code") == "lease_lost":
+        raise LeaseLost("history import lease is lost")
+    if result.get("accepted") != _history_document_event_count(document):
+        raise HistorySyncFailed("history archive acknowledgement mismatch")
+
+
+def _resume_committed_history_delivery(
+    adapter: Any,
+    root: Path,
+    *,
+    mode: HistoryMode,
+    from_date: "datetime | None",
+    api: Any,
+    job: dict,
+    connection_id: str,
+    login: str,
+    server: str,
+) -> dict[str, int] | None:
+    """Finish an already committed handoff without reading mutable MT5 history again."""
+
+    job_id = str(job["job_id"])
+    archive_key = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
+    archive_path = root / "state" / f"history-import-{archive_key}.json"
+    staged_archive_path = archive_path.with_name(f".{archive_path.name}.staged")
+    pending_path = root / "state" / "history-handoff-pending.json"
+    pending = read_json(pending_path, {})
+    pending_for_job = (
+        isinstance(pending, dict)
+        and pending.get("job_id") == job_id
+        and pending.get("connection_id") == connection_id
+        and pending.get("history_document") == archive_path.name
+    )
+
+    if not archive_path.is_file() and not pending_for_job:
+        # A stage without its pending commit is deliberately not recoverable: the snapshot and
+        # checkpoint that belonged to those bytes were never made durable. The caller will take
+        # one new coherent boundary and overwrite that uncommitted stage.
+        return None
+
+    if archive_path.is_file():
+        document = load_or_create_history_document(
+            archive_path,
+            job_id=job_id,
+            connection_id=connection_id,
+            account_number=login,
+            server=server,
+            history_mode=mode,
+            from_date=from_date,
+            events=(),
+        )
+        handoff_persisted = _persist_history_handoff_artifact(
+            adapter,
+            root,
+            job_id=job_id,
+            connection_id=connection_id,
+            archive_path=archive_path,
+            archive_preexisting=True,
+            document=document,
+        )
+        counts = _validated_history_counts(
+            pending.get("history_counts") if handoff_persisted else None,
+            document,
+        )
+    else:
+        document = pending.get("history_document_payload")
+        if not isinstance(document, dict):
+            raise HistorySyncFailed("history handoff prepared archive unavailable")
+        validate_history_document(
+            document,
+            job_id=job_id,
+            connection_id=connection_id,
+            account_number=login,
+            server=server,
+            history_mode=mode,
+            from_date=from_date,
+        )
+        staged_preexisting = staged_archive_path.is_file()
+        if staged_preexisting:
+            staged_document = load_or_create_history_document(
+                staged_archive_path,
+                job_id=job_id,
+                connection_id=connection_id,
+                account_number=login,
+                server=server,
+                history_mode=mode,
+                from_date=from_date,
+                events=(),
+            )
+            if staged_document != document:
+                raise HistorySyncFailed("history handoff staged archive mismatched")
+        if not _persist_history_handoff_artifact(
+            adapter,
+            root,
+            job_id=job_id,
+            connection_id=connection_id,
+            archive_path=archive_path,
+            archive_content_path=(
+                staged_archive_path if staged_preexisting else None
+            ),
+            archive_preexisting=True,
+            document=document,
+        ):
+            raise HistorySyncFailed("history handoff adapter support changed")
+        counts = _validated_history_counts(pending.get("history_counts"), document)
+        if not staged_preexisting:
+            atomic_json(staged_archive_path, document)
+        try:
+            staged_digest = hashlib.sha256(staged_archive_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise HistorySyncFailed("history staged archive unavailable") from exc
+        if staged_digest != pending.get("history_document_sha256"):
+            raise HistorySyncFailed("history staged archive digest mismatch")
+        try:
+            durable_replace(staged_archive_path, archive_path)
+        except OSError as exc:
+            raise HistorySyncFailed("history archive publication failed") from exc
+
+    _deliver_history_document(api, job, document)
+    return counts
+
+
+def _persist_history_handoff_artifact(
+    adapter: Any,
+    root: Path,
+    *,
+    job_id: str,
+    connection_id: str,
+    archive_path: Path,
+    archive_content_path: Path | None = None,
+    archive_preexisting: bool,
+    document: dict[str, Any],
+    history_counts: dict[str, int] | None = None,
+) -> bool:
+    """Bind the frozen position baseline to the immutable uploaded history bytes.
+
+    The file adapter exposes one atomic/frozen history bundle. Other injected adapters do not
+    participate in the file-bridge handoff, so they intentionally keep their legacy flow.
+    Once an archive exists, its original handoff artifact is mandatory: recapturing a newer
+    snapshot during retry could acknowledge or suppress deals that were never in that archive.
+    """
+
+    snapshot_reader = getattr(adapter, "snapshot", None)
+    checkpoint_reader = getattr(adapter, "checkpoint", None)
+    acknowledge = getattr(adapter, "acknowledge_events", None)
+    supports_file_handoff = all(
+        callable(value) for value in (snapshot_reader, checkpoint_reader, acknowledge)
+    )
+    if not supports_file_handoff:
+        return False
+
+    digest_path = archive_content_path
+    if digest_path is None and archive_path.is_file():
+        digest_path = archive_path
+    if digest_path is None:
+        archive_digest = history_document_sha256(document)
+    else:
+        try:
+            archive_digest = hashlib.sha256(
+                digest_path.read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            raise HistorySyncFailed("history archive digest unavailable") from exc
+    pending_path = root / "state" / "history-handoff-pending.json"
+    if archive_preexisting:
+        artifact = read_json(pending_path, {})
+        expected_archive_name = archive_path.name
+        artifact_counts = _validated_history_counts(
+            artifact.get("history_counts"), document
+        )
+        expected_counts = (
+            _validated_history_counts(history_counts, document)
+            if history_counts is not None
+            else artifact_counts
+        )
+        if (
+            artifact.get("schema_version") != 1
+            or artifact.get("job_id") != job_id
+            or artifact.get("connection_id") != connection_id
+            or artifact.get("history_document") != expected_archive_name
+            or artifact.get("history_document_sha256") != archive_digest
+            or "history_counts" not in artifact
+            or artifact_counts != expected_counts
+            or (
+                artifact.get("history_document_payload") is not None
+                and artifact.get("history_document_payload") != document
+            )
+        ):
+            raise HistorySyncFailed("history handoff artifact missing or mismatched")
+        return True
+
+    normalized_counts = _validated_history_counts(history_counts, document)
+    snapshot = snapshot_reader()
+    checkpoint = checkpoint_reader()
+    sequence = checkpoint.get("sequence") if isinstance(checkpoint, dict) else None
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise HistorySyncFailed("history handoff checkpoint invalid")
+    if not isinstance(snapshot, dict):
+        raise HistorySyncFailed("history handoff snapshot invalid")
+    positions = snapshot.get("positions")
+    orders = snapshot.get("orders")
+    deals = snapshot.get("deals")
+    if not all(isinstance(value, dict) for value in (positions, orders, deals)):
+        raise HistorySyncFailed("history handoff snapshot invalid")
+
+    imported_deal_tickets = _history_document_deal_tickets(document)
+    anchored_deal_tickets = sorted(
+        (str(ticket) for ticket in deals), key=lambda value: (len(value), value)
+    )
+    if any(
+        not re.fullmatch(r"[0-9]{1,32}", ticket)
+        for ticket in anchored_deal_tickets
+    ):
+        raise HistorySyncFailed("history handoff ledger identity invalid")
+    if not set(imported_deal_tickets).issubset(set(anchored_deal_tickets)):
+        raise HistorySyncFailed("history handoff ledger membership mismatch")
+    atomic_json(
+        pending_path,
+        {
+            "schema_version": 1,
+            "job_id": job_id,
+            "connection_id": connection_id,
+            "history_document": archive_path.name,
+            "history_document_sha256": archive_digest,
+            # The document and the frozen baseline form one atomic recovery bundle. Keeping the
+            # payload here lets a retry materialize missing staging bytes without querying MT5
+            # again or moving the history/live boundary.
+            "history_document_payload": document,
+            "history_counts": normalized_counts,
+            "anchor_sequence": sequence,
+            # Every deal in the frozen ledger belongs to the history side of the boundary,
+            # including accounting rows and deliberately non-projected reversals. A delayed
+            # native callback for any of them must never escape later as a live trade.
+            "archived_deal_tickets": anchored_deal_tickets,
+            "imported_deal_tickets": imported_deal_tickets,
+            "snapshot": {"positions": positions, "orders": orders, "deals": {}},
+        },
+    )
+    return True
+
+
+def _prepare_history_to_live_handoff(adapter: Any, root: Path) -> int:
+    """Activate the baseline captured with the exact immutable history archive.
+
+    The pending artifact is created before remote delivery and is reused byte-for-byte on a
+    retry. No current MT5 state is recaptured here. Deal membership remains persistent after
+    activation so even a delayed ``OnTradeTransaction`` callback is never imported twice.
+    """
+
+    artifact = read_json(root / "state" / "history-handoff-pending.json", {})
+    acknowledge = getattr(adapter, "acknowledge_events", None)
+    archive_name = artifact.get("history_document")
+    archive_digest = artifact.get("history_document_sha256")
+    sequence = artifact.get("anchor_sequence")
+    snapshot = artifact.get("snapshot")
+    tickets = artifact.get("archived_deal_tickets")
+    imported_tickets = artifact.get("imported_deal_tickets")
+    if (
+        artifact.get("schema_version") != 1
+        or artifact.get("connection_id") != root.name
+        or not isinstance(artifact.get("job_id"), str)
+        or not re.fullmatch(r"history-import-[0-9a-f]{16}\.json", str(archive_name))
+        or not isinstance(archive_digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", archive_digest)
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 0
+        or not isinstance(snapshot, dict)
+        or not isinstance(tickets, list)
+        or not isinstance(imported_tickets, list)
+        or any(
+            not isinstance(ticket, str)
+            or not re.fullmatch(r"[0-9]{1,32}", ticket)
+            for ticket in [*tickets, *imported_tickets]
+        )
+        or not set(imported_tickets).issubset(set(tickets))
+        or not callable(acknowledge)
+    ):
+        raise HistorySyncFailed("history handoff artifact invalid")
+    positions = snapshot.get("positions")
+    orders = snapshot.get("orders")
+    deals = snapshot.get("deals")
+    if not all(isinstance(value, dict) for value in (positions, orders, deals)) or deals:
+        raise HistorySyncFailed("history handoff baseline invalid")
+    archive_path = root / "state" / str(archive_name)
+    try:
+        current_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise HistorySyncFailed("history handoff archive unavailable") from exc
+    if current_digest != archive_digest:
+        raise HistorySyncFailed("history handoff archive digest mismatch")
+
+    active_path = root / "state" / "history-live-handoff.json"
+    active = read_json(active_path, {})
+    if active:
+        active_matches = (
+            active.get("schema_version") == 2
+            and active.get("job_id") == artifact["job_id"]
+            and active.get("connection_id") == root.name
+            and active.get("history_document_sha256") == archive_digest
+            and active.get("anchor_sequence") == sequence
+            and active.get("archived_deal_tickets") == tickets
+            and active.get("imported_deal_tickets") == imported_tickets
+        )
+        if active_matches:
+            # Activation is the local commit record. It is written only after the baseline and
+            # event checkpoint are durable. A reclaimed/completion retry must not rewind either
+            # one after LiveSync has already advanced beyond this anchor.
+            return sequence
+        if active.get("job_id") == artifact["job_id"]:
+            raise HistorySyncFailed("active history handoff conflicts with archive")
+
+    PersistentSnapshot(root / "state" / "live_snapshot.json").save(snapshot)
+    acknowledge(sequence)
+    # This marker is the activation commit and must therefore be written last. Native ticket
+    # membership remains durable across every later live poll; the next history job replaces it.
+    atomic_json(
+        active_path,
+        {
+            "schema_version": 2,
+            "job_id": artifact["job_id"],
+            "connection_id": root.name,
+            "history_document_sha256": archive_digest,
+            "anchor_sequence": sequence,
+            "archived_deal_tickets": tickets,
+            "imported_deal_tickets": imported_tickets,
+        },
+    )
+    return sequence
+
+
 def _start_file_bridge_and_sync(
+    job: dict,
+    api: Any,
+    root: Path,
+    cid: str,
+    login: int,
+    server: str,
+    connection_endpoint: str,
+    mode: HistoryMode,
+    from_date: "datetime | None",
+    store: WindowsSecretStore,
+    process_factory: Callable[[Path], Any],
+    expert_binary: Path,
+    runtime_factory: Callable[[Path, str], NativeMt5Runtime],
+    trading_ingestion_url: str,
+    endpoint_observer: BrokerEndpointObserver | None = None,
+) -> dict:
+    """Serialize the complete history-to-live publication for one connection."""
+    with connection_sync_lock(cid):
+        return _start_file_bridge_and_sync_locked(
+            job,
+            api,
+            root,
+            cid,
+            login,
+            server,
+            connection_endpoint,
+            mode,
+            from_date,
+            store,
+            process_factory,
+            expert_binary,
+            runtime_factory,
+            trading_ingestion_url,
+            endpoint_observer,
+        )
+
+
+def _start_file_bridge_and_sync_locked(
     job: dict,
     api: Any,
     root: Path,
@@ -1966,8 +2654,36 @@ def _start_file_bridge_and_sync(
             local_status="importing_history",
         )
         _require_lease(api, job)
-        # Native backfill is delivered by events/event-*.json in the following live poll.
-        counts = _run_history_sync(adapter, root, mode, from_date)
+        counts = _run_history_sync(
+            adapter,
+            root,
+            mode,
+            from_date,
+            api,
+            job,
+            cid,
+            str(login),
+            effective_server,
+        )
+        if mode != "new_only":
+            _prepare_history_to_live_handoff(adapter, root)
+            # Switch the already-running EA in place. OnTradeTransaction remains active while
+            # the history archive is uploaded and during this handoff, eliminating the blind
+            # interval in which a fully opened-and-closed trade used to disappear on restart.
+            _require_lease(api, job)
+            try:
+                runtime.switch_to_new_only()
+            except NativeMt5Error as exc:
+                code = str(exc)
+                raise Mt5InitializeFailed(code) from exc
+            adapter = Mql5FileMt5Adapter(
+                status.files_path,
+                cid,
+                login,
+                effective_server,
+                root / "state",
+            )
+            _verify_investor_access(adapter)
         _record_checkpoint(
             api,
             job,
@@ -2102,7 +2818,15 @@ def _authenticate_and_sync(
             )
             _require_lease(api, job)
             counts = _run_history_sync(
-                adapter, root, mode, from_date, ingestion_sink, str(login), server
+                adapter,
+                root,
+                mode,
+                from_date,
+                api,
+                job,
+                cid,
+                str(login),
+                server,
             )
             _record_checkpoint(
                 api,

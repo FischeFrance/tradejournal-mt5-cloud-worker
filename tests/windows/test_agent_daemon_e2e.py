@@ -92,6 +92,34 @@ class MockControlPlane:
     def heartbeat(self, job_id: str, lease_id: str) -> dict:
         return {"api_version": "1", "lease_valid": True}
 
+    def progress(
+        self,
+        job_id: str,
+        lease_id: str,
+        event_code: str,
+        event_status: str,
+        detail_code: str | None = None,
+    ) -> dict:
+        return {"api_version": "1", "event_recorded": True}
+
+    def import_history_file(
+        self,
+        job_id: str,
+        lease_id: str,
+        document: dict,
+    ) -> dict:
+        accepted = sum(
+            len(group["events"])
+            for group in document["trades"]
+        )
+        return {
+            "api_version": "1",
+            "accepted": accepted,
+            "inserted": accepted,
+            "duplicates": 0,
+            "object_deleted": True,
+        }
+
     def transition(self, job_id: str, lease_id: str, status: str, result: dict | None = None) -> dict:
         self.transitions.append((job_id, status, result))
         return {"api_version": "1", "status": "failed" if status == "fail" else status}

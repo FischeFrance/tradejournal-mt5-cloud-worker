@@ -35,6 +35,8 @@ input int InpCandleBars       = 200;      // Barre storiche complete da pubblica
 //--- Stato di processo persistito su disco per sopravvivere a un riavvio di EA/terminale.
 long g_event_seq     = 0;
 bool g_backfill_done = false;
+bool g_history_snapshot_written = false;
+long g_history_snapshot_sequence = 0;
 
 //--- Identificativo della connessione (UUID non sensibile), letto una volta in OnInit da un file
 //--- scritto dal Windows Agent PRIMA di avviare il terminale: l'EA non ha altro modo di
@@ -147,7 +149,10 @@ string JsonNumber(const double value)
   {
    if(!MathIsValidNumber(value))
       return "0"; // difensivo: un numero non finito non deve mai rompere il JSON prodotto
-   return DoubleToString(value, 5);
+   // Preserve the MT5 double instead of rounding every ledger row to five decimals.  Per-row
+   // rounding accumulates when an opening balance is reconstructed backwards over a long
+   // history and is especially visible on crypto-denominated accounts.
+   return DoubleToString(value, 16);
   }
 
 // Ogni file del protocollo nativo usa la stessa envelope. Login/server sono identita' di
@@ -167,8 +172,9 @@ string BuildEnvelope(const string payload, const long sequence)
    return json;
   }
 
-// datetime MQL5 e' gia' un timestamp Unix (secondi UTC dal 1970-01-01): nessuna conversione
-// di fuso orario e' necessaria, solo la formattazione ISO8601 con suffisso Z.
+// Compatibilita' wire: il suffisso Z resta nel formato storico del bridge. Per TimeCurrent e
+// DEAL_TIME il valore appartiene pero' al dominio temporale del server broker, non a UTC. Il
+// worker conserva quindi time_msc solo per identita'/audit e marca il time_basis come irrisolto.
 string Iso8601FromDatetime(const datetime value)
   {
    string s = TimeToString(value, TIME_DATE | TIME_SECONDS); // "yyyy.mm.dd hh:mi:ss"
@@ -345,11 +351,12 @@ bool SaveCursorState()
 //+------------------------------------------------------------------------+
 //| Costruzione degli snapshot completi (account/posizioni/ordini/candele) |
 //+------------------------------------------------------------------------+
-string BuildHeartbeatJson()
+string BuildHeartbeatJson(const long sequence)
   {
    string json = "{";
    json += "\"generated_at\":" + JsonString(Iso8601FromDatetime(TimeCurrent())) + ",";
-   json += "\"sequence\":" + IntegerToString(g_event_seq) + ",";
+   json += "\"sequence\":" + IntegerToString(sequence) + ",";
+   json += "\"history_mode\":" + JsonString(g_new_only ? "new_only" : "history") + ",";
    json += "\"terminal_connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false") + ",";
    json += "\"account_trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false");
    json += "}";
@@ -361,6 +368,7 @@ string BuildAccountJson()
    long   login    = AccountInfoInteger(ACCOUNT_LOGIN);
    string server   = AccountInfoString(ACCOUNT_SERVER);
    double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double credit   = AccountInfoDouble(ACCOUNT_CREDIT);
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
    string currency = AccountInfoString(ACCOUNT_CURRENCY);
    long   leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
@@ -372,6 +380,7 @@ string BuildAccountJson()
    json += "\"login\":" + JsonString(IntegerToString(login)) + ",";
    json += "\"server\":" + JsonString(server) + ",";
    json += "\"balance\":" + JsonNumber(balance) + ",";
+   json += "\"credit\":" + JsonNumber(credit) + ",";
    json += "\"equity\":" + JsonNumber(equity) + ",";
    json += "\"currency\":" + JsonString(currency) + ",";
    json += "\"leverage\":" + IntegerToString(leverage) + ",";
@@ -468,7 +477,7 @@ string BuildOrdersJson()
 string BuildHistoryOrdersJson()
   {
    datetime to_time = TimeCurrent();
-   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
+   datetime from_time = 0; // la finestra richiesta viene applicata dall'Agent
    string json = "[";
    bool first = true;
    if(!HistorySelect(from_time, to_time))
@@ -496,40 +505,169 @@ string BuildHistoryOrdersJson()
    return json + "]";
   }
 
-string BuildDealsJson()
+// Il ledger storico e' il confine di consistenza del bundle history. Lo catturiamo prima di
+// account/posizioni/ordini e lo confrontiamo nuovamente subito prima del heartbeat: se MT5
+// cambia mentre gli altri file vengono pubblicati, il nuovo bundle resta senza commit e il
+// Windows Agent continua a leggere l'ultimo heartbeat coerente.
+struct HistoryLedgerAnchor
   {
+   bool     coherent;
+   int      deal_count;
+   long     last_deal_ticket;
+   long     last_deal_time_msc;
+   double   balance;
+   double   credit;
+   datetime as_of;
+  };
+
+void ResetHistoryLedgerAnchor(HistoryLedgerAnchor &anchor)
+  {
+   anchor.coherent           = false;
+   anchor.deal_count         = 0;
+   anchor.last_deal_ticket   = 0;
+   anchor.last_deal_time_msc = 0;
+   anchor.balance            = 0.0;
+   anchor.credit             = 0.0;
+   anchor.as_of              = 0;
+  }
+
+bool RevalidateHistoryLedgerAnchor(HistoryLedgerAnchor &anchor)
+  {
+   if(!anchor.coherent)
+      return false;
+
+   // La coppia (ultimo time_msc, ultimo ticket) e il count sono l'high-water mark del ledger
+   // nel suo ordine MT5. Rieseguiamo HistorySelect dopo la scrittura degli altri snapshot,
+   // cosi' nessuna variazione economica puo' ricevere il nuovo heartbeat per errore.
+   if(!HistorySelect(0, TimeCurrent()))
+      return false;
+
+   int total = HistoryDealsTotal();
+   int count = 0;
+   long last_ticket = 0;
+   long last_time_msc = 0;
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         return false;
+      count++;
+      last_ticket = (long)ticket;
+      last_time_msc = HistoryDealGetInteger(ticket, DEAL_TIME_MSC);
+     }
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double credit = AccountInfoDouble(ACCOUNT_CREDIT);
+   return count == total &&
+          count == anchor.deal_count &&
+          last_ticket == anchor.last_deal_ticket &&
+          last_time_msc == anchor.last_deal_time_msc &&
+          MathAbs(balance - anchor.balance) < 0.000001 &&
+          MathAbs(credit - anchor.credit) < 0.000001;
+  }
+
+string BuildDealsJson(HistoryLedgerAnchor &anchor)
+  {
+   ResetHistoryLedgerAnchor(anchor);
    datetime to_time = TimeCurrent();
-   datetime from_time = to_time - MathMax(1, InpSnapshotHistoryHours) * 3600;
-   string json = "[";
+   datetime from_time = 0; // ledger completo: cash flow e posizioni sovrapposte inclusi
+   double balance_before = AccountInfoDouble(ACCOUNT_BALANCE);
+   double credit_before = AccountInfoDouble(ACCOUNT_CREDIT);
+   string deals = "[";
    bool first = true;
    if(!HistorySelect(from_time, to_time))
-      return json + "]";
+      return "{\"anchor\":{\"balance\":" + JsonNumber(balance_before) +
+             ",\"credit\":" + JsonNumber(credit_before) +
+             ",\"as_of\":" + JsonString(Iso8601FromDatetime(to_time)) +
+             ",\"coherent\":false,\"order_basis\":\"mt5_history_index_v1\"" +
+             ",\"time_basis\":\"broker_server_unresolved\",\"deal_count\":0" +
+             "},\"deals\":[]}";
    int total = HistoryDealsTotal();
+   int exported_total = 0;
+   long selected_last_ticket = 0;
+   long selected_last_time_msc = 0;
    for(int i = 0; i < total; i++)
      {
       ulong ticket = HistoryDealGetTicket(i);
       if(ticket == 0)
          continue;
+      long deal_time_msc = HistoryDealGetInteger(ticket, DEAL_TIME_MSC);
+      selected_last_time_msc = deal_time_msc;
+      selected_last_ticket = (long)ticket;
       if(!first)
-         json += ",";
+         deals += ",";
       first = false;
-      json += "{";
-      json += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
-      json += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
-      json += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
+      deals += "{";
+      deals += "\"history_index\":" + IntegerToString(exported_total) + ",";
+      deals += "\"ticket\":" + JsonString(IntegerToString((long)ticket)) + ",";
+      deals += "\"position_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID))) + ",";
+      deals += "\"order_id\":" + JsonString(IntegerToString((long)HistoryDealGetInteger(ticket, DEAL_ORDER))) + ",";
+      deals += "\"symbol\":" + JsonString(HistoryDealGetString(ticket, DEAL_SYMBOL)) + ",";
       long deal_type = HistoryDealGetInteger(ticket, DEAL_TYPE);
       long entry_raw = HistoryDealGetInteger(ticket, DEAL_ENTRY);
-      json += "\"direction\":" + JsonString(deal_type == DEAL_TYPE_SELL ? "sell" : "buy") + ",";
-      json += "\"entry\":" + JsonString(EntryToString(entry_raw)) + ",";
-      json += "\"volume\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_VOLUME)) + ",";
-      json += "\"price\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PRICE)) + ",";
-      json += "\"profit\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PROFIT)) + ",";
-      json += "\"commission\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_COMMISSION)) + ",";
-      json += "\"swap\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_SWAP)) + ",";
-      json += "\"time\":" + JsonString(Iso8601FromDatetime((datetime)HistoryDealGetInteger(ticket, DEAL_TIME)));
-      json += "}";
+      deals += "\"deal_type\":" + IntegerToString(deal_type) + ",";
+      deals += "\"direction\":" + JsonString(deal_type == DEAL_TYPE_SELL ? "sell" : "buy") + ",";
+      deals += "\"entry\":" + JsonString(EntryToString(entry_raw)) + ",";
+      deals += "\"volume\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_VOLUME)) + ",";
+      deals += "\"price\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PRICE)) + ",";
+      deals += "\"profit\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_PROFIT)) + ",";
+      deals += "\"commission\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_COMMISSION)) + ",";
+      deals += "\"swap\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_SWAP)) + ",";
+      deals += "\"fee\":" + JsonNumber(HistoryDealGetDouble(ticket, DEAL_FEE)) + ",";
+      deals += "\"time_msc\":" + IntegerToString(deal_time_msc) + ",";
+      deals += "\"time\":" + JsonString(Iso8601FromDatetime((datetime)HistoryDealGetInteger(ticket, DEAL_TIME)));
+      deals += "}";
+      exported_total++;
      }
-   return json + "]";
+   deals += "]";
+   double balance_mid = AccountInfoDouble(ACCOUNT_BALANCE);
+   double credit_mid = AccountInfoDouble(ACCOUNT_CREDIT);
+   datetime verified_at = TimeCurrent();
+   bool verified = HistorySelect(from_time, verified_at);
+   int verified_total = verified ? HistoryDealsTotal() : -1;
+   int verified_count = 0;
+   long verified_last_ticket = 0;
+   long verified_last_time_msc = 0;
+   if(verified && verified_total > 0)
+     {
+      for(int verify_index = 0; verify_index < verified_total; verify_index++)
+        {
+         ulong verified_ticket = HistoryDealGetTicket(verify_index);
+         if(verified_ticket == 0)
+            continue;
+         long verified_time_msc = HistoryDealGetInteger(verified_ticket, DEAL_TIME_MSC);
+         verified_last_ticket = (long)verified_ticket;
+         verified_last_time_msc = verified_time_msc;
+         verified_count++;
+        }
+     }
+   double balance_after = AccountInfoDouble(ACCOUNT_BALANCE);
+   double credit_after = AccountInfoDouble(ACCOUNT_CREDIT);
+   bool coherent = verified && exported_total == total &&
+                   verified_count == verified_total && verified_count == exported_total &&
+                   verified_last_ticket == selected_last_ticket &&
+                   verified_last_time_msc == selected_last_time_msc &&
+                   MathAbs(balance_before - balance_mid) < 0.000001 &&
+                   MathAbs(balance_mid - balance_after) < 0.000001 &&
+                   MathAbs(credit_before - credit_mid) < 0.000001 &&
+                   MathAbs(credit_mid - credit_after) < 0.000001;
+   anchor.coherent = coherent;
+   anchor.deal_count = exported_total;
+   anchor.last_deal_ticket = selected_last_ticket;
+   anchor.last_deal_time_msc = selected_last_time_msc;
+   anchor.balance = balance_after;
+   anchor.credit = credit_after;
+   anchor.as_of = verified_at;
+   return "{\"anchor\":{\"balance\":" + JsonNumber(anchor.balance) +
+          ",\"credit\":" + JsonNumber(anchor.credit) +
+          ",\"as_of\":" + JsonString(Iso8601FromDatetime(anchor.as_of)) +
+          ",\"coherent\":" + (anchor.coherent ? "true" : "false") +
+          ",\"order_basis\":\"mt5_history_index_v1\"" +
+          ",\"time_basis\":\"broker_server_unresolved\"" +
+          ",\"deal_count\":" + IntegerToString(anchor.deal_count) +
+          ",\"last_deal_ticket\":" + JsonString(IntegerToString(anchor.last_deal_ticket)) +
+          ",\"last_deal_time_msc\":" + IntegerToString(anchor.last_deal_time_msc) +
+          "},\"deals\":" + deals + "}";
   }
 
 string BuildCandlesJson(const int timeframe_index)
@@ -662,7 +800,10 @@ bool EmitDealAddEvent(const ulong deal_ticket)
    double   volume       = HistoryDealGetDouble(deal_ticket, DEAL_VOLUME);
    double   price        = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
    double   profit       = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
-   double   commission   = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+   // Il contratto remoto espone un solo costo: somma commissione e DEAL_FEE.
+   // Lo snapshot storico mantiene comunque entrambi i valori originali per audit.
+   double   commission   = HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION) +
+                           HistoryDealGetDouble(deal_ticket, DEAL_FEE);
    double   swap         = HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
    long     magic        = HistoryDealGetInteger(deal_ticket, DEAL_MAGIC);
    string   comment      = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
@@ -815,8 +956,9 @@ void EmitPositionEvent(const ulong position_ticket)
    string   comment     = PositionGetString(POSITION_COMMENT);
    datetime event_time  = (datetime)PositionGetInteger(POSITION_TIME_UPDATE);
    long     timestamp_msc = PositionGetInteger(POSITION_TIME_UPDATE_MSC);
+   long     position_id = PositionGetInteger(POSITION_IDENTIFIER);
 
-   string line = BuildEventJson("POSITION", (long)position_ticket, (long)position_ticket, 0, 0,
+   string line = BuildEventJson("POSITION", (long)position_ticket, position_id, 0, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
                                  0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
    WriteEventAtomic(line);
@@ -845,15 +987,9 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
   }
 
 //+------------------------------------------------------------------------+
-//| Backfill una tantum al primo avvio: rilegge lo storico deal/ordini     |
-//| nella finestra configurata e lo trascrive con lo stesso schema evento  |
-//| usato in tempo reale, cosi' il bridge non deve distinguere backfill da |
-//| eventi live. Marcato completato nel cursore persistente: un riavvio    |
-//| successivo dell'EA non lo ripete (e anche se lo ripetesse, gli         |
-//| event_id verrebbero rigenerati con una nuova sequenza: la deduplica    |
-//| finale dei deal nel bridge e' comunque per (connection_id, login,      |
-//| server, deal_ticket), non per event_id, quindi resta corretta in ogni  |
-//| caso).                                                                  |
+//| Il backfill storico non entra nella coda live. L'Agent legge gli       |
+//| snapshot e li consegna solo alla route /history vincolata alla lease:  |
+//| nessun rate limit live e nessun saldo corrente attribuito al passato.  |
 //+------------------------------------------------------------------------+
 void RunBackfill()
   {
@@ -872,20 +1008,7 @@ void RunBackfill()
      }
 
    int deals_total = HistoryDealsTotal();
-   for(int i = 0; i < deals_total; i++)
-     {
-      ulong ticket = HistoryDealGetTicket(i);
-      if(ticket != 0)
-         EmitDealAddEvent(ticket);
-     }
-
    int orders_total = HistoryOrdersTotal();
-   for(int i = 0; i < orders_total; i++)
-     {
-      ulong ticket = HistoryOrderGetTicket(i);
-      if(ticket != 0)
-         EmitHistoryOrderEvent(ticket);
-     }
 
    PrintFormat("TradeJournalBridge: backfill completato (%d deal, %d ordini storici, finestra %dh).",
                deals_total, orders_total, InpBackfillHours);
@@ -898,26 +1021,91 @@ void RunBackfill()
 //+------------------------------------------------------------------------+
 void WriteAllSnapshots()
   {
+   if(!g_new_only && g_history_snapshot_written)
+     {
+      // Lo storico deve restare immutabile e coerente con il balance anchor acquisito nello
+      // stesso ciclo. La sequenza degli eventi live puo' continuare ad avanzare, mentre
+      // l'heartbeat storico mantiene la sequence immutabile della fotografia certificata.
+      WriteJsonAtomic("heartbeat.json", BuildEnvelope(
+         BuildHeartbeatJson(g_history_snapshot_sequence), g_history_snapshot_sequence));
+      return;
+     }
    g_event_seq++;
    long sequence = g_event_seq;
-   WriteJsonAtomic("account.json", BuildEnvelope(BuildAccountJson(), sequence));
-   WriteJsonAtomic("positions.json", BuildEnvelope(BuildPositionsJson(), sequence));
-   WriteJsonAtomic("orders.json", BuildEnvelope(BuildOrdersJson(), sequence));
    if(g_new_only)
      {
       // new_only parte da "adesso": nessun HistorySelect e nessun download candele deve
       // ritardare account/heartbeat o il primo snapshot live.
-      WriteJsonAtomic("history_orders.json", BuildEnvelope("[]", sequence));
-      WriteJsonAtomic("deals.json", BuildEnvelope("[]", sequence));
-      WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(), sequence));
+      bool snapshot_ok = true;
+      if(!WriteJsonAtomic("account.json", BuildEnvelope(BuildAccountJson(), sequence)))
+         snapshot_ok = false;
+      if(!WriteJsonAtomic("positions.json", BuildEnvelope(BuildPositionsJson(), sequence)))
+         snapshot_ok = false;
+      if(!WriteJsonAtomic("orders.json", BuildEnvelope(BuildOrdersJson(), sequence)))
+         snapshot_ok = false;
+      if(!WriteJsonAtomic("history_orders.json", BuildEnvelope("[]", sequence)))
+         snapshot_ok = false;
+      datetime anchor_time = TimeCurrent();
+      string empty_deals = "{\"anchor\":{\"balance\":" +
+                           JsonNumber(AccountInfoDouble(ACCOUNT_BALANCE)) +
+                           ",\"credit\":" + JsonNumber(AccountInfoDouble(ACCOUNT_CREDIT)) +
+                           ",\"as_of\":" + JsonString(Iso8601FromDatetime(anchor_time)) +
+                           ",\"coherent\":false,\"deal_count\":0" +
+                           "},\"deals\":[]}";
+      if(!WriteJsonAtomic("deals.json", BuildEnvelope(empty_deals, sequence)))
+         snapshot_ok = false;
+      // Anche in new_only l'heartbeat resta il marker di commit: mai pubblicare una sequence
+      // che potrebbe riferirsi a file parzialmente aggiornati.
+      if(snapshot_ok)
+         WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(sequence), sequence));
       return;
      }
-   WriteJsonAtomic("history_orders.json", BuildEnvelope(BuildHistoryOrdersJson(), sequence));
-   WriteJsonAtomic("deals.json", BuildEnvelope(BuildDealsJson(), sequence));
+
+   // Storico: il ledger certificato e il suo anchor vengono costruiti e pubblicati per primi.
+   // Account/posizioni/ordini/candele possono richiedere tempo; prima del commit heartbeat il
+   // ledger viene quindi confrontato di nuovo con MT5. Un cambiamento lascia questo tentativo
+   // senza heartbeat e il consumer conserva l'ultimo bundle completo.
+   HistoryLedgerAnchor ledger_anchor;
+   string ledger_json = BuildDealsJson(ledger_anchor);
+   if(!ledger_anchor.coherent)
+     {
+      Print("TradeJournalBridge: ledger storico non coerente, heartbeat non pubblicato.");
+      return;
+     }
+
+   bool snapshot_ok = true;
+   if(!WriteJsonAtomic("deals.json", BuildEnvelope(ledger_json, sequence)))
+      snapshot_ok = false;
+   if(!WriteJsonAtomic("history_orders.json", BuildEnvelope(BuildHistoryOrdersJson(), sequence)))
+      snapshot_ok = false;
+   if(!WriteJsonAtomic("account.json", BuildEnvelope(BuildAccountJson(), sequence)))
+      snapshot_ok = false;
+   if(!WriteJsonAtomic("positions.json", BuildEnvelope(BuildPositionsJson(), sequence)))
+      snapshot_ok = false;
+   if(!WriteJsonAtomic("orders.json", BuildEnvelope(BuildOrdersJson(), sequence)))
+      snapshot_ok = false;
    for(int t = 0; t < 6; t++)
-      WriteJsonAtomic("candles\\" + _Symbol + "-" + TIMEFRAME_NAMES[t] + ".json",
-                      BuildEnvelope(BuildCandlesJson(t), sequence));
-   WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(), sequence));
+      if(!WriteJsonAtomic("candles\\" + _Symbol + "-" + TIMEFRAME_NAMES[t] + ".json",
+                          BuildEnvelope(BuildCandlesJson(t), sequence)))
+         snapshot_ok = false;
+   // L'heartbeat e' il marker di commit del bundle: non pubblicarlo mai quando un file
+   // richiesto e' fallito o l'anchor del ledger e' cambiato, altrimenti l'Agent potrebbe
+   // associare dati vecchi a un ciclo nuovo.
+   if(snapshot_ok)
+     {
+      if(!RevalidateHistoryLedgerAnchor(ledger_anchor))
+        {
+         Print("TradeJournalBridge: ledger storico cambiato prima del commit, heartbeat non pubblicato.");
+         return;
+        }
+      if(!WriteJsonAtomic("heartbeat.json", BuildEnvelope(BuildHeartbeatJson(sequence), sequence)))
+         snapshot_ok = false;
+     }
+   if(snapshot_ok)
+     {
+      g_history_snapshot_sequence = sequence;
+      g_history_snapshot_written = true;
+     }
   }
 
 //+------------------------------------------------------------------------+
@@ -987,6 +1175,16 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
+   // Handoff history -> live senza fermare MT5. OnTradeTransaction resta attivo per tutta
+   // l'importazione, quindi ogni deal successivo alla fotografia storica rimane nella coda
+   // eventi e non esiste alcuna finestra cieca fra stop e riavvio del terminale.
+   if(!g_new_only && ReadNewOnlyMode())
+     {
+      g_new_only = true;
+      g_history_snapshot_written = false;
+      WriteInitMarker("mode-new-only");
+      Print("TradeJournalBridge: passaggio atomico a new_only completato.");
+     }
    if(g_new_only && GetTickCount64() - g_new_only_started_ms < NEW_ONLY_STARTUP_GRACE_MS)
       return;
    RetryPendingDealEvents();

@@ -37,19 +37,6 @@
     "from_date": "2026-01-01T00:00:00.000Z",
     "payload": {}
   },
-  "claimResponseJob_liveSync": {
-    "api_version": "1",
-    "job_id": "2f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c33",
-    "connection_id": "1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d",
-    "lease_id": "7d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6c",
-    "lease_expires_at": "2026-07-15T12:21:00.000Z",
-    "job_type": "live_sync",
-    "attempt": 1,
-    "created_at": "2026-07-15T12:20:00.000Z",
-    "history_mode": null,
-    "from_date": null,
-    "payload": {}
-  },
   "claimResponseNoJob": null,
   "heartbeatRequest": {
     "api_version": "1",
@@ -80,5 +67,83 @@
     "detail_code": "wizard_required"
   },
   "progressResponseOk": { "api_version": "1", "event_recorded": true },
+  "historyBatchRequest": {
+    "api_version": "1",
+    "lease_id": "8d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6b",
+    "events": [{
+      "event_id": "mt5-850000001-trade_opened-123-fixture",
+      "event_type": "trade_opened",
+      "platform": "mt5",
+      "account_number": "850000001",
+      "server": "Fixture-Demo",
+      "external_trade_id": "123",
+      "symbol": "EURUSD",
+      "direction": "buy",
+      "volume": 0.1,
+      "price": null,
+      "open_price": 1.1,
+      "close_price": null,
+      "stop_loss": null,
+      "take_profit": null,
+      "previous_stop_loss": null,
+      "previous_take_profit": null,
+      "profit": null,
+      "commission": null,
+      "total_commission": null,
+      "fee": 0,
+      "swap": null,
+      "balance_before_open": 10000,
+      "native_deal_ticket": "123456789",
+      "time_msc": 1767348000000,
+      "time_basis": "broker_server_unresolved",
+      "open_time": "2026-01-02T10:00:00.000Z",
+      "close_time": null,
+      "event_time": "2026-01-02T10:00:00.000Z"
+    }]
+  },
+  "historyBatchResponse": {
+    "api_version": "1",
+    "accepted": 1,
+    "inserted": 1,
+    "duplicates": 0
+  },
+  "historyFilePrepareRequest": {
+    "api_version": "1",
+    "lease_id": "8d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6b",
+    "compressed_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "compressed_bytes": 1234,
+    "uncompressed_bytes": 9876,
+    "event_count": 1200
+  },
+  "historyFilePrepareResponse": {
+    "api_version": "1",
+    "already_imported": false,
+    "object_path": "4f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c55/1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d/1f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c22/history.json.gz",
+    "upload_url": "https://fixture.supabase.co/storage/v1/object/upload/sign/mt5-history-imports/4f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c55/1a2b3c4d-5e6f-4a1b-9c2d-3e4f5a6b7c8d/1f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c22/history.json.gz?token=fake",
+    "expires_in": 7200,
+    "accepted": 0,
+    "inserted": 0,
+    "duplicates": 0
+  },
+  "historyFileImportRequest": {
+    "api_version": "1",
+    "lease_id": "8d8c7b6a-5f4e-4d3c-8b2a-1e0f9d8c7b6b"
+  },
+  "historyFileImportResponse": {
+    "api_version": "1",
+    "accepted": 1200,
+    "inserted": 1190,
+    "duplicates": 10,
+    "object_deleted": true
+  },
+  "sessionRequest": { "api_version": "1" },
+  "sessionResponse": {
+    "api_version": "1",
+    "realtime_url": "wss://fixture.supabase.co/realtime/v1/websocket",
+    "publishable_key": "fixture-publishable-key",
+    "access_token": "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYXV0aGVudGljYXRlZCJ9.Zml4dHVyZS1zaWduYXR1cmU",
+    "expires_at": "2026-08-06T12:00:00.000Z",
+    "topics": ["mt5-agent:any", "mt5-agent:3f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c44"]
+  },
   "errorResponse_unauthorized": { "error_code": "unauthorized" }
 }

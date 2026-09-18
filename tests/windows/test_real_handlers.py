@@ -80,6 +80,7 @@ class FakeApi:
         self.lease_lost_at = lease_lost_at
         self.heartbeat_calls = 0
         self.transitions: list[tuple[str, dict | None]] = []
+        self.history_imports: list[tuple[str, str, dict]] = []
 
     def heartbeat(self, job_id: str, lease_id: str) -> dict:
         self.heartbeat_calls += 1
@@ -103,6 +104,17 @@ class FakeApi:
             self.progress_events = []
         self.progress_events.append((event_code, event_status, detail_code))
         return {"api_version": "1", "event_recorded": True}
+
+    def import_history_file(self, job_id: str, lease_id: str, document: dict) -> dict:
+        self.history_imports.append((job_id, lease_id, document))
+        accepted = sum(len(group["events"]) for group in document["trades"])
+        return {
+            "api_version": "1",
+            "accepted": accepted,
+            "inserted": accepted,
+            "duplicates": 0,
+            "object_deleted": True,
+        }
 
 
 class ScriptedAdapter:
@@ -580,6 +592,12 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         / "Advisors"
         / "ExpertMACD.ex5"
     )
+    artifact = (
+        env.instances_root
+        / cid
+        / "state"
+        / "broker-wizard-result.json"
+    )
 
     def reject_endpoint(_label: str, _server: str):
         raise BrokerEndpointResolutionError("fixture unavailable")
@@ -606,7 +624,7 @@ def test_provision_censuses_unknown_server_before_login_and_promotes_after_succe
         assert not (env.secrets_root / cid).exists()
         generated_example.parent.mkdir(parents=True)
         generated_example.write_bytes(b"mt5 default example")
-        artifact = root / "state" / "broker-wizard-result.json"
+        assert artifact == root / "state" / "broker-wizard-result.json"
         artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
         return BrokerWizardEvidence(
             run_id="12345678-1234-4234-8234-123456789abc",
@@ -1425,6 +1443,235 @@ def test_native_investor_sync_timeout_has_a_recoverable_error_code(env):
         )
 
     assert exc_info.value.error_code == "investor_verification_timeout"
+
+
+@pytest.mark.parametrize(
+    ("history_mode", "from_date"),
+    [
+        ("all_available", None),
+        ("from_date", datetime(2026, 1, 1, tzinfo=timezone.utc)),
+    ],
+)
+def test_initial_native_history_switches_to_new_only_without_terminal_restart(
+    env,
+    monkeypatch,
+    history_mode,
+    from_date,
+):
+    cid = str(uuid4())
+    root = InstanceLayout(env.instances_root, cid).path
+    terminal = root / "terminal"
+    terminal.mkdir(parents=True)
+    (terminal / "terminal64.exe").write_bytes(b"stub")
+    expert = env.instances_root / "bridge.ex5"
+    expert.write_bytes(b"stub")
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_investor_password", "fixture-password")
+    trace: list[str] = []
+
+    class TracingRuntime:
+        def __init__(self, runtime_root, _connection_id):
+            self.root = runtime_root
+
+        def set_cancel_check(self, _check):
+            pass
+
+        def _status(self, name, pid):
+            files = self.root / name
+            files.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(
+                pid=pid,
+                files_path=files,
+                effective_server="Demo-Server",
+                account={"server": "Demo-Server"},
+            )
+
+        def start(self, **kwargs):
+            trace.append(f"start:{kwargs['history_mode']}")
+            return self._status("history-files", 100)
+
+        def switch_to_new_only(self):
+            trace.append("switch:new_only")
+
+    def run_history(adapter, *_args, **_kwargs):
+        trace.append(f"history:{adapter.files_dir.name}")
+        return {"deals": 2, "orders": 1}
+
+    def run_live(adapter, *_args, **_kwargs):
+        trace.append(f"live:{adapter.files_dir.name}")
+        return 0
+
+    monkeypatch.setattr(real_handlers, "_verify_investor_access", lambda _adapter: None)
+    monkeypatch.setattr(real_handlers, "_run_history_sync", run_history)
+    monkeypatch.setattr(
+        real_handlers,
+        "_prepare_history_to_live_handoff",
+        lambda _adapter, _root: trace.append("baseline") or 99,
+    )
+    monkeypatch.setattr(real_handlers, "_run_live_sync_once", run_live)
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "seal_runtime_assets",
+        lambda _self, _connection_id: None,
+    )
+
+    result = real_handlers._start_file_bridge_and_sync(
+        _job("provision", cid, history_mode=history_mode),
+        FakeApi(),
+        root,
+        cid,
+        42,
+        "Demo-Server",
+        "203.0.113.10:443",
+        history_mode,
+        from_date,
+        store,
+        FakeProcessManager,
+        expert,
+        TracingRuntime,
+        "",
+    )
+
+    assert result["live_sync_started"] is True
+    assert trace == [
+        f"start:{history_mode}",
+        "history:history-files",
+        "baseline",
+        "switch:new_only",
+        "live:history-files",
+    ]
+
+
+def test_initial_native_history_handoff_fails_closed_without_ea_acknowledgement(
+    env,
+    monkeypatch,
+):
+    cid = str(uuid4())
+    root = InstanceLayout(env.instances_root, cid).path
+    terminal = root / "terminal"
+    terminal.mkdir(parents=True)
+    (terminal / "terminal64.exe").write_bytes(b"stub")
+    expert = env.instances_root / "bridge.ex5"
+    expert.write_bytes(b"stub")
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_investor_password", "fixture-password")
+
+    class NonSwitchingRuntime:
+        def __init__(self, runtime_root, _connection_id):
+            self.root = runtime_root
+
+        def set_cancel_check(self, _check):
+            pass
+
+        def start(self, **_kwargs):
+            files = self.root / "history-files"
+            files.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(
+                pid=100,
+                files_path=files,
+                effective_server="Demo-Server",
+                account={"server": "Demo-Server"},
+            )
+
+        def switch_to_new_only(self):
+            raise real_handlers.NativeMt5Error("history_mode_switch_timeout")
+
+    monkeypatch.setattr(real_handlers, "_verify_investor_access", lambda _adapter: None)
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_history_sync",
+        lambda *_args, **_kwargs: {"deals": 2, "orders": 1},
+    )
+    monkeypatch.setattr(
+        real_handlers,
+        "_prepare_history_to_live_handoff",
+        lambda _adapter, _root: 99,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        real_handlers._start_file_bridge_and_sync(
+            _job("provision", cid, history_mode="all_available"),
+            FakeApi(),
+            root,
+            cid,
+            42,
+            "Demo-Server",
+            "203.0.113.10:443",
+            "all_available",
+            None,
+            store,
+            FakeProcessManager,
+            expert,
+            NonSwitchingRuntime,
+            "",
+        )
+
+    assert exc_info.value.error_code == "mt5_initialize_failed"
+
+
+def test_history_handoff_seeds_frozen_positions_and_retires_only_anchor_events(
+    tmp_path,
+):
+    acknowledged: list[int] = []
+    connection_id = "33333333-3333-4333-8333-333333333333"
+    root = tmp_path / connection_id
+    archive_path = root / "state" / "history-import-0123456789abcdef.json"
+    document = {
+        "trades": [
+            {
+                "external_trade_id": "position-1",
+                "events": [
+                    {
+                        "event_type": "trade_opened",
+                        "native_deal_ticket": "41",
+                    }
+                ],
+            }
+        ]
+    }
+    atomic_json(archive_path, {"schema_version": 1, **document})
+
+    class FrozenAdapter:
+        def snapshot(self):
+            return {
+                "positions": {
+                    "position-1": {
+                        "ticket": "mutable-ticket",
+                        "position_id": "position-1",
+                        "volume": 0.2,
+                        "open_price": 1.1,
+                    }
+                },
+                "orders": {"order-1": {"ticket": "order-1", "volume": 0.1}},
+                "deals": {"41": {"profit": 10}},
+            }
+
+        def checkpoint(self):
+            return {"sequence": 41}
+
+        def acknowledge_events(self, sequence):
+            acknowledged.append(sequence)
+
+    adapter = FrozenAdapter()
+    real_handlers._persist_history_handoff_artifact(
+        adapter,
+        root,
+        job_id="11111111-1111-4111-8111-111111111111",
+        connection_id=connection_id,
+        archive_path=archive_path,
+        archive_preexisting=False,
+        document=document,
+    )
+    assert real_handlers._prepare_history_to_live_handoff(adapter, root) == 41
+    baseline = read_json(root / "state" / "live_snapshot.json")
+    assert baseline["positions"]["position-1"]["volume"] == 0.2
+    assert baseline["orders"]["order-1"]["volume"] == 0.1
+    assert baseline["deals"] == {}
+    handoff = read_json(root / "state" / "history-live-handoff.json")
+    assert handoff["anchor_sequence"] == 41
+    assert handoff["archived_deal_tickets"] == ["41"]
+    assert handoff["imported_deal_tickets"] == ["41"]
+    assert acknowledged == [41]
 
 
 def test_provision_disconnected_terminal_is_mt5_initialize_failed(env):

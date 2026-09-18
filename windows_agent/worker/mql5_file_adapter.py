@@ -19,6 +19,7 @@ from typing import Any
 
 from ..state_store import atomic_json, read_json
 from .adapter_errors import IdentityMismatch, Mt5Error
+from .history_balance import reconstruct_trade_deals
 
 SCHEMA_VERSION = 1
 # The EA refreshes every 2s. Thirty seconds still rejects an interrupted terminal promptly,
@@ -55,6 +56,9 @@ class Mql5FileMt5Adapter:
     by the daemon on its next job/poll rather than being forwarded as partial data.
     """
 
+    history_snapshot_atomic = True
+    history_time_basis = "broker_server_unresolved"
+
     def __init__(
         self,
         files_dir: Path,
@@ -71,8 +75,15 @@ class Mql5FileMt5Adapter:
         self.expected_login = str(int(expected_login))
         self.expected_server = str(expected_server)
         self.heartbeat_max_age_seconds = heartbeat_max_age_seconds
-        self.checkpoint_path = Path(state_dir) / "file-adapter-checkpoint.json"
-        self.event_checkpoint_path = Path(state_dir) / "file-event-checkpoint.json"
+        self.state_dir = Path(state_dir)
+        self.checkpoint_path = self.state_dir / "file-adapter-checkpoint.json"
+        self.event_checkpoint_path = self.state_dir / "file-event-checkpoint.json"
+        self.history_handoff_path = self.state_dir / "history-live-handoff.json"
+        self._history_deals_cache: tuple[
+            dict[str, Any] | None,
+            tuple[dict[str, Any], ...],
+            tuple[dict[str, Any], ...],
+        ] | None = None
 
     @staticmethod
     def _parse_time(value: object) -> datetime | None:
@@ -83,6 +94,10 @@ class Mql5FileMt5Adapter:
         except ValueError:
             return None
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _all_available_window(start: datetime) -> bool:
+        return start <= datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def _read_path_envelope(self, path: Path, label: str) -> tuple[dict[str, Any], Any]:
         for attempt in range(_TRANSIENT_READ_ATTEMPTS):
@@ -155,6 +170,7 @@ class Mql5FileMt5Adapter:
         equity = payload.get("equity")
         currency = payload.get("currency")
         leverage = payload.get("leverage")
+        credit = payload.get("credit", 0)
         if (
             not isinstance(balance, (int, float))
             or isinstance(balance, bool)
@@ -168,6 +184,9 @@ class Mql5FileMt5Adapter:
             or isinstance(leverage, bool)
             or leverage < 1
             or leverage > 1_000_000
+            or not isinstance(credit, (int, float))
+            or isinstance(credit, bool)
+            or not math.isfinite(float(credit))
         ):
             raise Mql5FileAdapterError("account_schema_invalid")
         return payload
@@ -187,6 +206,7 @@ class Mql5FileMt5Adapter:
             equity=float(account["equity"]),
             currency=str(account["currency"]).upper(),
             leverage=int(account["leverage"]),
+            credit=float(account.get("credit", 0)),
         )
 
     def _rows(self, name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -194,6 +214,47 @@ class Mql5FileMt5Adapter:
         if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
             raise Mql5FileAdapterError(f"{Path(name).stem}_schema_invalid")
         return envelope, [dict(row) for row in payload]
+
+    def _require_history_sequence(self, envelope: dict[str, Any]) -> None:
+        heartbeat, _ = self._heartbeat_envelope()
+        account, _ = self._read_envelope("account.json")
+        if len({envelope["sequence"], heartbeat["sequence"], account["sequence"]}) != 1:
+            raise Mql5FileAdapterError("history_snapshot_sequence_mismatch")
+
+    def _deal_rows(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, list[dict[str, Any]]]:
+        """Read the V2 anchored deal payload, retaining legacy list compatibility."""
+        envelope, payload = self._read_envelope("deals.json")
+        if isinstance(payload, list):
+            anchor = None
+            rows = payload
+        elif isinstance(payload, dict):
+            anchor = payload.get("anchor")
+            rows = payload.get("deals")
+            if not isinstance(anchor, dict):
+                raise Mql5FileAdapterError("deals_schema_invalid")
+        else:
+            raise Mql5FileAdapterError("deals_schema_invalid")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise Mql5FileAdapterError("deals_schema_invalid")
+        normalized_anchor = dict(anchor) if anchor is not None else None
+        normalized_rows = [dict(row) for row in rows]
+        if normalized_anchor is not None and normalized_anchor.get("coherent") is True:
+            history_indices = [row.get("history_index") for row in normalized_rows]
+            last = normalized_rows[-1] if normalized_rows else {}
+            if (
+                normalized_anchor.get("order_basis") != "mt5_history_index_v1"
+                or history_indices != list(range(len(normalized_rows)))
+                or normalized_anchor.get("deal_count") != len(normalized_rows)
+                or str(normalized_anchor.get("last_deal_ticket", "0"))
+                != str(last.get("ticket", "0"))
+                or normalized_anchor.get("last_deal_time_msc", 0)
+                != last.get("time_msc", 0)
+            ):
+                normalized_anchor["coherent"] = False
+                normalized_anchor["coherence_error"] = "ledger_metadata_mismatch"
+        return envelope, normalized_anchor, normalized_rows
 
     @staticmethod
     def _dedupe(rows: list[dict[str, Any]], field: str) -> dict[str, dict[str, Any]]:
@@ -244,7 +305,7 @@ class Mql5FileMt5Adapter:
                 raise Mql5FileIdentityMismatch("account_identity_mismatch")
             positions_envelope, positions = self._rows("positions.json")
             orders_envelope, orders = self._rows("orders.json")
-            deals_envelope, deals = self._rows("deals.json")
+            deals_envelope, _, deals = self._deal_rows()
             heartbeat_after, _ = self._heartbeat_envelope()
             sequences = {
                 int(heartbeat_before["sequence"]),
@@ -268,11 +329,13 @@ class Mql5FileMt5Adapter:
 
     def _history(self, name: str, start: datetime, end: datetime) -> tuple[dict[str, Any], ...]:
         self.verify_identity()
-        _, rows = self._rows(name)
+        envelope, rows = self._rows(name)
+        self._require_history_sequence(envelope)
+        all_available = self._all_available_window(start)
         result = []
         for row in rows:
             moment = self._parse_time(row.get("time", row.get("close_time")))
-            if moment is not None and start <= moment < end:
+            if moment is not None and (all_available or start <= moment < end):
                 result.append(row)
         return tuple(result)
 
@@ -280,16 +343,89 @@ class Mql5FileMt5Adapter:
         return self._history("history_orders.json", start, end)
 
     def history_deals(self, start: datetime, end: datetime) -> tuple[dict[str, Any], ...]:
-        rows = self._history("deals.json", start, end)
-        valid_entries = {"0", "1", "2", "3", "IN", "OUT", "INOUT", "OUT_BY"}
+        self.verify_identity()
+        _, projected, _ = self._historical_deal_snapshot()
+        annotated = any("history_event_type" in row for row in projected)
+        all_available = self._all_available_window(start)
+        eligible_positions = {
+            str(row.get("position_id"))
+            for row in projected
+            if row.get("project_as_trade", True) is True
+            and row.get("history_event_type") == "trade_opened"
+            and (moment := self._parse_time(row.get("time"))) is not None
+            and (all_available or start <= moment < end)
+        }
+        return tuple(
+            row
+            for row in projected
+            if row.get("project_as_trade", True) is True
+            and (moment := self._parse_time(row.get("time"))) is not None
+            and (all_available or moment < end)
+            and (
+                str(row.get("position_id")) in eligible_positions
+                if annotated
+                else start <= moment
+            )
+        )
+
+    def history_accounting_deals(
+        self, start: datetime, end: datetime
+    ) -> tuple[dict[str, Any], ...]:
+        """Return the complete ledger, including deposits, credit and charges.
+
+        These records are persisted in a dedicated local audit stream and are
+        intentionally never projected into the journal as trades.
+        """
+        self.verify_identity()
+        _, _, rows = self._historical_deal_snapshot()
+        all_available = self._all_available_window(start)
         return tuple(
             row
             for row in rows
-            if str(row.get("position_id", "")).strip() not in ("", "0")
-            and isinstance(row.get("symbol"), str)
-            and bool(row["symbol"].strip())
-            and str(row.get("entry", "")).strip().upper() in valid_entries
+            if (moment := self._parse_time(row.get("time"))) is not None
+            and (all_available or start <= moment < end)
         )
+
+    def history_anchor(self) -> dict[str, Any] | None:
+        self.verify_identity()
+        anchor, _, _ = self._historical_deal_snapshot()
+        return anchor
+
+    def history_balance_rows(self) -> tuple[dict[str, Any], ...]:
+        """Include non-projected lifecycles so the manual report can say N/D."""
+        self.verify_identity()
+        _, projected, _ = self._historical_deal_snapshot()
+        return projected
+
+    def _historical_deal_snapshot(
+        self,
+    ) -> tuple[
+        dict[str, Any] | None,
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ]:
+        if self._history_deals_cache is None:
+            envelope, anchor, rows = self._deal_rows()
+            self._require_history_sequence(envelope)
+            immutable_rows = tuple(dict(row) for row in rows)
+            if anchor is None:
+                valid_entries = {"0", "1", "2", "3", "IN", "OUT", "INOUT", "OUT_BY"}
+                projected = tuple(
+                    row
+                    for row in immutable_rows
+                    if str(row.get("position_id", "")).strip() not in ("", "0")
+                    and isinstance(row.get("symbol"), str)
+                    and bool(row["symbol"].strip())
+                    and str(row.get("entry", "")).strip().upper() in valid_entries
+                )
+            else:
+                projected = reconstruct_trade_deals(immutable_rows, anchor)
+            self._history_deals_cache = (
+                dict(anchor) if anchor is not None else None,
+                projected,
+                immutable_rows,
+            )
+        return self._history_deals_cache
 
     def pending_events(self) -> tuple[dict[str, Any], ...]:
         checkpoint = read_json(self.event_checkpoint_path, {})
@@ -302,6 +438,7 @@ class Mql5FileMt5Adapter:
         if events_dir.is_symlink() or not events_dir.is_dir():
             raise Mql5FileAdapterError("events_directory_invalid")
         self._prune_acknowledged_event_files(events_dir, last_sequence)
+        handoff_deal_tickets = self._history_handoff_deal_tickets()
         pending: list[tuple[int, dict[str, Any]]] = []
         for path in events_dir.iterdir():
             match = _EVENT_FILE.fullmatch(path.name)
@@ -315,9 +452,45 @@ class Mql5FileMt5Adapter:
             envelope, payload = self._read_path_envelope(path, "event")
             if envelope["sequence"] != sequence or not isinstance(payload, dict):
                 raise Mql5FileAdapterError("event_schema_invalid")
-            pending.append((sequence, {"sequence": sequence, **payload}))
+            event = {"sequence": sequence, **payload}
+            native_deal_ticket = event.get("deal_id") or event.get("ticket")
+            if (
+                str(event.get("event_type", "")).upper() == "DEAL_ADD"
+                and native_deal_ticket is not None
+                and str(native_deal_ticket) in handoff_deal_tickets
+            ):
+                event["history_archived"] = True
+            pending.append((sequence, event))
         pending.sort(key=lambda item: item[0])
         return tuple(payload for _, payload in pending)
+
+    def _history_handoff_deal_tickets(self) -> set[str]:
+        if not self.history_handoff_path.exists():
+            return set()
+        value = read_json(self.history_handoff_path, {})
+        if not isinstance(value, dict):
+            raise Mql5FileAdapterError("history_handoff_invalid")
+        tickets = value.get("archived_deal_tickets")
+        imported_tickets = value.get("imported_deal_tickets")
+        if (
+            value.get("schema_version") != 2
+            or value.get("connection_id") != self.connection_id
+            or not isinstance(value.get("job_id"), str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("history_document_sha256", ""))
+            )
+            or not isinstance(value.get("anchor_sequence"), int)
+            or not isinstance(tickets, list)
+            or not isinstance(imported_tickets, list)
+            or any(
+                not isinstance(ticket, str)
+                or not re.fullmatch(r"[0-9]{1,32}", ticket)
+                for ticket in [*tickets, *imported_tickets]
+            )
+            or not set(imported_tickets).issubset(set(tickets))
+        ):
+            raise Mql5FileAdapterError("history_handoff_invalid")
+        return set(tickets)
 
     def acknowledge_events(self, through_sequence: int) -> None:
         if not isinstance(through_sequence, int) or through_sequence < 0:

@@ -45,6 +45,15 @@ class FakeNativeRuntime:
 
     def start(self, **kwargs: Any) -> NativeMt5Status:
         assert kwargs["expert_binary"].name == "TradeJournalBridge.ex5"
+        managed_assets = {
+            "MQL5/Experts/TradeJournal/TradeJournalBridge.ex5": b"expert",
+            "MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5": b"discovery",
+            "MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5": b"loader",
+        }
+        for relative, contents in managed_assets.items():
+            target = self.root / "terminal" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
         files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"
         files.mkdir(parents=True, exist_ok=True)
         records = {
@@ -318,9 +327,18 @@ def test_live_sync_job_sends_heartbeat_over_http(tmp_path: Path, monkeypatch) ->
 
     assert api.transitions[-1][1] == "complete"
     heartbeat_calls = [
-        call for call in mock_post.call_args_list if call.kwargs.get("json") == {"event_type": "heartbeat"}
+        call
+        for call in mock_post.call_args_list
+        if call.kwargs.get("json", {}).get("event_type") == "heartbeat"
     ]
     assert len(heartbeat_calls) == 1
+    assert heartbeat_calls[0].kwargs["json"] == {
+        "event_type": "heartbeat",
+        "balance": 100.0,
+        "equity": 100.0,
+        "currency": "USD",
+        "leverage": 100,
+    }
     assert heartbeat_calls[0].kwargs["headers"]["Authorization"] == "Bearer tjmt5_test-bridge-token"
 
 

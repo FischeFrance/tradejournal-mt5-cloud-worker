@@ -29,35 +29,6 @@ class _CallableSender:
         return SendResult(status="sent", attempts=1)
 
 
-def _position_total_commission(snapshot: dict, position_ticket: str) -> float | None:
-    """Return the exact MT5 commission only for a complete, deduplicated lifecycle.
-
-    ``snapshot['deals']`` is keyed by deal ticket, so repeated snapshot reads cannot multiply a
-    charge. Requiring both an entry and an exit prevents a short history window from turning an
-    incomplete lifecycle into an authoritative zero.
-    """
-    deals = [
-        deal
-        for deal in snapshot.get("deals", {}).values()
-        if isinstance(deal, dict)
-        and str(deal.get("position_id") or deal.get("position_ticket") or "")
-        == str(position_ticket)
-    ]
-    entries = {"0", "IN"}
-    exits = {"1", "2", "3", "OUT", "INOUT", "OUT_BY"}
-    has_entry = any(str(deal.get("entry", "")).upper() in entries for deal in deals)
-    has_exit = any(str(deal.get("entry", "")).upper() in exits for deal in deals)
-    if not has_entry or not has_exit:
-        return None
-    commissions = [
-        float(deal["commission"])
-        for deal in deals
-        if isinstance(deal.get("commission"), (int, float))
-        and not isinstance(deal.get("commission"), bool)
-    ]
-    return sum(commissions) if commissions else None
-
-
 def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
     event_type = str(record.get("event_type", "")).upper()
     position_ticket = record.get("position_id") or record.get("position_ticket")
@@ -77,47 +48,58 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
         "leverage": record.get("leverage"),
     }
     if event_type == "DEAL_ADD":
+        time_msc = record.get("timestamp_msc")
+        if time_msc is None:
+            time_msc = record.get("time_msc")
+        deal_base = {
+            **base,
+            "native_deal_ticket": record.get("deal_id") or record.get("ticket"),
+            "time_msc": time_msc,
+            "time_basis": "broker_server_unresolved",
+        }
         entry = str(record.get("entry", "")).upper()
         if entry == "IN":
             if previous_position is not None and current_position is not None:
                 return {
-                    **base,
+                    **deal_base,
                     "event_type": "trade_volume_changed",
                     "volume": current_position.get("volume"),
                     "previous_volume": previous_position.get("volume"),
-                    "partial_close": False,
+                    "open_price": current_position.get("open_price"),
+                    # Opening/scale-in costs are deal-level values.  Keeping each native fill
+                    # separate lets Supabase aggregate them once and lets history replay use
+                    # the same immutable deal identity.
+                    "profit": record.get("profit"),
                     "commission": record.get("commission"),
                     "swap": record.get("swap"),
+                    "partial_close": False,
                 }
             return {
-                **base,
+                **deal_base,
                 "event_type": "trade_opened",
                 "open_price": record.get("price"),
-                "open_time": record.get("time"),
-                "balance_before_open": record.get("balance_before_open"),
+                "profit": record.get("profit"),
                 "commission": record.get("commission"),
                 "swap": record.get("swap"),
+                "open_time": record.get("time"),
+                "balance_before_open": record.get("balance_before_open"),
             }
         if entry in ("OUT", "OUT_BY"):
             if current_position is not None:
                 return {
-                    **base,
-                    "event_type": "trade_volume_changed",
-                    "volume": current_position.get("volume"),
-                    "previous_volume": (
-                        previous_position.get("volume")
-                        if previous_position is not None
-                        else None
-                    ),
-                    "partial_close": True,
+                    **deal_base,
+                    "event_type": "trade_partial_closed",
+                    # A close event always carries the executed deal volume, never the
+                    # remaining position volume.  This makes its fingerprint identical to
+                    # the same fill replayed by the historical importer.
                     "close_price": record.get("price"),
                     "profit": record.get("profit"),
                     "commission": record.get("commission"),
                     "swap": record.get("swap"),
                     "close_time": record.get("time"),
                 }
-            closed = {
-                **base,
+            return {
+                **deal_base,
                 "event_type": "trade_closed",
                 "close_price": record.get("price"),
                 "profit": record.get("profit"),
@@ -125,12 +107,8 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                 "swap": record.get("swap"),
                 "close_time": record.get("time"),
             }
-            total_commission = _position_total_commission(current, ticket_text)
-            if total_commission is not None:
-                closed["total_commission"] = total_commission
-            return closed
         return {
-            **base,
+            **deal_base,
             "event_type": "deal_recorded",
             "close_price": record.get("price"),
             "profit": record.get("profit"),
@@ -206,8 +184,126 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
 def _merge_event_stream_with_snapshot(
     records: tuple[dict, ...], previous: dict, current: dict
 ) -> list[dict]:
+    # Replay DEAL_ADD records against the position volume that existed before the batch.
+    # Several fills can arrive between two polls; looking only at the final snapshot would
+    # otherwise classify every fill as a final close when the position is now absent.
+    tracked_volumes: dict[str, float] = {}
+    tracked_open_prices: dict[str, float] = {}
+    for ticket, position in previous.get("positions", {}).items():
+        try:
+            tracked_volumes[str(ticket)] = float(position.get("volume"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            tracked_open_prices[str(ticket)] = float(position.get("open_price"))
+        except (TypeError, ValueError):
+            pass
+
+    stream_events: list[dict] = []
+    for record in records:
+        # The immutable history archive may already contain a deal whose MT5 transaction
+        # callback was queued just after the frozen snapshot committed.  Its native ticket is
+        # authoritative membership proof; replaying it from the live queue would turn the same
+        # opening into a false scale-in (or apply the same close twice).
+        if record.get("history_archived") is True:
+            continue
+        event_previous, event_current = previous, current
+        if str(record.get("event_type", "")).upper() == "DEAL_ADD":
+            position_ticket = record.get("position_id") or record.get("position_ticket")
+            position_key = str(position_ticket) if position_ticket is not None else ""
+            entry = str(record.get("entry", "")).upper()
+            try:
+                fill_volume = float(record.get("volume"))
+            except (TypeError, ValueError):
+                fill_volume = 0.0
+            prior_volume = tracked_volumes.get(position_key)
+            if position_key and fill_volume > 0 and entry == "IN":
+                remaining = (prior_volume or 0.0) + fill_volume
+                try:
+                    fill_price = float(record.get("price"))
+                except (TypeError, ValueError):
+                    fill_price = None
+                prior_price = tracked_open_prices.get(position_key)
+                average_price = fill_price
+                if (
+                    prior_volume is not None
+                    and prior_volume > 0
+                    and prior_price is not None
+                    and fill_price is not None
+                ):
+                    average_price = (
+                        (prior_volume * prior_price) + (fill_volume * fill_price)
+                    ) / remaining
+                event_previous = {
+                    "positions": (
+                        {
+                            position_key: {
+                                "volume": prior_volume,
+                                "open_price": prior_price,
+                            }
+                        }
+                        if prior_volume is not None
+                        else {}
+                    )
+                }
+                event_current = {
+                    "positions": {
+                        position_key: {
+                            "volume": remaining,
+                            "open_price": average_price,
+                        }
+                    }
+                }
+                tracked_volumes[position_key] = remaining
+                if average_price is not None:
+                    tracked_open_prices[position_key] = average_price
+            elif position_key and fill_volume > 0 and entry in ("OUT", "OUT_BY"):
+                if prior_volume is not None:
+                    remaining = prior_volume - fill_volume
+                    prior_price = tracked_open_prices.get(position_key)
+                    event_previous = {
+                        "positions": {
+                            position_key: {
+                                "volume": prior_volume,
+                                "open_price": prior_price,
+                            }
+                        }
+                    }
+                    event_current = {
+                        "positions": (
+                            {
+                                position_key: {
+                                    "volume": remaining,
+                                    "open_price": prior_price,
+                                }
+                            }
+                            if remaining > 1e-8
+                            else {}
+                        )
+                    }
+                    if remaining > 1e-8:
+                        tracked_volumes[position_key] = remaining
+                    else:
+                        tracked_volumes.pop(position_key, None)
+                        tracked_open_prices.pop(position_key, None)
+        stream_events.append(_mql5_file_event(record, event_previous, event_current))
+
+    # DEAL_ADD is the authoritative economic close.  A POSITION notification for the same
+    # transition (or the snapshot diff below) is only a state echo and must not reduce the
+    # volume a second time.
+    economic_close_tickets = {
+        str(event.get("ticket"))
+        for event in stream_events
+        if event.get("event_type") in ("trade_partial_closed", "trade_closed")
+    }
     stream_events = [
-        _mql5_file_event(record, previous, current) for record in records
+        event
+        for event in stream_events
+        if not (
+            event.get("event_type") == "trade_volume_changed"
+            and event.get("partial_close") is True
+            and str(event.get("ticket")) in economic_close_tickets
+        )
     ]
     reconciliation = detect_windows_events(previous, current)
     covered = {
@@ -222,6 +318,12 @@ def _merge_event_stream_with_snapshot(
     for event in reconciliation:
         key = (str(event.get("event_type")), str(event.get("ticket")))
         if key in covered:
+            continue
+        if (
+            event.get("event_type") == "trade_volume_changed"
+            and event.get("partial_close") is True
+            and str(event.get("ticket")) in economic_close_tickets
+        ):
             continue
         if (
             event.get("event_type") == "deal_recorded"
@@ -255,14 +357,6 @@ def detect_windows_events(previous: dict, current: dict) -> list[dict]:
     ):
         deal = current["deals"][ticket]
         events.append({"event_type": "deal_recorded", "ticket": ticket, **deal})
-    for event in events:
-        if event.get("event_type") != "trade_closed":
-            continue
-        total_commission = _position_total_commission(
-            current, str(event.get("ticket", ""))
-        )
-        if total_commission is not None:
-            event["total_commission"] = total_commission
     return events
 
 

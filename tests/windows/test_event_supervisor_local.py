@@ -5,10 +5,17 @@ import time
 from uuid import uuid4
 
 from windows_agent.event_supervisor import Mt5EventSupervisor
+from windows_agent.state_store import atomic_json
 
 
-def _managed_instance(instances_root, secrets_root, connection_id):
-    (instances_root / connection_id).mkdir(parents=True)
+def _managed_instance(instances_root, secrets_root, connection_id, *, active=True):
+    root = instances_root / connection_id
+    (root / "state").mkdir(parents=True)
+    if active:
+        atomic_json(
+            root / "state" / "job_progress.json",
+            {"connection_id": connection_id, "status": "connected"},
+        )
     secret_root = secrets_root / connection_id
     secret_root.mkdir(parents=True)
     for name in ("mt5_login", "mt5_server", "bridge_token"):
@@ -34,6 +41,25 @@ def test_poll_once_processes_only_managed_connection_directories(tmp_path):
 
     assert supervisor.poll_once() == 2
     assert processed == sorted((first, second))
+
+
+def test_poll_once_ignores_connection_until_history_handoff_is_active(tmp_path):
+    instances_root = tmp_path / "instances"
+    secrets_root = tmp_path / "secrets"
+    pending = str(uuid4())
+    active = str(uuid4())
+    _managed_instance(instances_root, secrets_root, pending, active=False)
+    _managed_instance(instances_root, secrets_root, active)
+    processed = []
+    supervisor = Mt5EventSupervisor(
+        instances_root,
+        secrets_root,
+        "https://example.invalid",
+        processor=lambda connection_id: processed.append(connection_id) or 1,
+    )
+
+    assert supervisor.poll_once() == 1
+    assert processed == [active]
 
 
 def test_run_stops_without_network_or_recurring_remote_heartbeat(tmp_path):

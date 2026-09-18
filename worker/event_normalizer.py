@@ -39,8 +39,13 @@ _FINGERPRINT_FIELDS = {
         "previous_take_profit",
     ),
     "trade_closed": (
+        "native_deal_ticket", "time_msc", "volume",
         "close_price", "profit", "commission", "total_commission", "swap", "close_time",
         "mae_points", "mfe_points", "excursion_samples",
+    ),
+    "trade_partial_closed": (
+        "native_deal_ticket", "time_msc", "volume",
+        "close_price", "profit", "commission", "swap", "close_time",
     ),
     "pending_order_created": (
         "symbol",
@@ -69,6 +74,15 @@ _FINGERPRINT_FIELDS = {
     ),
 }
 
+_NATIVE_DEAL_EVENTS = frozenset(
+    (
+        "trade_opened",
+        "trade_volume_changed",
+        "trade_partial_closed",
+        "trade_closed",
+    )
+)
+
 
 def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     """Genera un event_id deterministico e idempotente.
@@ -79,7 +93,14 @@ def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     """
     event_type = event["event_type"]
     ticket = str(event.get("ticket", ""))
-    fields = _FINGERPRINT_FIELDS.get(event_type, ())
+    # DEAL_TICKET is immutable and unique inside one MT5 account.  Economics may be posted or
+    # corrected after the transaction (especially commission/swap), so including those mutable
+    # values would turn an enrichment of the same native fill into a second remote event.  Old
+    # snapshot-only producers have no native identity and retain the legacy state fingerprint.
+    if event_type in _NATIVE_DEAL_EVENTS and event.get("native_deal_ticket") is not None:
+        fields = ("native_deal_ticket",)
+    else:
+        fields = _FINGERPRINT_FIELDS.get(event_type, ())
     fingerprint_payload = {name: event.get(name) for name in fields}
     fingerprint_json = json.dumps(
         fingerprint_payload, sort_keys=True, separators=(",", ":"), default=str
@@ -145,4 +166,20 @@ def normalize_event(
         payload.update(account_snapshot)
     if event.get("balance_before_open") is not None:
         payload["balance_before_open"] = event["balance_before_open"]
+    if event.get("native_deal_ticket") is not None:
+        payload["native_deal_ticket"] = str(event["native_deal_ticket"])
+    if event.get("time_msc") is not None:
+        payload["time_msc"] = event["time_msc"]
+    if event.get("time_basis") is not None:
+        payload["time_basis"] = event["time_basis"]
+    if event.get("commission_complete") is not None:
+        payload["commission_complete"] = bool(event["commission_complete"])
+    if event.get("previous_volume") is not None:
+        payload["previous_volume"] = event["previous_volume"]
+    if event.get("partial_close") is not None:
+        payload["partial_close"] = bool(event["partial_close"])
+    # `commission` is already the effective MT5 cost (commission + fee).
+    # Preserve the native fee separately for audit, never for a second sum.
+    if event.get("fee") is not None:
+        payload["fee"] = event["fee"]
     return payload
