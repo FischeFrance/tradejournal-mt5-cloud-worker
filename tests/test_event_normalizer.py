@@ -1,3 +1,5 @@
+import pytest
+
 from event_normalizer import build_event_id, normalize_event
 
 RAW_TRADE_OPENED = {
@@ -12,6 +14,27 @@ RAW_TRADE_OPENED = {
     "open_time": "2026-01-01T00:00:00+00:00",
     "event_time": "2026-01-01T00:00:00+00:00",
 }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("symbol", "", "symbol unavailable"),
+        ("symbol", " EURUSD", "symbol unavailable"),
+        ("direction", None, "direction unavailable"),
+        ("direction", "BUY", "direction unavailable"),
+        ("volume", 0, "volume unavailable"),
+        ("volume", float("inf"), "volume unavailable"),
+        ("volume", True, "volume unavailable"),
+    ),
+)
+def test_trade_open_preflight_rejects_invalid_required_fields(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        normalize_event(
+            {**RAW_TRADE_OPENED, field: value},
+            account_number="12345",
+            server="Demo-Server",
+        )
 
 
 def test_normalize_event_produces_all_contract_fields():

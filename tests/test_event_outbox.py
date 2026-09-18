@@ -218,6 +218,43 @@ def test_permanent_failure_moves_event_to_persistent_dead_letter_once(tmp_path):
     assert restarted.enqueue_many([payload]) == 0
 
 
+def test_permanent_failure_is_a_causal_barrier_for_later_events(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    opened = _payload("event-opened")
+    closed = _payload("event-closed", "2026-01-01T00:05:00Z")
+    outbox = EventOutbox(str(path))
+    outbox.enqueue_many([opened, closed])
+    first_sender = _Sender(
+        [
+            SendResult(
+                status="failed",
+                http_status=422,
+                error="rejected_by_api",
+                attempts=1,
+                failure_type="permanent",
+            )
+        ]
+    )
+
+    result = outbox.drain(first_sender)
+
+    assert result.dead_lettered == 1
+    assert result.pending == 1
+    assert first_sender.payloads == [opened]
+    assert list(outbox.pending_payloads()) == ["event-closed"]
+    assert outbox.dead_letter_count() == 1
+
+    # A restart does not erase the barrier or let the close overtake its rejected open.
+    restarted = EventOutbox(str(path))
+    successor_sender = _Sender([SendResult(status="sent", http_status=200)])
+    blocked = restarted.drain(successor_sender)
+    assert blocked.sent == 0
+    assert blocked.pending == 1
+    assert successor_sender.payloads == []
+    assert list(restarted.pending_payloads()) == ["event-closed"]
+    assert restarted.dead_letter_count() == 1
+
+
 def test_dry_run_preserves_outbox_for_later_real_delivery(tmp_path):
     path = tmp_path / "event_outbox.json"
     outbox = EventOutbox(str(path))

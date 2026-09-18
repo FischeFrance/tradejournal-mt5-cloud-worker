@@ -86,3 +86,34 @@ def test_run_stops_without_network_or_recurring_remote_heartbeat(tmp_path):
     assert not thread.is_alive()
     assert len(calls) >= 2
     assert set(calls) == {connection_id}
+
+
+def test_run_keeps_polling_after_a_connection_processing_error(tmp_path):
+    connection_id = str(uuid4())
+    instances_root = tmp_path / "instances"
+    secrets_root = tmp_path / "secrets"
+    _managed_instance(instances_root, secrets_root, connection_id)
+    calls = []
+
+    def failing_processor(value):
+        calls.append(value)
+        raise RuntimeError("persistent local barrier")
+
+    supervisor = Mt5EventSupervisor(
+        instances_root,
+        secrets_root,
+        "https://example.invalid",
+        poll_seconds=0.01,
+        processor=failing_processor,
+    )
+    stop_event = threading.Event()
+    thread = threading.Thread(target=supervisor.run, args=(stop_event,))
+
+    thread.start()
+    time.sleep(0.04)
+    stop_event.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(calls) >= 2
+    assert set(calls) == {connection_id}

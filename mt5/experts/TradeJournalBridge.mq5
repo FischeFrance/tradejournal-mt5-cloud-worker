@@ -51,7 +51,9 @@ const ulong NEW_ONLY_STARTUP_GRACE_MS = 5000;
 // OnTradeTransaction puo' arrivare qualche millisecondo prima che il deal sia leggibile tramite
 // HistoryDealSelect. Conserviamo i ticket non ancora pubblicabili e li riproviamo dal timer: il
 // ticket e' deduplicato in memoria e l'event_id resta deterministico, quindi anche un errore di
-// scrittura successivo alla costruzione del payload non puo' creare duplicati remoti.
+// scrittura successivo alla costruzione del payload non puo' creare duplicati remoti. Questa coda
+// e' volutamente process-local: dopo un riavvio la riconciliazione all_available dello storico
+// autorevole ricostruisce il deal; non trasformiamo cursor.json in un secondo ledger economico.
 const int MAX_PENDING_DEAL_EVENTS = 256;
 ulong g_pending_deal_tickets[];
 int   g_pending_deal_attempts[];
@@ -787,17 +789,53 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
 //| tra i tipi di evento, ogni emettitore rilegge lo stato corrente dal    |
 //| ticket ricevuto invece di fidarsi di uno stato accumulato in memoria.  |
 //+------------------------------------------------------------------------+
+string SymbolForPositionIdentifier(const long position_id)
+  {
+   if(position_id <= 0)
+      return "";
+
+   // DEAL_POSITION_ID is the stable POSITION_IDENTIFIER, which need not remain equal to the
+   // current position ticket.  This bounded scan is used only for the exceptional case where
+   // both the deal and its originating order omit the symbol.
+   int positions_total = PositionsTotal();
+   for(int i = 0; i < positions_total; i++)
+     {
+      if(PositionGetTicket(i) == 0)
+         continue;
+      if(PositionGetInteger(POSITION_IDENTIFIER) == position_id)
+         return PositionGetString(POSITION_SYMBOL);
+     }
+   return "";
+  }
+
 bool EmitDealAddEvent(const ulong deal_ticket)
   {
    if(!HistoryDealSelect(deal_ticket))
       return false; // il deal potrebbe non essere ancora visibile nella cache storica
 
+   long     deal_type    = HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
+   // Balance, credit, commission and correction records are accounting ledger movements, not
+   // trade lifecycle fills.  Returning true marks them intentionally handled without publishing
+   // a false trade_opened event or retrying them forever.
+   if(deal_type != DEAL_TYPE_BUY && deal_type != DEAL_TYPE_SELL)
+      return true;
+
    long     position_id = (long)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
    long     order_id     = (long)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
    string   symbol       = HistoryDealGetString(deal_ticket, DEAL_SYMBOL);
-   long     deal_type    = HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
+   if(symbol == "" && order_id > 0 && HistoryOrderSelect((ulong)order_id))
+      symbol = HistoryOrderGetString((ulong)order_id, ORDER_SYMBOL);
+   if(symbol == "")
+      symbol = SymbolForPositionIdentifier(position_id);
+   // A temporarily incomplete MT5 history cache remains pending for retry.  Never publish an
+   // event which the ingestion contract will reject and which the file bridge would acknowledge.
+   if(symbol == "")
+      return false;
+
    long     entry_raw    = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
    double   volume       = HistoryDealGetDouble(deal_ticket, DEAL_VOLUME);
+   if(volume <= 0.0)
+      return false;
    double   price        = HistoryDealGetDouble(deal_ticket, DEAL_PRICE);
    double   profit       = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
    // Il contratto remoto espone un solo costo: somma commissione e DEAL_FEE.
@@ -1195,8 +1233,8 @@ void OnTimer()
 // SICUREZZA: questo e' l'unico punto in cui l'EA reagisce a transazioni. Legge soltanto lo
 // stato del ticket coinvolto (funzioni Get*/History*Get*) e pubblica un file evento atomico.
 // Nessun ramo chiama funzioni di trading. Ogni chiamata e' O(1) rispetto al volume di
-// account/posizioni/ordini (nessuna scansione completa), per non bloccare a lungo il thread
-// dei trade transaction del terminale.
+// account/posizioni/ordini nel percorso normale. Solo il raro fallback di un DEAL_SYMBOL vuoto
+// esegue una scansione limitata delle posizioni attive, senza chiamate di trading.
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)

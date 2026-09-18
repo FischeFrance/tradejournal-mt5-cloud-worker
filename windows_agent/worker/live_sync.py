@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from worker.event_outbox import EventOutbox
 from worker.event_detector import detect_events
-from worker.event_normalizer import normalize_event
+from worker.event_normalizer import normalize_event, validate_event_preflight
 from worker.event_sender import SendResult
 
 from .dedup import PersistentDedup
@@ -27,6 +27,114 @@ class _CallableSender:
             return sender(payload)
         self._sink(payload)
         return SendResult(status="sent", attempts=1)
+
+
+def _usable_symbol(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > 64
+        or any(ord(character) < 32 for character in value)
+    ):
+        return None
+    return value
+
+
+def _identifiers(*values: object) -> set[str]:
+    identifiers: set[str] = set()
+    for value in values:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            identifier = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if identifier > 0:
+            identifiers.add(str(identifier))
+    return identifiers
+
+
+def _symbols_from_rows(
+    rows: object,
+    identifiers: set[str],
+    identity_fields: tuple[str, ...],
+    *,
+    include_key: bool = True,
+) -> set[str]:
+    if not identifiers or not isinstance(rows, dict):
+        return set()
+    symbols: set[str] = set()
+    for key, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        identity_values = [row.get(field) for field in identity_fields]
+        if include_key:
+            identity_values.insert(0, key)
+        row_identifiers = _identifiers(*identity_values)
+        if identifiers.isdisjoint(row_identifiers):
+            continue
+        symbol = _usable_symbol(row.get("symbol"))
+        if symbol is not None:
+            symbols.add(symbol)
+    return symbols
+
+
+def _authoritative_symbol(record: dict, previous: dict, current: dict) -> str | None:
+    """Resolve a missing symbol only from records already bound to this MT5 event."""
+
+    symbol = _usable_symbol(record.get("symbol"))
+    if symbol is not None:
+        return symbol
+
+    source_type = str(record.get("event_type", "")).upper()
+    position_ids = _identifiers(record.get("position_id"), record.get("position_ticket"))
+    if source_type != "DEAL_ADD":
+        position_ids.update(_identifiers(record.get("ticket")))
+    deal_ids = _identifiers(record.get("deal_id"))
+    if source_type == "DEAL_ADD":
+        deal_ids.update(_identifiers(record.get("ticket")))
+    order_ids = _identifiers(record.get("order_id"))
+
+    candidates: set[str] = set()
+    for snapshot in (current, previous):
+        if not isinstance(snapshot, dict):
+            continue
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("positions"),
+                position_ids,
+                ("ticket", "position_id", "position_ticket"),
+            )
+        )
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("deals"),
+                deal_ids,
+                ("ticket", "deal_id"),
+            )
+        )
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("orders"),
+                order_ids,
+                ("ticket", "order_id"),
+            )
+        )
+        # A related deal/order can still authoritatively name the position even when its own
+        # native ticket is unavailable in the callback.
+        for collection in ("deals", "orders"):
+            candidates.update(
+                _symbols_from_rows(
+                    snapshot.get(collection),
+                    position_ids,
+                    ("position_id", "position_ticket"),
+                    include_key=False,
+                )
+            )
+    # Conflicting related rows are not a safe fallback: wait for the next coherent snapshot.
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
@@ -207,6 +315,9 @@ def _merge_event_stream_with_snapshot(
         # opening into a false scale-in (or apply the same close twice).
         if record.get("history_archived") is True:
             continue
+        resolved_symbol = _authoritative_symbol(record, previous, current)
+        if resolved_symbol is not None and _usable_symbol(record.get("symbol")) is None:
+            record = {**record, "symbol": resolved_symbol}
         event_previous, event_current = previous, current
         if str(record.get("event_type", "")).upper() == "DEAL_ADD":
             position_ticket = record.get("position_id") or record.get("position_ticket")
@@ -385,9 +496,13 @@ class LiveSync:
         )
 
     def _drain_outbox(self) -> int:
+        # A historical dead-letter is an explicit causal barrier, not a reason to kill the
+        # local supervisor loop.  Do not retry or delete it here, and do not deliver successors.
+        if self.outbox.dead_letter_count():
+            return 0
         result = self.outbox.drain(_CallableSender(self.sink))
         dead_lettered = self.outbox.dead_letter_count()
-        if result.pending or dead_lettered or result.dry_run:
+        if result.pending or result.dead_lettered or result.dry_run:
             raise LiveSyncDeliveryError(
                 "event delivery incomplete: "
                 f"pending={result.pending}, dead_lettered={dead_lettered}, "
@@ -399,6 +514,10 @@ class LiveSync:
         # Finish a previously persisted causal prefix before reading newer source events. This
         # makes crash recovery and transient delivery failures preserve open -> modify -> close.
         delivered = self._drain_outbox()
+        if self.outbox.dead_letter_count():
+            # Keep the supervisor cycle healthy, but do not even read/acknowledge a successor
+            # while its rejected predecessor still requires explicit operator recovery.
+            return delivered
         account = self.adapter.verify_identity()
         current = self.adapter.snapshot()
         previous = self.snapshot_store.get()
@@ -409,6 +528,20 @@ class LiveSync:
             if records
             else detect_windows_events(previous, current)
         )
+        for event in events:
+            if event.get("event_type") != "trade_opened":
+                continue
+            symbol = _authoritative_symbol(event, previous, current)
+            if symbol is None:
+                # Do not persist, enqueue or acknowledge an event that the ingestion contract
+                # will reject.  The bridge file remains available for the next authoritative
+                # snapshot instead of becoming an unrecoverable 422 dead-letter.
+                raise LiveSyncDeliveryError("trade_opened symbol unavailable")
+            event["symbol"] = symbol
+            try:
+                validate_event_preflight(event)
+            except ValueError as exc:
+                raise LiveSyncDeliveryError(str(exc)) from exc
         # MAE/MFE stays local for the whole lifetime of the position.  Only the final extrema are
         # attached to the already-existing close event, so this adds zero Supabase calls per poll.
         self.excursions.observe_open_events(events)

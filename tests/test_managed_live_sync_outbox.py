@@ -14,11 +14,15 @@ from windows_agent.worker.live_sync import LiveSync, LiveSyncDeliveryError
 class Adapter:
     def __init__(self, snapshot: dict) -> None:
         self._snapshot = snapshot
+        self.identity_checks = 0
+        self.snapshot_reads = 0
 
     def verify_identity(self) -> dict[str, str]:
+        self.identity_checks += 1
         return {"login": "42", "server": "Fixture-Demo"}
 
     def snapshot(self) -> dict:
+        self.snapshot_reads += 1
         return self._snapshot
 
 
@@ -43,8 +47,10 @@ class StreamAdapter(Adapter):
         self.acknowledged: int | None = None
         self.handoff_completed = False
         self._records = records
+        self.pending_reads = 0
 
     def pending_events(self) -> tuple[dict, ...]:
+        self.pending_reads += 1
         return self._records or (
             {
                 "sequence": 17,
@@ -87,6 +93,29 @@ def _snapshot() -> dict:
     }
 
 
+def _open_record(**changes: object) -> dict:
+    record = {
+        "sequence": 18,
+        "event_type": "DEAL_ADD",
+        "ticket": "900",
+        "deal_id": "900",
+        "order_id": "700",
+        "position_id": "100",
+        "entry": "IN",
+        "symbol": "EURUSD",
+        "direction": "buy",
+        "volume": 0.1,
+        "price": 1.1,
+        "profit": 0.0,
+        "commission": -1.0,
+        "swap": 0.0,
+        "time": "2026-07-27T10:00:00Z",
+        "timestamp_msc": 1_722_074_400_000,
+    }
+    record.update(changes)
+    return record
+
+
 def _live(root: Path, sender: Sender) -> LiveSync:
     return LiveSync(
         Adapter(_snapshot()),
@@ -125,11 +154,24 @@ def test_permanent_rejection_is_visible_and_preserved_in_dead_letter(tmp_path: P
     assert persisted.pending_count() == 0
     assert persisted.dead_letter_count() == 1
 
-    # A causal successor must not bypass an unresolved permanent failure.
+    # A historical dead-letter is a non-fatal causal barrier: the supervisor remains healthy,
+    # but it must not even read or acknowledge a successor from the file bridge.
     retry_sender = Sender([])
-    with pytest.raises(LiveSyncDeliveryError, match="dead_lettered=1"):
-        _live(tmp_path, retry_sender).poll_once()
+    retry_adapter = StreamAdapter(_snapshot(), (_open_record(sequence=19),))
+    retry_live = LiveSync(
+        retry_adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "retry-dedup.sqlite"),
+        retry_sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+    assert retry_live.poll_once() == 0
     assert retry_sender.payloads == []
+    assert retry_adapter.identity_checks == 0
+    assert retry_adapter.snapshot_reads == 0
+    assert retry_adapter.pending_reads == 0
+    assert retry_adapter.acknowledged is None
+    assert EventOutbox(str(tmp_path / "outbox.json")).dead_letter_count() == 1
 
 
 def test_mql5_event_stream_is_primary_and_acknowledged_after_outbox_persist(tmp_path: Path) -> None:
@@ -496,3 +538,224 @@ def test_stream_open_and_snapshot_open_are_merged_without_duplication(
     assert [payload["event_type"] for payload in sender.payloads] == [
         "trade_opened"
     ]
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    (
+        ({"positions": {}, "orders": {}, "deals": {}}, _snapshot()),
+        (
+            {
+                "positions": {},
+                "orders": {},
+                "deals": {
+                    "900": {
+                        "ticket": "900",
+                        "deal_id": "900",
+                        "position_id": "100",
+                        "symbol": "EURUSD",
+                    }
+                },
+            },
+            {"positions": {}, "orders": {}, "deals": {}},
+        ),
+        (
+            {
+                "positions": {},
+                "orders": {
+                    "700": {
+                        "ticket": "700",
+                        "order_id": "700",
+                        "position_id": "100",
+                        "symbol": "EURUSD",
+                    }
+                },
+                "deals": {},
+            },
+            {
+                "positions": {},
+                "orders": {
+                    "700": {
+                        "ticket": "700",
+                        "order_id": "700",
+                        "position_id": "100",
+                        "symbol": "",
+                    }
+                },
+                "deals": {},
+            },
+        ),
+    ),
+    ids=("current-position", "previous-deal", "previous-order"),
+)
+def test_blank_open_symbol_uses_only_related_authoritative_snapshot_rows(
+    tmp_path: Path,
+    previous: dict,
+    current: dict,
+) -> None:
+    PersistentSnapshot(tmp_path / "snapshot.json").save(previous)
+    adapter = StreamAdapter(current, (_open_record(symbol=""),))
+    sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    assert live.poll_once() == 1
+    assert adapter.acknowledged == 18
+    assert sender.payloads[0]["event_type"] == "trade_opened"
+    assert sender.payloads[0]["symbol"] == "EURUSD"
+
+
+def test_blank_open_symbol_fails_closed_until_exact_fallback_exists(
+    tmp_path: Path,
+) -> None:
+    current = {
+        "positions": {
+            "200": {
+                "ticket": "200",
+                "symbol": "GBPUSD",
+                "direction": "buy",
+                "volume": 0.1,
+            }
+        },
+        "orders": {},
+        "deals": {},
+    }
+    record = _open_record(symbol="")
+    adapter = StreamAdapter(current, (record,))
+    sender = Sender([])
+    dedup = PersistentDedup(tmp_path / "dedup.sqlite")
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        dedup,
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    with pytest.raises(LiveSyncDeliveryError, match="symbol unavailable"):
+        live.poll_once()
+
+    assert sender.payloads == []
+    assert adapter.acknowledged is None
+    assert EventOutbox(str(tmp_path / "outbox.json")).pending_count() == 0
+    assert not (tmp_path / "snapshot.json").exists()
+    dedup.close()
+
+    # The same still-pending source event succeeds on a later poll once MT5 exposes a matching
+    # authoritative position row.
+    retry_adapter = StreamAdapter(_snapshot(), (record,))
+    retry_sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+    retry_live = LiveSync(
+        retry_adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        retry_sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+    assert retry_live.poll_once() == 1
+    assert retry_adapter.acknowledged == 18
+    assert retry_sender.payloads[0]["symbol"] == "EURUSD"
+
+
+def test_conflicting_symbol_fallbacks_fail_closed(tmp_path: Path) -> None:
+    current = _snapshot()
+    current["deals"] = {
+        "900": {
+            "ticket": "900",
+            "deal_id": "900",
+            "position_id": "100",
+            "symbol": "GBPUSD",
+        }
+    }
+    adapter = StreamAdapter(current, (_open_record(symbol=""),))
+    sender = Sender([])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    with pytest.raises(LiveSyncDeliveryError, match="symbol unavailable"):
+        live.poll_once()
+
+    assert sender.payloads == []
+    assert adapter.acknowledged is None
+    assert EventOutbox(str(tmp_path / "outbox.json")).pending_count() == 0
+
+
+def test_related_symbol_fallback_does_not_confuse_native_ticket_with_position_id(
+    tmp_path: Path,
+) -> None:
+    # The map key/native order ticket equals the target position ID, but the authoritative
+    # position relation proves this order belongs to another lifecycle.
+    collision_snapshot = {
+        "positions": {},
+        "orders": {
+            "100": {
+                "ticket": "100",
+                "order_id": "100",
+                "position_id": "200",
+                "symbol": "GBPUSD",
+            }
+        },
+        "deals": {},
+    }
+    PersistentSnapshot(tmp_path / "snapshot.json").save(collision_snapshot)
+    adapter = StreamAdapter(collision_snapshot, (_open_record(symbol=""),))
+    sender = Sender([])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    with pytest.raises(LiveSyncDeliveryError, match="symbol unavailable"):
+        live.poll_once()
+
+    assert sender.payloads == []
+    assert adapter.acknowledged is None
+    assert EventOutbox(str(tmp_path / "outbox.json")).pending_count() == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("direction", None, "direction unavailable"),
+        ("direction", "BUY", "direction unavailable"),
+        ("volume", 0.0, "volume unavailable"),
+        ("volume", float("nan"), "volume unavailable"),
+        ("volume", True, "volume unavailable"),
+    ),
+)
+def test_invalid_open_contract_fields_are_not_enqueued_or_acknowledged(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    adapter = StreamAdapter(_snapshot(), (_open_record(**{field: value}),))
+    sender = Sender([])
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+
+    with pytest.raises(LiveSyncDeliveryError, match=message):
+        live.poll_once()
+
+    assert sender.payloads == []
+    assert adapter.acknowledged is None
+    assert EventOutbox(str(tmp_path / "outbox.json")).pending_count() == 0
+    assert not (tmp_path / "snapshot.json").exists()

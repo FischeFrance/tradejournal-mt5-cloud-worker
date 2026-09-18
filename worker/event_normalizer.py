@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -84,6 +85,44 @@ _NATIVE_DEAL_EVENTS = frozenset(
 )
 
 
+def validate_event_preflight(raw_event: Dict[str, Any]) -> None:
+    """Reject malformed opens before they can acquire an outbox identity.
+
+    The ingestion route requires these three lifecycle fields.  In particular, accepting an
+    empty symbol locally would acknowledge the bridge file and turn a recoverable MT5 cache race
+    into a permanent HTTP 422 dead-letter.
+    """
+
+    if raw_event.get("event_type") != "trade_opened":
+        return
+
+    symbol = raw_event.get("symbol")
+    if (
+        not isinstance(symbol, str)
+        or not symbol
+        or symbol != symbol.strip()
+        or len(symbol) > 64
+        or any(ord(character) < 32 for character in symbol)
+    ):
+        raise ValueError("trade_opened symbol unavailable")
+
+    if raw_event.get("direction") not in ("buy", "sell"):
+        raise ValueError("trade_opened direction unavailable")
+
+    volume = raw_event.get("volume")
+    try:
+        numeric_volume = float(volume)
+    except (OverflowError, TypeError, ValueError):
+        numeric_volume = math.nan
+    if (
+        isinstance(volume, bool)
+        or not isinstance(volume, (int, float))
+        or not math.isfinite(numeric_volume)
+        or numeric_volume <= 0.0
+    ):
+        raise ValueError("trade_opened volume unavailable")
+
+
 def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     """Genera un event_id deterministico e idempotente.
 
@@ -121,6 +160,7 @@ def normalize_event(
     platform: str = "mt5",
 ) -> Dict[str, Any]:
     """Converte un evento grezzo rilevato da event_detector nel payload dell'ingestion API."""
+    validate_event_preflight(raw_event)
     event_time = raw_event.get("event_time") or _now_iso()
     event = {**raw_event, "event_time": event_time}
 

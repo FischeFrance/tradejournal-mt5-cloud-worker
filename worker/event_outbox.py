@@ -145,6 +145,10 @@ class EventOutbox:
         dopo un errore transitorio potrebbe quindi trasformare un problema temporaneo in un 4xx
         permanente e perdere causalita'.
         """
+        if self.dead_letter_count():
+            # Recovery of a rejected predecessor is an explicit operator action.  Until then,
+            # its successors stay durable and must not overtake it on a later process restart.
+            return DrainResult(pending=self.pending_count())
         sent = dry_run = dead_lettered = transient_failures = 0
         index = 0
 
@@ -183,7 +187,10 @@ class EventOutbox:
                     "(http_status=%s).",
                     result.http_status,
                 )
-                continue
+                # The rejected event remains a causal barrier even after being moved out of
+                # ``pending``.  Sending a later close/modify here could make the remote state
+                # advance past its missing predecessor.  Recovery is deliberately explicit.
+                break
 
             # Include risultati legacy senza failure_type: conservarli e fermare il drain e' la
             # scelta fail-safe che preserva sia l'evento sia l'ordine dei successivi.

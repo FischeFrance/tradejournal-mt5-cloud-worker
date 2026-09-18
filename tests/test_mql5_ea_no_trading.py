@@ -221,6 +221,51 @@ def test_live_deal_cache_races_are_retried_from_the_timer():
     assert "g_pending_deal_tickets[i] == deal_ticket" in text
 
 
+def test_live_deal_emitter_allows_only_trade_fills_and_defers_incomplete_symbols():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    helper = text[
+        text.index("string SymbolForPositionIdentifier") : text.index(
+            "bool EmitDealAddEvent"
+        )
+    ]
+    emitter = text[
+        text.index("bool EmitDealAddEvent") : text.index("bool QueuePendingDealEvent")
+    ]
+
+    # A positive allow-list is stronger than trying to enumerate every accounting deal type:
+    # balance, credit, commission, correction and future non-trading types cannot be projected.
+    allowlist = "deal_type != DEAL_TYPE_BUY && deal_type != DEAL_TYPE_SELL"
+    assert allowlist in emitter
+    assert emitter.index(allowlist) < emitter.index("string direction")
+    assert emitter.index(allowlist) < emitter.index("BuildEventJson")
+    handled_branch = emitter[emitter.index(allowlist) : emitter.index("long     position_id")]
+    assert "return true;" in handled_branch
+
+    # An omitted deal symbol is recovered only from the exact originating order or associated
+    # position identifier.  If MT5 has not exposed either yet, false keeps the ticket pending.
+    deal_symbol = "HistoryDealGetString(deal_ticket, DEAL_SYMBOL)"
+    order_select = "HistoryOrderSelect((ulong)order_id)"
+    order_symbol = "HistoryOrderGetString((ulong)order_id, ORDER_SYMBOL)"
+    position_symbol = "SymbolForPositionIdentifier(position_id)"
+    build = "BuildEventJson"
+    assert emitter.index(deal_symbol) < emitter.index(order_select)
+    assert emitter.index(order_select) < emitter.index(order_symbol)
+    assert emitter.index(order_symbol) < emitter.index(position_symbol)
+    assert emitter.index(position_symbol) < emitter.index(build)
+    unresolved = emitter[
+        emitter.index(position_symbol) + len(position_symbol) : emitter.index(build)
+    ]
+    assert 'if(symbol == "")' in unresolved
+    assert "return false;" in unresolved
+
+    assert "PositionsTotal()" in helper
+    assert "PositionGetTicket(i)" in helper
+    assert "PositionGetInteger(POSITION_IDENTIFIER)" in helper
+    assert "PositionGetString(POSITION_SYMBOL)" in helper
+
+
 def test_position_events_keep_ticket_but_use_stable_position_identifier():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
         encoding="utf-8"
