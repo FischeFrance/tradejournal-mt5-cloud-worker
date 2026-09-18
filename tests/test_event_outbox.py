@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from event_outbox import EventOutbox, OutboxError, durable_replace
+from event_outbox import EventOutbox, OutboxError, _outbox_file_lock, durable_replace
 from event_sender import SendResult
 
 
@@ -99,6 +99,48 @@ def test_batch_is_persisted_together_and_survives_restart(tmp_path):
 
     restarted = EventOutbox(str(path))
     assert restarted.pending_payloads() == {"event-1": first, "event-2": second}
+
+
+def test_stale_instances_reload_under_lock_before_enqueue(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    first_writer = EventOutbox(str(path))
+    second_writer = EventOutbox(str(path))
+    first = _payload("event-1")
+    second = _payload("event-2")
+
+    assert first_writer.enqueue_many([first]) == 1
+    assert second_writer.enqueue_many([second]) == 1
+
+    assert EventOutbox(str(path)).pending_payloads() == {
+        "event-1": first,
+        "event-2": second,
+    }
+    _assert_private_file(path.with_name(f"{path.name}.lock"))
+
+
+def test_stale_instance_reloads_under_lock_before_drain(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    stale = EventOutbox(str(path))
+    payload = _payload("event-added-by-another-writer")
+    EventOutbox(str(path)).enqueue_many([payload])
+    sender = _Sender([SendResult(status="sent", http_status=200)])
+
+    result = stale.drain(sender)
+
+    assert result.sent == 1
+    assert result.pending == 0
+    assert sender.payloads == [payload]
+
+
+def test_outbox_lock_contention_has_a_finite_timeout(tmp_path):
+    path = tmp_path / "event_outbox.json"
+
+    with _outbox_file_lock(str(path)):
+        with patch("event_outbox._LOCK_TIMEOUT_SECONDS", 0.01), patch(
+            "event_outbox._LOCK_POLL_SECONDS", 0.001
+        ):
+            with pytest.raises(OutboxError, match="Timeout"):
+                EventOutbox(str(path))
 
 
 def test_fifo_order_survives_restart_when_event_ids_sort_differently(tmp_path):
@@ -322,50 +364,7 @@ def _dead_lettered_outbox(path, payload=None):
     return outbox, payload, record
 
 
-def test_guarded_requeue_moves_same_event_id_to_fifo_head(tmp_path):
-    path = tmp_path / "event_outbox.json"
-    outbox, payload, record = _dead_lettered_outbox(path)
-    later = _payload("later-event", "2026-01-01T00:00:02Z")
-    outbox.enqueue_many([later])
-    replacement = {**payload, "symbol": "EURUSD"}
-
-    returned = outbox.requeue_dead_letter_first(
-        payload["event_id"],
-        replacement,
-        expected_record_sha256=EventOutbox.record_sha256(record),
-    )
-
-    restarted = EventOutbox(str(path))
-    assert returned == record
-    assert list(restarted.pending_payloads()) == [payload["event_id"], "later-event"]
-    assert restarted.pending_payloads()[payload["event_id"]] == replacement
-    assert restarted.dead_letter_count() == 0
-
-
-def test_guarded_requeue_rejects_changed_record_and_event_identity(tmp_path):
-    path = tmp_path / "event_outbox.json"
-    outbox, payload, record = _dead_lettered_outbox(path)
-    digest = EventOutbox.record_sha256(record)
-
-    with pytest.raises(OutboxError, match="event_id"):
-        outbox.requeue_dead_letter_first(
-            payload["event_id"],
-            {**payload, "event_id": "different-event"},
-            expected_record_sha256=digest,
-        )
-    with pytest.raises(OutboxError, match="cambiato"):
-        outbox.requeue_dead_letter_first(
-            payload["event_id"],
-            {**payload, "symbol": "EURUSD"},
-            expected_record_sha256="0" * 64,
-        )
-
-    restarted = EventOutbox(str(path))
-    assert restarted.dead_letters()[payload["event_id"]] == record
-    assert restarted.pending_count() == 0
-
-
-def test_non_trading_resolution_requires_matching_durable_audit(tmp_path):
+def test_audited_resolution_requires_matching_durable_audit(tmp_path):
     path = tmp_path / "event_outbox.json"
     outbox, payload, record = _dead_lettered_outbox(path)
     record_digest = EventOutbox.record_sha256(record)
@@ -375,7 +374,7 @@ def test_non_trading_resolution_requires_matching_durable_audit(tmp_path):
     audit_digest = hashlib.sha256(audit.read_bytes()).hexdigest()
 
     with pytest.raises(OutboxError, match="Audit"):
-        outbox.resolve_non_trading_dead_letter(
+        outbox.resolve_audited_dead_letter(
             payload["event_id"],
             expected_record_sha256=record_digest,
             audit_path=str(audit),
@@ -383,7 +382,16 @@ def test_non_trading_resolution_requires_matching_durable_audit(tmp_path):
         )
     assert EventOutbox(str(path)).dead_letter_count() == 1
 
-    returned = outbox.resolve_non_trading_dead_letter(
+    with pytest.raises(OutboxError, match="cambiato"):
+        outbox.resolve_audited_dead_letter(
+            payload["event_id"],
+            expected_record_sha256="0" * 64,
+            audit_path=str(audit),
+            expected_audit_sha256=audit_digest,
+        )
+    assert EventOutbox(str(path)).dead_letter_count() == 1
+
+    returned = outbox.resolve_audited_dead_letter(
         payload["event_id"],
         expected_record_sha256=record_digest,
         audit_path=str(audit),
@@ -391,3 +399,27 @@ def test_non_trading_resolution_requires_matching_durable_audit(tmp_path):
     )
     assert returned == record
     assert EventOutbox(str(path)).dead_letter_count() == 0
+
+
+def test_audited_cas_removal_refreshes_state_and_preserves_pending_successor(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    stale, payload, record = _dead_lettered_outbox(path)
+    record_digest = EventOutbox.record_sha256(record)
+    audit = tmp_path / "resolution.json"
+    audit.write_bytes(b'{"classification":"real_trade"}')
+    audit.chmod(0o600)
+    audit_digest = hashlib.sha256(audit.read_bytes()).hexdigest()
+    successor = _payload("successor", "2026-01-01T00:01:00Z")
+    EventOutbox(str(path)).enqueue_many([successor])
+
+    returned = stale.resolve_audited_dead_letter(
+        payload["event_id"],
+        expected_record_sha256=record_digest,
+        audit_path=str(audit),
+        expected_audit_sha256=audit_digest,
+    )
+
+    refreshed = EventOutbox(str(path))
+    assert returned == record
+    assert refreshed.dead_letter_count() == 0
+    assert refreshed.pending_payloads() == {"successor": successor}
