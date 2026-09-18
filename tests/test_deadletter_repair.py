@@ -10,6 +10,7 @@ import pytest
 
 from worker.event_outbox import EventOutbox
 from worker.event_sender import SendResult
+from windows_agent import deadletter_repair as repair_module
 from windows_agent.deadletter_repair import (
     DeadLetterRepairError,
     RepairRequest,
@@ -43,14 +44,14 @@ class _RepairSender:
         return self.result
 
 
-def _payload(*, external_trade_id="7001"):
-    return {
+def _payload(**overrides):
+    value = {
         "event_id": "mt5-sensitive-account-trade_opened-sensitive-digest",
         "event_type": "trade_opened",
         "platform": "mt5",
         "account_number": "sensitive-account",
         "server": "Sensitive Broker",
-        "external_trade_id": external_trade_id,
+        "external_trade_id": "7001",
         "symbol": "",
         "direction": "buy",
         "volume": 0.3,
@@ -61,16 +62,18 @@ def _payload(*, external_trade_id="7001"):
         "event_time": "2026-09-17T15:05:15+00:00",
         "open_time": "2026-09-17T15:05:15+00:00",
     }
+    value.update(overrides)
+    return value
 
 
-def _ledger_row(*, deal_type=0, position_id="7001", symbol="EURUSD"):
-    return {
+def _ledger_row(**overrides):
+    value = {
         "history_index": 9,
         "ticket": "9001",
-        "position_id": position_id,
+        "position_id": "7001",
         "order_id": "8001",
-        "symbol": symbol,
-        "deal_type": deal_type,
+        "symbol": "EURUSD",
+        "deal_type": 0,
         "direction": "buy",
         "entry": "IN",
         "volume": 0.3,
@@ -82,6 +85,8 @@ def _ledger_row(*, deal_type=0, position_id="7001", symbol="EURUSD"):
         "time_msc": 1789657515000,
         "time": "2026-09-17T15:05:15+00:00",
     }
+    value.update(overrides)
+    return value
 
 
 def _write_json(path: Path, value) -> None:
@@ -221,8 +226,19 @@ def test_duplicate_acknowledgement_is_success(tmp_path):
 
 
 def test_non_trading_accounting_is_audited_without_delivery(tmp_path):
-    row = _ledger_row(deal_type=2, position_id="0", symbol="")
-    env = _fixture(tmp_path, row=row, payload=_payload(external_trade_id="9001"))
+    row = _ledger_row(
+        deal_type=2,
+        position_id="0",
+        order_id="0",
+        symbol="",
+        volume=0,
+        price=0,
+    )
+    env = _fixture(
+        tmp_path,
+        row=row,
+        payload=_payload(external_trade_id="9001", volume=0, open_price=0),
+    )
     sender = _RepairSender()
 
     result = repair_live_dead_letter(
@@ -249,6 +265,178 @@ def test_non_trading_accounting_is_audited_without_delivery(tmp_path):
     )
     assert repeated["classification"] == "non_trading_accounting"
     assert sender.payloads == []
+
+
+@pytest.mark.parametrize(
+    "deal_type",
+    [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17],
+)
+def test_only_explicit_mt5_accounting_types_with_accounting_shape_are_resolved(
+    tmp_path, deal_type
+):
+    row = _ledger_row(
+        deal_type=deal_type,
+        position_id="0",
+        order_id="0",
+        symbol="",
+        volume=0,
+        price=0,
+    )
+    env = _fixture(
+        tmp_path,
+        row=row,
+        payload=_payload(external_trade_id="9001", volume=0, open_price=0),
+    )
+
+    result = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=_RepairSender(),
+    )
+
+    assert result["classification"] == "non_trading_accounting"
+
+
+@pytest.mark.parametrize(
+    "row,payload",
+    [
+        (
+            _ledger_row(
+                deal_type=99,
+                position_id="0",
+                order_id="0",
+                symbol="",
+                volume=0,
+                price=0,
+            ),
+            _payload(external_trade_id="9001", volume=0, open_price=0),
+        ),
+        (
+            _ledger_row(
+                deal_type=0,
+                position_id="0",
+                order_id="0",
+                symbol="",
+                volume=0,
+                price=0,
+            ),
+            _payload(external_trade_id="9001", volume=0, open_price=0),
+        ),
+        (
+            _ledger_row(
+                deal_type=1,
+                direction="sell",
+                position_id="0",
+                order_id="0",
+                symbol="",
+                volume=0,
+                price=0,
+            ),
+            _payload(external_trade_id="9001", volume=0, open_price=0),
+        ),
+        (_ledger_row(deal_type=2), _payload()),
+        (
+            _ledger_row(
+                deal_type=13,
+                position_id="0",
+                order_id="0",
+                symbol="",
+                volume=0,
+                price=0,
+            ),
+            _payload(external_trade_id="9001", volume=0, open_price=0),
+        ),
+        (
+            _ledger_row(
+                deal_type=14,
+                position_id="0",
+                order_id="0",
+                symbol="",
+                volume=0,
+                price=0,
+            ),
+            _payload(external_trade_id="9001", volume=0, open_price=0),
+        ),
+    ],
+    ids=[
+        "unknown-accounting-shape",
+        "buy-position-zero",
+        "sell-position-zero",
+        "accounting-type-trade-shape",
+        "buy-cancelled",
+        "sell-cancelled",
+    ],
+)
+def test_ambiguous_deal_type_or_shape_never_mutates(tmp_path, row, payload):
+    env = _fixture(tmp_path, row=row, payload=payload)
+    original = env["outbox_path"].read_bytes()
+    sender = _RepairSender()
+
+    with pytest.raises(DeadLetterRepairError, match="ledger_classification_ambiguous"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=sender,
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert EventOutbox(str(env["outbox_path"])).dead_letter_count() == 1
+    assert sender.payloads == []
+    assert not env["rollback"].exists()
+    assert not (env["instance"] / "state" / "dead-letter-resolutions").exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("connection_id", "d8c7ea21-512f-4629-a065-d5d6f85c0f0e"),
+        ("account_number", "different-account"),
+        ("server", "Different Broker"),
+    ],
+)
+def test_ledger_report_identity_mismatch_never_mutates(tmp_path, field, value):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    report_path = env["instance"] / "data" / "history-balance-backfill.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report[field] = value
+    _write_json(report_path, report)
+
+    with pytest.raises(DeadLetterRepairError, match="ledger_identity_mismatch"):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert not env["rollback"].exists()
+    assert not (env["instance"] / "state" / "dead-letter-resolutions").exists()
+
+
+def test_ledger_report_identity_uses_existing_exact_normalizers(tmp_path):
+    env = _fixture(tmp_path)
+    report_path = env["instance"] / "data" / "history-balance-backfill.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["account_number"] = "  sensitive-account  "
+    report["server"] = "  SENSITIVE   broker  "
+    _write_json(report_path, report)
+
+    result = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=_RepairSender(),
+    )
+
+    assert result["classification"] == "real_trade"
 
 
 @pytest.mark.parametrize(
@@ -364,3 +552,145 @@ def test_transient_delivery_stays_pending_and_rerun_can_confirm_duplicate(tmp_pa
     )
     assert result["outcome"] == "duplicate"
     assert EventOutbox(str(env["outbox_path"])).pending_count() == 0
+
+
+def test_private_write_recovers_partial_orphan_and_rerun_cleans_orphan(tmp_path):
+    destination = tmp_path / "audit" / "record.json"
+    payload = b'{"classification":"real_trade"}'
+    absolute_destination = repair_module._absolute_path(destination)
+    temporary = repair_module._private_temporary_path(absolute_destination, payload)
+    temporary.parent.mkdir(parents=True)
+    temporary.write_bytes(b"partial")
+    temporary.chmod(0o600)
+
+    repair_module._write_private_once(destination, payload)
+
+    assert destination.read_bytes() == payload
+    assert not temporary.exists()
+    _assert_private(destination)
+
+    # Models POSIX crashing after the no-replace link and before unlinking the temp name.
+    temporary.write_bytes(b"orphan-after-publish")
+    temporary.chmod(0o600)
+    repair_module._write_private_once(destination, payload)
+    assert destination.read_bytes() == payload
+    assert not temporary.exists()
+
+
+def test_private_write_never_overwrites_existing_artifact(tmp_path):
+    destination = tmp_path / "audit" / "record.json"
+    repair_module._write_private_once(destination, b"first")
+
+    with pytest.raises(
+        DeadLetterRepairError, match="immutable_maintenance_artifact_conflict"
+    ):
+        repair_module._write_private_once(destination, b"second")
+
+    assert destination.read_bytes() == b"first"
+
+
+def test_private_write_losing_publish_race_does_not_replace_winner(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "audit" / "record.json"
+
+    def competing_publish(_source, target):
+        target.write_bytes(b"winner")
+        target.chmod(0o600)
+        raise FileExistsError
+
+    monkeypatch.setattr(repair_module, "_publish_no_replace", competing_publish)
+
+    with pytest.raises(
+        DeadLetterRepairError, match="immutable_maintenance_artifact_conflict"
+    ):
+        repair_module._write_private_once(destination, b"candidate")
+
+    assert destination.read_bytes() == b"winner"
+
+
+@pytest.mark.parametrize("target_kind", ["state", "data", "audit", "rollback"])
+def test_symlink_in_sensitive_path_chain_is_rejected_without_mutation(
+    tmp_path, target_kind
+):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    if target_kind in ("state", "data"):
+        target = env["instance"] / target_kind
+        real = tmp_path / f"real-{target_kind}"
+        target.rename(real)
+    elif target_kind == "audit":
+        target = env["instance"] / "state" / "dead-letter-resolutions"
+        real = tmp_path / "real-audit"
+        real.mkdir()
+    else:
+        target = env["rollback"]
+        real = tmp_path / "real-rollback"
+        real.mkdir()
+    try:
+        target.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+
+    with pytest.raises(
+        DeadLetterRepairError,
+        match="(?:rollback|maintenance)_(?:path|file)_invalid",
+    ):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert EventOutbox(str(env["outbox_path"])).dead_letter_count() == 1
+
+
+@pytest.mark.parametrize(
+    "target_kind", ["state", "data", "ledger-file", "audit", "rollback"]
+)
+def test_windows_reparse_attribute_on_file_or_ancestor_is_rejected(
+    tmp_path, monkeypatch, target_kind
+):
+    env = _fixture(tmp_path)
+    original = env["outbox_path"].read_bytes()
+    if target_kind == "state":
+        target = env["instance"] / "state"
+    elif target_kind == "data":
+        target = env["instance"] / "data"
+    elif target_kind == "ledger-file":
+        target = env["instance"] / "data" / "history-balance-backfill.json"
+    elif target_kind == "audit":
+        target = env["instance"] / "state" / "dead-letter-resolutions"
+        target.mkdir()
+    else:
+        target = env["rollback"]
+        target.mkdir()
+    target = repair_module._absolute_path(target)
+    actual_attributes = repair_module._windows_file_attributes
+
+    def modeled_attributes(path, metadata):
+        if repair_module._absolute_path(path) == target:
+            return repair_module._FILE_ATTRIBUTE_REPARSE_POINT
+        return actual_attributes(path, metadata)
+
+    monkeypatch.setattr(
+        repair_module, "_windows_file_attributes", modeled_attributes
+    )
+
+    with pytest.raises(
+        DeadLetterRepairError,
+        match="(?:rollback|maintenance)_(?:path|file)_invalid",
+    ):
+        repair_live_dead_letter(
+            env["request"],
+            instances_root=env["instances"],
+            rollback_root=env["rollback"],
+            ingestion_url="https://example.supabase.co/trading-mt5-events",
+            sender=_RepairSender(),
+        )
+
+    assert env["outbox_path"].read_bytes() == original
+    assert EventOutbox(str(env["outbox_path"])).dead_letter_count() == 1

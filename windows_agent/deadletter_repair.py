@@ -8,6 +8,7 @@ record selected by digests rather than by putting sensitive MT5 identifiers on a
 from __future__ import annotations
 
 import copy
+import ctypes
 import hashlib
 import json
 import os
@@ -28,7 +29,13 @@ from worker.event_sender import SendResult
 
 from .event_supervisor import connection_sync_lock
 from .provisioning.secret_store import WindowsSecretStore
-from .security import canonical_uuid, safe_child
+from .security import canonical_uuid
+from .worker.history_balance import (
+    CREDIT_DEAL_TYPE,
+    KNOWN_BALANCE_DEAL_TYPES,
+    TRADE_DEAL_TYPES,
+)
+from .worker.mt5_broker_discovery import BrokerDiscoveryError, normalize_server_name
 
 
 DEFAULT_INSTANCES_ROOT = Path(r"C:\TradeJournal\instances")
@@ -48,7 +55,12 @@ _REQUEST_KEYS = frozenset(
         "expected_record_sha256",
     }
 )
-_TRADE_DEAL_TYPES = frozenset((0, 1))
+_TRADE_DEAL_TYPES = TRADE_DEAL_TYPES
+_ACCOUNTING_DEAL_TYPES = frozenset(
+    (KNOWN_BALANCE_DEAL_TYPES - TRADE_DEAL_TYPES) | {CREDIT_DEAL_TYPE}
+)
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_MOVEFILE_WRITE_THROUGH = 0x00000008
 _MAX_JSON_BYTES = 512 * 1024 * 1024
 
 
@@ -257,7 +269,7 @@ def repair_live_dead_letter(
             event_id, dead_record = _select_dead_letter(outbox, request)
             if outbox.pending_count() != 0:
                 raise DeadLetterRepairError("outbox_not_quiescent")
-            decision = _classify_from_coherent_ledger(instance_root, dead_record)
+            decision = _classify_from_coherent_ledger(instance_root, dead_record, request)
             audit_document = _audit_document(request, dead_record, decision)
             audit_bytes = _canonical_json_bytes(audit_document)
             _write_private_once(backup_path, outbox_bytes)
@@ -273,11 +285,26 @@ def repair_live_dead_letter(
             audit_sha256 = _sha256(audit_bytes)
             dead_record = copy.deepcopy(audit_document["dead_letter_record"])
             event_id = str(dead_record["payload"]["event_id"])
-            decision = LedgerDecision(
+            audited_decision = LedgerDecision(
                 classification=str(audit_document["classification"]),
                 row=copy.deepcopy(audit_document["ledger_record"]),
                 replacement_payload=copy.deepcopy(audit_document.get("replacement_payload")),
             )
+            decision = _classify_from_coherent_ledger(instance_root, dead_record, request)
+            if _canonical_json_bytes(
+                {
+                    "classification": decision.classification,
+                    "row": decision.row,
+                    "replacement_payload": decision.replacement_payload,
+                }
+            ) != _canonical_json_bytes(
+                {
+                    "classification": audited_decision.classification,
+                    "row": audited_decision.row,
+                    "replacement_payload": audited_decision.replacement_payload,
+                }
+            ):
+                raise DeadLetterRepairError("resolution_audit_invalid")
 
         if decision.classification == "non_trading_accounting":
             result = _resolve_non_trading(
@@ -469,6 +496,7 @@ def _select_dead_letter(
 def _classify_from_coherent_ledger(
     instance_root: Path,
     dead_record: dict[str, Any],
+    request: RepairRequest,
 ) -> LedgerDecision:
     checkpoint = _read_json(instance_root / "state" / "history.json")
     report = _read_json(instance_root / "data" / "history-balance-backfill.json")
@@ -482,6 +510,8 @@ def _classify_from_coherent_ledger(
         or anchor.get("coherent") is not True
     ):
         raise DeadLetterRepairError("ledger_not_coherent")
+    payload = dead_record["payload"]
+    _require_ledger_identity(request, report, payload)
     deal_count = anchor.get("deal_count")
     accounting_count = checkpoint.get("accounting_deals")
     if (
@@ -492,7 +522,6 @@ def _classify_from_coherent_ledger(
         or isinstance(accounting_count, bool)
     ):
         raise DeadLetterRepairError("ledger_not_coherent")
-    payload = dead_record["payload"]
     event_time = _parse_aware_datetime(payload.get("event_time"))
     through = _parse_aware_datetime(checkpoint.get("through"))
     anchor_as_of = _parse_aware_datetime(anchor.get("as_of"))
@@ -504,36 +533,114 @@ def _classify_from_coherent_ledger(
         raise DeadLetterRepairError("ledger_not_complete")
     row = _match_ledger_row(payload, tuple(rows.values()))
     deal_type = row.get("deal_type")
-    position_id = str(row.get("position_id", "")).strip()
-    entry = str(row.get("entry", "")).strip().upper()
+    position_id = row.get("position_id")
+    order_id = row.get("order_id")
+    entry = row.get("entry")
     symbol = row.get("symbol")
-    if isinstance(deal_type, int) and not isinstance(deal_type, bool):
-        if deal_type not in _TRADE_DEAL_TYPES or position_id == "0":
+    if not isinstance(deal_type, int) or isinstance(deal_type, bool):
+        raise DeadLetterRepairError("ledger_classification_ambiguous")
+    if deal_type in _ACCOUNTING_DEAL_TYPES:
+        if _has_strict_accounting_shape(row):
             return LedgerDecision("non_trading_accounting", row, None)
-        if (
-            deal_type in _TRADE_DEAL_TYPES
-            and position_id
-            and position_id != "0"
-            and entry == "IN"
-            and isinstance(symbol, str)
-            and symbol.strip()
-        ):
-            replacement = copy.deepcopy(payload)
-            replacement.update(
-                {
-                    "symbol": symbol.strip(),
-                    "direction": "buy" if deal_type == 0 else "sell",
-                    "external_trade_id": position_id,
-                    "native_deal_ticket": str(row.get("ticket")),
-                    "time_basis": "broker_server_unresolved",
-                }
-            )
-            if row.get("time_msc") is not None:
-                replacement["time_msc"] = row["time_msc"]
-            if replacement.get("event_id") != payload.get("event_id"):
-                raise DeadLetterRepairError("event_identity_changed")
-            return LedgerDecision("real_trade", row, replacement)
-    raise DeadLetterRepairError("ledger_classification_ambiguous")
+        raise DeadLetterRepairError("ledger_classification_ambiguous")
+    if deal_type not in _TRADE_DEAL_TYPES:
+        raise DeadLetterRepairError("ledger_classification_ambiguous")
+    expected_direction = "buy" if deal_type == 0 else "sell"
+    if (
+        not isinstance(position_id, str)
+        or not position_id.isdecimal()
+        or int(position_id) <= 0
+        or not isinstance(order_id, str)
+        or not order_id.isdecimal()
+        or int(order_id) <= 0
+        or not isinstance(entry, str)
+        or entry.strip().upper() != "IN"
+        or not isinstance(symbol, str)
+        or not symbol.strip()
+        or str(row.get("direction", "")).strip().lower() != expected_direction
+        or not _number_is_positive(row.get("volume"))
+        or not _number_is_positive(row.get("price"))
+    ):
+        # BUY/SELL with position zero is not silently treated as accounting.  Any malformed
+        # trade shape (and every unknown future MT5 enum) remains a hard, non-mutating stop.
+        raise DeadLetterRepairError("ledger_classification_ambiguous")
+    replacement = copy.deepcopy(payload)
+    replacement.update(
+        {
+            "symbol": symbol.strip(),
+            "direction": expected_direction,
+            "external_trade_id": position_id,
+            "native_deal_ticket": str(row.get("ticket")),
+            "time_basis": "broker_server_unresolved",
+        }
+    )
+    if row.get("time_msc") is not None:
+        replacement["time_msc"] = row["time_msc"]
+    if replacement.get("event_id") != payload.get("event_id"):
+        raise DeadLetterRepairError("event_identity_changed")
+    return LedgerDecision("real_trade", row, replacement)
+
+
+def _require_ledger_identity(
+    request: RepairRequest,
+    report: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    try:
+        report_connection_id = canonical_uuid(report.get("connection_id"))
+        report_account = _normalize_account_number(report.get("account_number"))
+        payload_account = _normalize_account_number(payload.get("account_number"))
+        report_server = _normalize_server(report.get("server"))
+        payload_server = _normalize_server(payload.get("server"))
+    except (TypeError, ValueError, BrokerDiscoveryError) as exc:
+        raise DeadLetterRepairError("ledger_identity_mismatch") from exc
+    if (
+        report_connection_id != request.connection_id
+        or report_account != payload_account
+        or report_server != payload_server
+    ):
+        raise DeadLetterRepairError("ledger_identity_mismatch")
+
+
+def _normalize_account_number(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid account number")
+    normalized = value.strip()
+    if not normalized or any(character.isspace() for character in normalized):
+        raise ValueError("invalid account number")
+    return normalized
+
+
+def _normalize_server(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid server")
+    normalized = normalize_server_name(value)
+    if not normalized:
+        raise ValueError("invalid server")
+    return normalized
+
+
+def _has_strict_accounting_shape(row: dict[str, Any]) -> bool:
+    return (
+        row.get("position_id") == "0"
+        and row.get("order_id") == "0"
+        and isinstance(row.get("symbol"), str)
+        and not row["symbol"].strip()
+        and isinstance(row.get("entry"), str)
+        and row["entry"].strip().upper() == "IN"
+        and _number_is_zero(row.get("volume"))
+        and _number_is_zero(row.get("price"))
+    )
+
+
+def _number_is_zero(value: Any) -> bool:
+    parsed = _to_decimal(value)
+    return parsed is not None and parsed == 0
+
+
+def _number_is_positive(value: Any) -> bool:
+    parsed = _to_decimal(value)
+    return parsed is not None and parsed > 0
 
 
 def _read_accounting_rows(path: Path) -> dict[str, dict[str, Any]]:
@@ -666,81 +773,238 @@ def _validate_existing_audit(document: Any, request: RepairRequest) -> dict[str,
 
 
 def _backup_path(root: Path, request: RepairRequest) -> Path:
-    base = Path(root).resolve()
-    target = (base / request.deployment_id / request.connection_id).resolve()
+    if not _DEPLOYMENT_ID.fullmatch(request.deployment_id):
+        raise DeadLetterRepairError("rollback_path_invalid")
+    try:
+        connection_id = canonical_uuid(request.connection_id)
+    except (TypeError, ValueError) as exc:
+        raise DeadLetterRepairError("rollback_path_invalid") from exc
+    base = _absolute_path(root)
+    target = base / request.deployment_id / connection_id
     try:
         target.relative_to(base)
     except ValueError as exc:
         raise DeadLetterRepairError("rollback_path_invalid") from exc
-    _reject_existing_reparse_ancestors(base, target)
+    _reject_reparse_chain(target, "rollback_path_invalid")
     return target / "live-outbox.before.json"
 
 
 def _validated_instance_root(root: Path, connection_id: str) -> Path:
     try:
-        instance = safe_child(Path(root), connection_id)
-    except ValueError as exc:
+        canonical = canonical_uuid(connection_id)
+    except (TypeError, ValueError) as exc:
         raise DeadLetterRepairError("instance_path_invalid") from exc
-    if _is_reparse_point(instance) or not instance.is_dir():
+    base = _absolute_path(root)
+    instance = base / canonical
+    try:
+        instance.relative_to(base)
+    except ValueError as exc:  # pragma: no cover - canonical UUID has no separators
+        raise DeadLetterRepairError("instance_path_invalid") from exc
+    _reject_reparse_chain(instance, "instance_path_invalid")
+    try:
+        metadata = instance.lstat()
+    except OSError as exc:
+        raise DeadLetterRepairError("instance_path_invalid") from exc
+    if _stat_is_reparse(instance, metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise DeadLetterRepairError("instance_path_invalid")
     return instance
 
 
-def _reject_existing_reparse_ancestors(base: Path, target: Path) -> None:
-    current = base
-    if current.exists() and _is_reparse_point(current):
-        raise DeadLetterRepairError("rollback_path_invalid")
-    relative = target.relative_to(base)
-    for part in relative.parts:
-        current = current / part
-        if current.exists() and _is_reparse_point(current):
-            raise DeadLetterRepairError("rollback_path_invalid")
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
 
 
-def _is_reparse_point(path: Path) -> bool:
+def _reject_reparse_chain(path: Path, error_code: str) -> None:
+    current = _absolute_path(path)
+    chain: list[Path] = []
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for candidate in reversed(chain):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise DeadLetterRepairError(error_code) from exc
+        if _stat_is_reparse(candidate, metadata):
+            raise DeadLetterRepairError(error_code)
+
+
+def _stat_is_reparse(path: Path, metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        _windows_file_attributes(path, metadata) & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _windows_file_attributes(path: Path, metadata: os.stat_result) -> int:
+    del path  # Kept as an argument so tests can model a Windows reparse point by path.
+    return int(getattr(metadata, "st_file_attributes", 0))
+
+
+def _path_exists_without_follow(path: Path) -> bool:
     try:
-        value = path.lstat()
-    except OSError:
-        return True
-    return path.is_symlink() or bool(getattr(value, "st_file_attributes", 0) & 0x400)
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DeadLetterRepairError("maintenance_path_invalid") from exc
+    return True
 
 
 def _write_private_once(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if _is_reparse_point(path.parent):
-        raise DeadLetterRepairError("maintenance_path_invalid")
-    descriptor = -1
+    path = _absolute_path(path)
+    _prepare_private_parent(path.parent)
+    temporary = _private_temporary_path(path, payload)
+    if _path_exists_without_follow(path):
+        if _read_regular_bytes(path) != payload:
+            raise DeadLetterRepairError("immutable_maintenance_artifact_conflict")
+        _remove_orphan_temporary(temporary)
+        return
+    _stage_private_temporary(temporary, payload)
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        _restrict_file_access(str(path), descriptor)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        fsync_directory(path.parent)
+        _publish_no_replace(temporary, path)
     except FileExistsError:
         if _read_regular_bytes(path) != payload:
             raise DeadLetterRepairError("immutable_maintenance_artifact_conflict")
+        _remove_orphan_temporary(temporary)
     except DeadLetterRepairError:
         raise
     except OSError as exc:
+        # MoveFileExW reports ERROR_ALREADY_EXISTS as an OSError on some Python builds.
+        if _path_exists_without_follow(path):
+            if _read_regular_bytes(path) != payload:
+                raise DeadLetterRepairError("immutable_maintenance_artifact_conflict") from exc
+            _remove_orphan_temporary(temporary)
+            return
+        raise DeadLetterRepairError("maintenance_artifact_write_failed") from exc
+    if _read_regular_bytes(path) != payload:
+        raise DeadLetterRepairError("maintenance_artifact_write_failed")
+
+
+def _prepare_private_parent(parent: Path) -> None:
+    _reject_reparse_chain(parent, "maintenance_path_invalid")
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DeadLetterRepairError("maintenance_path_invalid") from exc
+    _reject_reparse_chain(parent, "maintenance_path_invalid")
+    try:
+        metadata = parent.lstat()
+    except OSError as exc:
+        raise DeadLetterRepairError("maintenance_path_invalid") from exc
+    if _stat_is_reparse(parent, metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise DeadLetterRepairError("maintenance_path_invalid")
+
+
+def _private_temporary_path(path: Path, payload: bytes) -> Path:
+    return path.with_name(f".{path.name}.{_sha256(payload)}.tmp")
+
+
+def _stage_private_temporary(path: Path, payload: bytes) -> None:
+    _reject_reparse_chain(path, "maintenance_path_invalid")
+    existed = _path_exists_without_follow(path)
+    previous: os.stat_result | None = None
+    if existed:
+        try:
+            previous = path.lstat()
+        except OSError as exc:
+            raise DeadLetterRepairError("maintenance_path_invalid") from exc
+        if _stat_is_reparse(path, previous) or not stat.S_ISREG(previous.st_mode):
+            raise DeadLetterRepairError("maintenance_path_invalid")
+        if os.name != "nt" and (
+            stat.S_IMODE(previous.st_mode) != 0o600
+            or hasattr(os, "geteuid") and previous.st_uid != os.geteuid()
+        ):
+            raise DeadLetterRepairError("maintenance_path_invalid")
+    flags = (
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    if not existed:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _windows_file_attributes(path, opened) & _FILE_ATTRIBUTE_REPARSE_POINT
+            or previous is not None
+            and (opened.st_dev, opened.st_ino) != (previous.st_dev, previous.st_ino)
+        ):
+            raise DeadLetterRepairError("maintenance_path_invalid")
+        _restrict_file_access(str(path), descriptor)
+        os.ftruncate(descriptor, 0)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:  # pragma: no cover - os.write raises instead in normal operation
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+    except DeadLetterRepairError:
+        raise
+    except (OSError, OutboxError) as exc:
         raise DeadLetterRepairError("maintenance_artifact_write_failed") from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    fsync_directory(path.parent)
+
+
+def _publish_no_replace(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+        move_file_ex.restype = wintypes.BOOL
+        if not move_file_ex(
+            os.path.abspath(os.fspath(source)),
+            os.path.abspath(os.fspath(destination)),
+            _MOVEFILE_WRITE_THROUGH,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    os.link(source, destination, follow_symlinks=False)
+    fsync_directory(destination.parent)
+    source.unlink()
+    fsync_directory(destination.parent)
+
+
+def _remove_orphan_temporary(path: Path) -> None:
+    if not _path_exists_without_follow(path):
+        return
+    _reject_reparse_chain(path, "maintenance_path_invalid")
+    try:
+        metadata = path.lstat()
+        if _stat_is_reparse(path, metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise DeadLetterRepairError("maintenance_path_invalid")
+        path.unlink()
+        fsync_directory(path.parent)
+    except DeadLetterRepairError:
+        raise
+    except OSError as exc:
+        raise DeadLetterRepairError("maintenance_artifact_write_failed") from exc
 
 
 def write_private_result(path: Path, result: Mapping[str, Any]) -> None:
     payload = _canonical_json_bytes(dict(result))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
+    if _path_exists_without_follow(_absolute_path(path)):
         raise DeadLetterRepairError("result_path_exists")
     _write_private_once(path, payload)
 
 
 def _read_optional_json(path: Path) -> Any | None:
-    if not path.exists():
+    path = _absolute_path(path)
+    _reject_reparse_chain(path, "maintenance_path_invalid")
+    if not _path_exists_without_follow(path):
         return None
     return _read_json(path)
 
@@ -753,16 +1017,28 @@ def _read_json(path: Path, *, max_bytes: int = _MAX_JSON_BYTES) -> Any:
 
 
 def _read_regular_bytes(path: Path, *, max_bytes: int = _MAX_JSON_BYTES) -> bytes:
+    path = _absolute_path(path)
     descriptor = -1
     try:
+        _reject_reparse_chain(path, "maintenance_file_invalid")
         path_stat = path.lstat()
-        if path.is_symlink() or not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size > max_bytes:
+        if (
+            _stat_is_reparse(path, path_stat)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_size > max_bytes
+        ):
             raise DeadLetterRepairError("maintenance_file_invalid")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
         descriptor = os.open(path, flags)
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
+            or _windows_file_attributes(path, opened) & _FILE_ATTRIBUTE_REPARSE_POINT
             or (opened.st_dev, opened.st_ino) != (path_stat.st_dev, path_stat.st_ino)
             or opened.st_size > max_bytes
         ):
