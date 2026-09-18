@@ -9,6 +9,7 @@ la serializzazione ordinata per chiave del vecchio formato poteva avere alterato
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import logging
@@ -16,9 +17,11 @@ import os
 import re
 import stat
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 try:
     from .atomic_file import durable_replace
@@ -33,10 +36,118 @@ _FORMAT_VERSION = 2
 _LEGACY_FORMAT_VERSION = 1
 _SECURE_FILE_MODE = 0o600
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LOCK_FILE_SUFFIX = ".lock"
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.05
 
 
 class OutboxError(RuntimeError):
     """Errore di consistenza o persistenza dell'outbox."""
+
+
+def _is_reparse_point(file_stat: os.stat_result) -> bool:
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(file_stat, "st_file_attributes", 0) & flag)
+
+
+def _validate_lock_file(path: str, descriptor: int) -> None:
+    try:
+        path_stat = os.lstat(path)
+        file_stat = os.fstat(descriptor)
+    except OSError as exc:
+        raise OutboxError("Lock dell'outbox non verificabile.") from exc
+    if (
+        stat.S_ISLNK(path_stat.st_mode)
+        or _is_reparse_point(path_stat)
+        or not stat.S_ISREG(file_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino)
+    ):
+        raise OutboxError("Lock dell'outbox non sicuro.")
+
+
+def _lock_contention(error: OSError) -> bool:
+    if error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+        return True
+    return getattr(error, "winerror", None) in (32, 33, 36)
+
+
+@contextmanager
+def _outbox_file_lock(file_path: str) -> Iterator[None]:
+    """Serialize mutations across processes, including native Windows workers.
+
+    The lock lives beside the replace-on-write JSON file: locking the JSON descriptor itself
+    would protect an obsolete inode after ``os.replace``. ``msvcrt.locking`` is an OS-wide byte
+    range lock on Windows; POSIX workers use ``flock`` on the same sidecar convention.
+    """
+
+    directory = os.path.dirname(file_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    lock_path = f"{file_path}{_LOCK_FILE_SUFFIX}"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    locked = False
+    try:
+        descriptor = os.open(lock_path, flags, _SECURE_FILE_MODE)
+        _validate_lock_file(lock_path, descriptor)
+        _restrict_file_access(lock_path, descriptor)
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+        else:
+            import fcntl
+
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if os.name == "nt":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError as exc:
+                if not _lock_contention(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OutboxError("Timeout acquisizione lock dell'outbox.") from exc
+                time.sleep(min(_LOCK_POLL_SECONDS, remaining))
+        # A replacement of the sidecar while acquisition was blocked must fail closed;
+        # otherwise two processes could hold locks on different inodes.
+        _validate_lock_file(lock_path, descriptor)
+    except OutboxError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except (OSError, ImportError) as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise OutboxError("Impossibile acquisire il lock dell'outbox.") from exc
+
+    try:
+        yield
+    finally:
+        try:
+            if locked and os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            elif locked:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            # Closing the descriptor still releases an OS lock. Do not mask the operation's
+            # original result, but leave evidence for service diagnostics.
+            logger.exception("Rilascio esplicito del lock outbox non riuscito.")
+        finally:
+            os.close(descriptor)
 
 
 def _restrict_file_access(path: str, descriptor: int) -> None:
@@ -94,9 +205,10 @@ class EventOutbox:
             self._state = self._empty_state()
             return
 
-        self._state, migration_required = self._load()
-        if migration_required:
-            self._persist(self._state)
+        with _outbox_file_lock(file_path):
+            self._state, migration_required = self._load()
+            if migration_required:
+                self._persist(self._state)
 
     @staticmethod
     def _empty_state() -> Dict[str, Any]:
@@ -139,41 +251,7 @@ class EventOutbox:
             raise OutboxError("Record dead-letter non serializzabile.") from exc
         return hashlib.sha256(encoded).hexdigest()
 
-    def requeue_dead_letter_first(
-        self,
-        event_id: str,
-        replacement_payload: Dict[str, Any],
-        *,
-        expected_record_sha256: str,
-    ) -> Dict[str, Any]:
-        """Move one exact dead-letter back to the head of the FIFO.
-
-        The caller must own the connection-level maintenance lock.  This method refreshes the
-        persisted state immediately before comparing the record digest, then publishes one
-        atomic replacement.  The event identity is immutable even when authoritative fields in
-        the payload are repaired.
-        """
-
-        self._validate_expected_sha256(expected_record_sha256)
-        self._validate_payload(replacement_payload)
-        if replacement_payload["event_id"] != event_id:
-            raise OutboxError("Il requeue non puo cambiare event_id.")
-        state = self._refresh_for_guarded_mutation()
-        record = self._guarded_dead_letter(
-            state,
-            event_id,
-            expected_record_sha256,
-        )
-        if any(payload["event_id"] == event_id for payload in state["pending"]):
-            raise OutboxError("Evento dead-letter gia presente nei pending.")
-        new_state = copy.deepcopy(state)
-        del new_state["dead_letter"][event_id]
-        new_state["pending"].insert(0, copy.deepcopy(replacement_payload))
-        self._validate_state(new_state)
-        self._replace_state(new_state)
-        return copy.deepcopy(record)
-
-    def resolve_non_trading_dead_letter(
+    def resolve_audited_dead_letter(
         self,
         event_id: str,
         *,
@@ -181,28 +259,29 @@ class EventOutbox:
         audit_path: str,
         expected_audit_sha256: str,
     ) -> Dict[str, Any]:
-        """Remove one exact non-trading dead-letter after a durable audit exists.
+        """CAS-remove one exact dead-letter after a durable audit exists.
 
         The outbox never decides whether an MT5 ledger row is a trade.  A privileged maintenance
         tool must make that decision from a coherent ledger and first publish an immutable audit
-        artifact.  Requiring the artifact digest here makes an unaudited removal fail closed.
+        artifact. Requiring both digests makes an unaudited or stale removal fail closed. Pending
+        successors are deliberately preserved.
         """
 
         self._validate_expected_sha256(expected_record_sha256)
         self._validate_expected_sha256(expected_audit_sha256)
-        if self._regular_file_sha256(audit_path) != expected_audit_sha256:
-            raise OutboxError("Audit dead-letter assente o non corrispondente.")
-        state = self._refresh_for_guarded_mutation()
-        record = self._guarded_dead_letter(
-            state,
-            event_id,
-            expected_record_sha256,
-        )
-        new_state = copy.deepcopy(state)
-        del new_state["dead_letter"][event_id]
-        self._validate_state(new_state)
-        self._replace_state(new_state)
-        return copy.deepcopy(record)
+        with self._locked_current_state(maintenance=True) as state:
+            if self._regular_file_sha256(audit_path) != expected_audit_sha256:
+                raise OutboxError("Audit dead-letter assente o non corrispondente.")
+            record = self._guarded_dead_letter(
+                state,
+                event_id,
+                expected_record_sha256,
+            )
+            new_state = copy.deepcopy(state)
+            del new_state["dead_letter"][event_id]
+            self._validate_state(new_state)
+            self._replace_state(new_state)
+            return copy.deepcopy(record)
 
     def enqueue_many(self, payloads: Iterable[Dict[str, Any]]) -> int:
         """Accoda atomicamente un batch, in ordine, deduplicandolo per ``event_id``."""
@@ -210,22 +289,23 @@ class EventOutbox:
         for payload in batch:
             self._validate_payload(payload)
 
-        new_state = copy.deepcopy(self._state)
-        known_ids = {
-            payload["event_id"] for payload in new_state["pending"]
-        } | set(new_state["dead_letter"])
-        added = 0
-        for payload in batch:
-            event_id = payload["event_id"]
-            if event_id in known_ids:
-                continue
-            new_state["pending"].append(payload)
-            known_ids.add(event_id)
-            added += 1
+        with self._locked_current_state() as current_state:
+            new_state = copy.deepcopy(current_state)
+            known_ids = {
+                payload["event_id"] for payload in new_state["pending"]
+            } | set(new_state["dead_letter"])
+            added = 0
+            for payload in batch:
+                event_id = payload["event_id"]
+                if event_id in known_ids:
+                    continue
+                new_state["pending"].append(payload)
+                known_ids.add(event_id)
+                added += 1
 
-        if added:
-            self._replace_state(new_state)
-        return added
+            if added:
+                self._replace_state(new_state)
+            return added
 
     def drain(self, sender: EventSender) -> DrainResult:
         """Consegna i pending FIFO, fermandosi al primo fallimento transitorio.
@@ -234,6 +314,10 @@ class EventOutbox:
         dopo un errore transitorio potrebbe quindi trasformare un problema temporaneo in un 4xx
         permanente e perdere causalita'.
         """
+        with self._locked_current_state():
+            return self._drain_current_state(sender)
+
+    def _drain_current_state(self, sender: EventSender) -> DrainResult:
         if self.dead_letter_count():
             # Recovery of a rejected predecessor is an explicit operator action.  Until then,
             # its successors stay durable and must not overtake it on a later process restart.
@@ -336,8 +420,10 @@ class EventOutbox:
         fd = -1
         try:
             path_stat = os.lstat(self.file_path)
-            if stat.S_ISLNK(path_stat.st_mode):
-                raise OutboxError("Outbox persistente non sicura: i symlink non sono ammessi.")
+            if stat.S_ISLNK(path_stat.st_mode) or _is_reparse_point(path_stat):
+                raise OutboxError(
+                    "Outbox persistente non sicura: reparse point non ammesso."
+                )
 
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(self.file_path, flags)
@@ -423,15 +509,25 @@ class EventOutbox:
         if not isinstance(value, str) or not _SHA256.fullmatch(value):
             raise OutboxError("Digest di manutenzione non valido.")
 
-    def _refresh_for_guarded_mutation(self) -> Dict[str, Any]:
+    @contextmanager
+    def _locked_current_state(
+        self, *, maintenance: bool = False
+    ) -> Iterator[Dict[str, Any]]:
         if not self.file_path:
-            raise OutboxError("La manutenzione dead-letter richiede un outbox persistente.")
-        state, migration_required = self._load()
-        if migration_required:
-            # A maintenance decision must never silently combine schema migration and removal.
-            raise OutboxError("Migrare l'outbox prima della manutenzione dead-letter.")
-        self._state = state
-        return copy.deepcopy(state)
+            if maintenance:
+                raise OutboxError("La manutenzione dead-letter richiede un outbox persistente.")
+            yield self._state
+            return
+
+        with _outbox_file_lock(self.file_path):
+            state, migration_required = self._load()
+            if migration_required:
+                if maintenance:
+                    # A maintenance decision must not silently combine migration and removal.
+                    raise OutboxError("Migrare l'outbox prima della manutenzione dead-letter.")
+                self._persist(state)
+            self._state = state
+            yield state
 
     @classmethod
     def _guarded_dead_letter(
@@ -454,7 +550,7 @@ class EventOutbox:
         descriptor = -1
         try:
             path_stat = os.lstat(path)
-            if stat.S_ISLNK(path_stat.st_mode):
+            if stat.S_ISLNK(path_stat.st_mode) or _is_reparse_point(path_stat):
                 raise OutboxError("Audit dead-letter non sicuro.")
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)
@@ -511,8 +607,8 @@ class EventOutbox:
     def _reject_symlink_target(self) -> None:
         assert self.file_path is not None
         try:
-            mode = os.lstat(self.file_path).st_mode
+            path_stat = os.lstat(self.file_path)
         except FileNotFoundError:
             return
-        if stat.S_ISLNK(mode):
-            raise OutboxError("Outbox persistente non sicura: i symlink non sono ammessi.")
+        if stat.S_ISLNK(path_stat.st_mode) or _is_reparse_point(path_stat):
+            raise OutboxError("Outbox persistente non sicura: reparse point non ammesso.")

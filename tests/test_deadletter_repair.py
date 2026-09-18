@@ -44,6 +44,18 @@ class _RepairSender:
         return self.result
 
 
+class _EnqueueSuccessorOnSend(_RepairSender):
+    def __init__(self, outbox_path, successor):
+        super().__init__(outcome="ok")
+        self.outbox_path = outbox_path
+        self.successor = successor
+
+    def send(self, payload):
+        result = super().send(payload)
+        EventOutbox(str(self.outbox_path)).enqueue_many([self.successor])
+        return result
+
+
 def _payload(**overrides):
     value = {
         "event_id": "mt5-sensitive-account-trade_opened-sensitive-digest",
@@ -223,6 +235,33 @@ def test_duplicate_acknowledgement_is_success(tmp_path):
 
     assert result["outcome"] == "duplicate"
     assert result["dead_letter_count"] == result["pending_count"] == 0
+
+
+def test_real_trade_delivery_never_drains_successor_enqueued_during_send(tmp_path):
+    env = _fixture(tmp_path)
+    successor = {
+        **_payload(external_trade_id="7001"),
+        "event_id": "mt5-sensitive-account-trade_closed-sensitive-digest",
+        "event_type": "trade_closed",
+        "event_time": "2026-09-17T16:05:15+00:00",
+    }
+    sender = _EnqueueSuccessorOnSend(env["outbox_path"], successor)
+
+    result = repair_live_dead_letter(
+        env["request"],
+        instances_root=env["instances"],
+        rollback_root=env["rollback"],
+        ingestion_url="https://example.supabase.co/trading-mt5-events",
+        sender=sender,
+    )
+
+    persisted = EventOutbox(str(env["outbox_path"]))
+    assert result["status"] == "resolved"
+    assert result["pending_count"] == 1
+    assert len(sender.payloads) == 1
+    assert sender.payloads[0]["event_id"] == env["payload"]["event_id"]
+    assert persisted.dead_letter_count() == 0
+    assert persisted.pending_payloads() == {successor["event_id"]: successor}
 
 
 def test_non_trading_accounting_is_audited_without_delivery(tmp_path):
@@ -516,7 +555,7 @@ def test_outbox_preimage_mismatch_fails_before_backup_or_audit(tmp_path):
     assert EventOutbox(str(env["outbox_path"])).dead_letter_count() == 1
 
 
-def test_transient_delivery_stays_pending_and_rerun_can_confirm_duplicate(tmp_path):
+def test_transient_delivery_stays_dead_lettered_and_rerun_can_confirm_duplicate(tmp_path):
     env = _fixture(tmp_path)
     transient = _RepairSender(
         outcome=None,
@@ -539,8 +578,8 @@ def test_transient_delivery_stays_pending_and_rerun_can_confirm_duplicate(tmp_pa
             sender=transient,
         )
     persisted = EventOutbox(str(env["outbox_path"]))
-    assert persisted.pending_count() == 1
-    assert persisted.dead_letter_count() == 0
+    assert persisted.pending_count() == 0
+    assert persisted.dead_letter_count() == 1
 
     duplicate = _RepairSender(outcome="duplicate")
     result = repair_live_dead_letter(

@@ -333,6 +333,8 @@ def repair_live_dead_letter(
                 dead_record,
                 decision.replacement_payload,
                 effective_sender,
+                audit_path,
+                audit_sha256,
             )
         else:  # pragma: no cover - validated classifiers cannot produce another value
             raise DeadLetterRepairError("ledger_classification_ambiguous")
@@ -377,7 +379,7 @@ def _resolve_non_trading(
         if EventOutbox.record_sha256(record) != request.expected_record_sha256:
             raise DeadLetterRepairError("dead_letter_changed")
         try:
-            outbox.resolve_non_trading_dead_letter(
+            outbox.resolve_audited_dead_letter(
                 event_id,
                 expected_record_sha256=request.expected_record_sha256,
                 audit_path=str(audit_path),
@@ -400,28 +402,32 @@ def _resolve_real_trade(
     original_record: dict[str, Any],
     replacement_payload: dict[str, Any],
     sender: RepairSender,
+    audit_path: Path,
+    audit_sha256: str,
 ) -> dict[str, Any]:
     outbox = EventOutbox(str(outbox_path))
     pending = outbox.pending_payloads()
     dead = outbox.dead_letters()
+    if replacement_payload["event_id"] != original_record["payload"]["event_id"]:
+        raise DeadLetterRepairError("event_identity_changed")
     if event_id in dead:
         if EventOutbox.record_sha256(dead[event_id]) != request.expected_record_sha256:
             raise DeadLetterRepairError("dead_letter_changed")
-        if outbox.pending_count() != 0:
-            raise DeadLetterRepairError("outbox_not_quiescent")
+        send_result = sender.send(copy.deepcopy(replacement_payload))
+        _require_acknowledged(send_result, sender)
         try:
-            outbox.requeue_dead_letter_first(
+            EventOutbox(str(outbox_path)).resolve_audited_dead_letter(
                 event_id,
-                replacement_payload,
                 expected_record_sha256=request.expected_record_sha256,
+                audit_path=str(audit_path),
+                expected_audit_sha256=audit_sha256,
             )
         except OutboxError as exc:
-            raise DeadLetterRepairError("dead_letter_requeue_failed") from exc
+            raise DeadLetterRepairError("dead_letter_resolution_failed") from exc
     elif event_id in pending:
-        if _canonical_payload_sha256(pending[event_id]) != _canonical_payload_sha256(replacement_payload):
-            raise DeadLetterRepairError("pending_payload_changed")
-        if outbox.pending_count() != 1 or outbox.dead_letter_count() != 0:
-            raise DeadLetterRepairError("outbox_not_quiescent")
+        # This repair never stages corrected payloads in the general live queue. A matching
+        # pending event therefore belongs to another writer or an older repair implementation.
+        raise DeadLetterRepairError("dead_letter_state_conflict")
     else:
         # A crash can occur after the idempotent API accepted the event but before the receipt
         # was written. Re-sending the same event_id can only return ok/duplicate.
@@ -434,15 +440,9 @@ def _resolve_real_trade(
             "outcome": sender.outcome,
         }
 
-    drain = EventOutbox(str(outbox_path)).drain(sender)  # type: ignore[arg-type]
-    if drain.sent != 1 or drain.pending != 0:
-        raise DeadLetterRepairError("corrected_delivery_incomplete")
-    _require_acknowledged(SendResult(status="sent", http_status=sender.http_status), sender)
     final = EventOutbox(str(outbox_path))
-    if final.pending_count() != 0 or final.dead_letter_count() != 0:
+    if event_id in final.pending_payloads() or event_id in final.dead_letters():
         raise DeadLetterRepairError("corrected_delivery_incomplete")
-    if replacement_payload["event_id"] != original_record["payload"]["event_id"]:
-        raise DeadLetterRepairError("event_identity_changed")
     return {
         "classification": "real_trade",
         "action": "corrected_event_delivered",
@@ -1075,10 +1075,6 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise DeadLetterRepairError("maintenance_json_invalid") from exc
-
-
-def _canonical_payload_sha256(payload: dict[str, Any]) -> str:
-    return _sha256(_canonical_json_bytes(payload))
 
 
 def _sha256(payload: bytes) -> str:
