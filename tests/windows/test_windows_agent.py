@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import stat
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +19,31 @@ from windows_agent.security import RedactionFilter, canonical_uuid, safe_child
 from windows_agent.state_store import atomic_json, read_json
 from windows_agent.worker.dedup import PersistentDedup
 from windows_agent.worker.live_sync import detect_windows_events
+from windows_agent.worker.native_mt5_runtime import NativeMt5Runtime
+
+
+def _sealed_runtime_instance(
+    tmp_path: Path,
+) -> tuple[InstanceProvisioner, str, Path, Path]:
+    source = tmp_path / "template"
+    assets = (
+        Path("MQL5/Experts/TradeJournal/TradeJournalBridge.ex5"),
+        Path("MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5"),
+        Path("MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5"),
+    )
+    for relative in assets:
+        asset = source / relative
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        asset.write_bytes(relative.as_posix().encode("utf-8"))
+    terminal = source / "terminal64.exe"
+    terminal.write_bytes(b"terminal")
+    connection_id = str(uuid4())
+    provisioner = InstanceProvisioner(
+        tmp_path / "instances", tmp_path / "secrets"
+    )
+    root = provisioner.provision(connection_id, terminal)
+    provisioner.seal_runtime_assets(connection_id)
+    return provisioner, connection_id, root, root / "terminal" / assets[0]
 
 
 def test_uuid_and_path_traversal(tmp_path):
@@ -255,6 +281,75 @@ def test_instance_rotates_managed_expert_and_reseals_manifests(tmp_path):
     assert provisioner.validate(connection_id) == root
     state = read_json(root / "state" / "instance.json")
     assert state["runtime_assets_manifest_sha256"] == sealed
+    assert not list(root.rglob("*.upgrade"))
+    assert not list(root.rglob("*.rollback"))
+
+
+def test_windows_rotation_accepts_read_only_content_addressed_expert(tmp_path):
+    provisioner, connection_id, root, target = _sealed_runtime_instance(tmp_path)
+    replacement = tmp_path / "TradeJournalBridge-release.ex5"
+    replacement.write_bytes(b"windows-read-only-release")
+    expected = hashlib.sha256(replacement.read_bytes()).hexdigest()
+    replacement.chmod(stat.S_IREAD)
+
+    try:
+        sealed = provisioner.rotate_managed_expert(
+            connection_id, replacement, expected
+        )
+        installed = NativeMt5Runtime(root, connection_id).install_expert(
+            replacement
+        )
+
+        assert installed == target
+        assert target.read_bytes() == b"windows-read-only-release"
+        assert target.stat().st_mode & stat.S_IWUSR
+        assert not replacement.stat().st_mode & stat.S_IWUSR
+        assert provisioner.validate_runtime_assets(connection_id) == sealed
+        assert provisioner.validate(connection_id) == root
+        assert not list(root.rglob("*.upgrade"))
+        assert not list(root.rglob("*.rollback"))
+    finally:
+        replacement.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_windows_failed_rotation_removes_read_only_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    provisioner, connection_id, root, target = _sealed_runtime_instance(tmp_path)
+    previous = target.read_bytes()
+    previous_seal = provisioner.validate_runtime_assets(connection_id)
+    replacement = tmp_path / "TradeJournalBridge-release.ex5"
+    replacement.write_bytes(b"windows-failed-release")
+    expected = hashlib.sha256(replacement.read_bytes()).hexdigest()
+    original_sha256 = InstanceProvisioner._sha256
+    observed = {"upgrade": False, "rollback": False}
+
+    def reject_upgrade(path):
+        candidate = Path(path)
+        digest = original_sha256(candidate)
+        if candidate.name.endswith(".upgrade"):
+            rollback = target.with_name(f"{target.name}.rollback")
+            candidate.chmod(stat.S_IREAD)
+            rollback.chmod(stat.S_IREAD)
+            observed["upgrade"] = True
+            observed["rollback"] = True
+            return "0" * 64
+        return digest
+
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "_sha256",
+        staticmethod(reject_upgrade),
+    )
+
+    with pytest.raises(ValueError, match="copy integrity"):
+        provisioner.rotate_managed_expert(connection_id, replacement, expected)
+
+    assert observed == {"upgrade": True, "rollback": True}
+    assert target.read_bytes() == previous
+    assert target.stat().st_mode & stat.S_IWUSR
+    assert provisioner.validate_runtime_assets(connection_id) == previous_seal
     assert not list(root.rglob("*.upgrade"))
     assert not list(root.rglob("*.rollback"))
 

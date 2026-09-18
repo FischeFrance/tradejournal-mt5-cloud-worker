@@ -6,7 +6,13 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from worker.atomic_file import durable_replace, fsync_directory
+from worker.atomic_file import (
+    durable_copy_contents,
+    durable_replace,
+    fsync_directory,
+    make_regular_file_writable,
+    unlink_readonly_file,
+)
 
 from ..state_store import atomic_json, read_json
 from .instance_layout import SUBDIRS, InstanceLayout
@@ -269,17 +275,20 @@ class InstanceProvisioner:
         if temporary.exists() or rollback.exists():
             raise ValueError("managed expert rotation already pending")
 
-        def durable_copy(source_path: Path, destination_path: Path) -> None:
-            shutil.copy2(source_path, destination_path)
-            with destination_path.open("r+b") as handle:
-                os.fsync(handle.fileno())
-
-        durable_copy(target, rollback)
+        previous_target_sha256 = self._sha256(target)
+        preserve_rollback = False
         try:
-            durable_copy(source, temporary)
+            durable_copy_contents(target, rollback)
+            if self._sha256(rollback) != previous_target_sha256:
+                raise ValueError("managed expert rollback copy integrity failed")
+
+            durable_copy_contents(source, temporary)
             if self._sha256(temporary) != expected:
                 raise ValueError("managed expert copy integrity failed")
+            make_regular_file_writable(target)
             durable_replace(temporary, target)
+            if self._sha256(target) != expected:
+                raise ValueError("published managed expert digest mismatch")
             state = dict(previous_state)
             state["template_code_manifest_sha256"] = self._code_manifest(
                 root / "terminal"
@@ -291,13 +300,33 @@ class InstanceProvisioner:
             atomic_json(state_path, state)
             sealed = self.validate_runtime_assets(connection_id)
         except Exception:
-            if rollback.is_file():
-                durable_replace(rollback, target)
-            atomic_json(state_path, previous_state)
+            try:
+                current_target_sha256 = self._sha256(target)
+            except OSError:
+                current_target_sha256 = None
+            if current_target_sha256 != previous_target_sha256:
+                try:
+                    if self._sha256(rollback) != previous_target_sha256:
+                        raise ValueError(
+                            "managed expert rollback copy integrity failed"
+                        )
+                    make_regular_file_writable(rollback)
+                    make_regular_file_writable(target)
+                    durable_replace(rollback, target)
+                    if self._sha256(target) != previous_target_sha256:
+                        raise ValueError("managed expert rollback integrity failed")
+                    atomic_json(state_path, previous_state)
+                    self.validate_runtime_assets(connection_id)
+                except Exception:
+                    # Preserve the verified rollback if recovery itself fails.  Removing
+                    # it here would destroy the only known-good copy of the old bridge.
+                    preserve_rollback = rollback.is_file()
+                    raise
             raise
         finally:
-            temporary.unlink(missing_ok=True)
-        rollback.unlink(missing_ok=True)
+            unlink_readonly_file(temporary)
+            if not preserve_rollback:
+                unlink_readonly_file(rollback)
         fsync_directory(target.parent)
         return sealed
 

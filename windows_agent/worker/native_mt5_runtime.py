@@ -14,7 +14,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from worker.atomic_file import durable_replace
+from worker.atomic_file import (
+    durable_copy_contents,
+    durable_replace,
+    make_regular_file_writable,
+    unlink_readonly_file,
+)
 
 from ..provisioning.secret_store import WindowsSecretStore
 
@@ -101,15 +106,30 @@ class NativeMt5Runtime:
         source_digest = self._sha256(expert_binary)
         temporary_expert = destination.with_suffix(".ex5.tmp")
         try:
-            shutil.copy2(expert_binary, temporary_expert)
-            # Windows os.fsync maps to _commit and therefore needs a writable descriptor.
-            with temporary_expert.open("r+b") as handle:
-                os.fsync(handle.fileno())
-            if self._sha256(temporary_expert) != source_digest:
-                raise NativeMt5Error("expert_copy_integrity_failed")
-            durable_replace(temporary_expert, destination)
+            # An interrupted legacy copy may have left a read-only staging file.
+            # It is never authoritative and can be removed before a fresh,
+            # digest-verified publication.
+            unlink_readonly_file(temporary_expert)
+            current_digest: str | None = None
+            if destination.exists():
+                make_regular_file_writable(destination)
+                current_digest = self._sha256(destination)
+            if current_digest != source_digest:
+                durable_copy_contents(expert_binary, temporary_expert)
+                if self._sha256(temporary_expert) != source_digest:
+                    raise NativeMt5Error("expert_copy_integrity_failed")
+                durable_replace(temporary_expert, destination)
+                if self._sha256(destination) != source_digest:
+                    raise NativeMt5Error("expert_publish_integrity_failed")
+        except NativeMt5Error:
+            raise
+        except (OSError, ValueError) as exc:
+            raise NativeMt5Error("expert_install_failed") from exc
         finally:
-            temporary_expert.unlink(missing_ok=True)
+            try:
+                unlink_readonly_file(temporary_expert)
+            except (OSError, ValueError) as exc:
+                raise NativeMt5Error("expert_staging_cleanup_failed") from exc
         discovery = (
             self.terminal_root
             / "MQL5"

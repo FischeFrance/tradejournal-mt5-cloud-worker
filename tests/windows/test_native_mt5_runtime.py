@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from unittest.mock import ANY, Mock, call, patch
 
@@ -57,6 +58,91 @@ def _runtime(
         (managed_profile / name).write_text("generated chart", encoding="utf-8")
     (managed_profile / "order.wnd").write_bytes(b"generated layout")
     return NativeMt5Runtime(tmp_path, connection_id)
+
+
+def test_install_expert_replaces_read_only_target_from_read_only_release(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "TradeJournalBridge-release.ex5"
+    expert.write_bytes(b"read-only-release")
+    expert.chmod(stat.S_IREAD)
+    destination = (
+        runtime.terminal_root
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old-expert")
+    destination.chmod(stat.S_IREAD)
+    stale_temporary = destination.with_suffix(".ex5.tmp")
+    stale_temporary.write_bytes(b"interrupted-copy")
+    stale_temporary.chmod(stat.S_IREAD)
+
+    try:
+        installed = runtime.install_expert(expert, "all_available")
+
+        assert installed == destination
+        assert destination.read_bytes() == b"read-only-release"
+        assert destination.stat().st_mode & stat.S_IWUSR
+        assert not expert.stat().st_mode & stat.S_IWUSR
+        assert not stale_temporary.exists()
+        assert (runtime.files / "history_mode").read_text() == "all_available"
+    finally:
+        expert.chmod(stat.S_IREAD | stat.S_IWRITE)
+        if destination.exists():
+            destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+        if stale_temporary.exists():
+            stale_temporary.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_install_expert_cleans_read_only_temporary_after_integrity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "TradeJournalBridge-release.ex5"
+    expert.write_bytes(b"failed-release")
+    expert.chmod(stat.S_IREAD)
+    destination = (
+        runtime.terminal_root
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"known-good-expert")
+    destination.chmod(stat.S_IREAD)
+    temporary = destination.with_suffix(".ex5.tmp")
+    original_sha256 = runtime._sha256
+
+    def reject_temporary(path: Path) -> str:
+        candidate = Path(path)
+        digest = original_sha256(candidate)
+        if candidate == temporary:
+            candidate.chmod(stat.S_IREAD)
+            return "0" * 64
+        return digest
+
+    monkeypatch.setattr(runtime, "_sha256", reject_temporary)
+
+    try:
+        with pytest.raises(NativeMt5Error, match="expert_copy_integrity_failed"):
+            runtime.install_expert(expert)
+
+        assert destination.read_bytes() == b"known-good-expert"
+        assert destination.stat().st_mode & stat.S_IWUSR
+        assert not expert.stat().st_mode & stat.S_IWUSR
+        assert not temporary.exists()
+    finally:
+        expert.chmod(stat.S_IREAD | stat.S_IWRITE)
+        if destination.exists():
+            destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+        if temporary.exists():
+            temporary.chmod(stat.S_IREAD | stat.S_IWRITE)
 
 
 def _envelope(payload: dict[str, object]) -> str:
