@@ -26,7 +26,6 @@ def validate_against(def_name: str, value: object) -> None:
         ("claimRequest", "claimRequest"),
         ("claimResponseJob", "claimResponseJob_provision"),
         ("claimResponseJob", "claimResponseJob_historicalSync"),
-        ("claimResponseJob", "claimResponseJob_liveSync"),
         ("heartbeatRequest", "heartbeatRequest"),
         ("heartbeatResponseOk", "heartbeatResponseOk"),
         ("heartbeatResponseLeaseLost", "heartbeatResponseLeaseLost"),
@@ -39,6 +38,14 @@ def validate_against(def_name: str, value: object) -> None:
         ("transitionResponseLeaseLost", "transitionResponseLeaseLost"),
         ("progressRequest", "progressRequest"),
         ("progressResponseOk", "progressResponseOk"),
+        ("historyBatchRequest", "historyBatchRequest"),
+        ("historyBatchResponse", "historyBatchResponse"),
+        ("historyFilePrepareRequest", "historyFilePrepareRequest"),
+        ("historyFilePrepareResponse", "historyFilePrepareResponse"),
+        ("historyFileImportRequest", "historyFileImportRequest"),
+        ("historyFileImportResponse", "historyFileImportResponse"),
+        ("sessionRequest", "sessionRequest"),
+        ("sessionResponse", "sessionResponse"),
         ("errorResponse", "errorResponse_unauthorized"),
     ],
 )
@@ -72,7 +79,7 @@ def test_claim_returns_falsy_on_204_no_job() -> None:
 
 
 def test_claim_rejects_unknown_job_type_before_dispatch() -> None:
-    body = {**FIXTURES["claimResponseJob_liveSync"], "job_type": "future_job"}
+    body = {**FIXTURES["claimResponseJob_historicalSync"], "job_type": "future_job"}
     client = AgentApiClient(
         "https://agent.example/",
         "fixture",

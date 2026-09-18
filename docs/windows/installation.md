@@ -107,7 +107,7 @@ metadata del job. Il provider riceve soltanto il server MT5:
 ```text
 TRADEJOURNAL_BROKER_IDENTITY_CACHE=C:\TradeJournal\broker-registry\broker-identity-cache.json
 TRADEJOURNAL_BROKER_IDENTITY_CACHE_TTL_SECONDS=86400
-TRADEJOURNAL_BROKER_IDENTITY_MODEL=gpt-5.6
+TRADEJOURNAL_BROKER_IDENTITY_MODEL=gpt-5.6-terra
 ```
 
 La risposta AI non abilita MT5 e non verifica un endpoint. Il job prosegue solo

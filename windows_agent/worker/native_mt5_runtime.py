@@ -123,10 +123,46 @@ class NativeMt5Runtime:
         connection_tmp = self.files / "connection_id.tmp"
         self._write_text_durable(connection_tmp, self.connection_id, "utf-8")
         durable_replace(connection_tmp, self.files / "connection_id")
+        self._publish_history_mode(history_mode)
+        return destination
+
+    def _publish_history_mode(self, history_mode: str) -> None:
+        if history_mode not in ("new_only", "from_date", "all_available"):
+            raise NativeMt5Error("invalid_history_mode")
+        self.files.mkdir(parents=True, exist_ok=True)
         mode_tmp = self.files / "history_mode.tmp"
         self._write_text_durable(mode_tmp, history_mode, "utf-8")
         durable_replace(mode_tmp, self.files / "history_mode")
-        return destination
+
+    def switch_to_new_only(self, timeout: float = 30.0) -> None:
+        """Switch a running bridge to live mode without interrupting trade events.
+
+        The EA acknowledges the one-way handoff in a newly committed heartbeat.  Waiting for a
+        greater envelope sequence prevents an old/stale heartbeat from completing the switch.
+        """
+        if timeout <= 0:
+            raise NativeMt5Error("history_mode_switch_timeout")
+        previous = self._read_json(self.files / "heartbeat.json") or {}
+        previous_sequence = previous.get("sequence", -1)
+        if not isinstance(previous_sequence, int):
+            previous_sequence = -1
+        self._publish_history_mode("new_only")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            record = self._read_json(self.files / "heartbeat.json")
+            payload = self._payload(record, "heartbeat") if record else None
+            sequence = record.get("sequence") if record else None
+            if (
+                payload is not None
+                and payload.get("history_mode") == "new_only"
+                and payload.get("terminal_connected") is True
+                and isinstance(sequence, int)
+                and sequence > previous_sequence
+            ):
+                return
+            time.sleep(0.25)
+        raise NativeMt5Error("history_mode_switch_timeout")
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -891,6 +927,10 @@ class NativeMt5Runtime:
         for name in (
             "account.json",
             "heartbeat.json",
+            "positions.json",
+            "orders.json",
+            "history_orders.json",
+            "deals.json",
             "discovered-symbol.json",
             "discovered-symbol.tmp",
             "bridge-ready",

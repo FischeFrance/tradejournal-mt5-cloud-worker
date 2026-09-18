@@ -100,6 +100,132 @@ def test_history_deals_ignore_non_position_and_unclassified_account_movements(
     assert [row["ticket"] for row in rows] == ["close"]
 
 
+def test_all_available_uses_the_complete_atomic_snapshot_not_a_utc_cutoff(
+    tmp_path: Path,
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(
+        adapter.files_dir,
+        "deals.json",
+        [{
+            "ticket": "broker-future",
+            "position_id": "8",
+            "symbol": "EURUSD",
+            "entry": "OUT",
+            "time": "2030-01-01T02:00:00Z",
+        }],
+    )
+
+    rows = adapter.history_deals(
+        datetime(1970, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    assert [row["ticket"] for row in rows] == ["broker-future"]
+
+
+def test_anchored_history_keeps_accounting_ledger_separate_and_reconstructs_balance(
+    tmp_path: Path,
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    deals = [
+        {
+            "history_index": 0, "ticket": "1", "order_id": "0", "position_id": "0", "symbol": "",
+            "deal_type": 2, "entry": "IN", "volume": 0, "price": 0,
+            "profit": 1000, "commission": 0, "swap": 0, "fee": 0,
+            "time_msc": 1_767_225_600_000, "time": "2026-01-01T00:00:00Z",
+        },
+        {
+            "history_index": 1, "ticket": "2", "order_id": "12", "position_id": "A", "symbol": "EURUSD",
+            "deal_type": 0, "entry": "IN", "direction": "buy", "volume": 0.1,
+            "price": 1.1, "profit": 0, "commission": -0.8, "swap": 0, "fee": -0.2,
+            "time_msc": 1_767_225_601_000, "time": "2026-01-01T00:00:01Z",
+        },
+        {
+            "history_index": 2, "ticket": "3", "order_id": "13", "position_id": "A", "symbol": "EURUSD",
+            "deal_type": 1, "entry": "OUT", "direction": "sell", "volume": 0.1,
+            "price": 1.2, "profit": 10, "commission": -1, "swap": 0, "fee": 0,
+            "time_msc": 1_767_225_602_000, "time": "2026-01-01T00:00:02Z",
+        },
+    ]
+    _write(
+        adapter.files_dir,
+        "deals.json",
+        {
+            "anchor": {
+                "balance": 1008,
+                "credit": 0,
+                "as_of": "2026-01-01T00:00:03Z",
+                "coherent": True,
+                "order_basis": "mt5_history_index_v1",
+                "deal_count": 3,
+                "last_deal_ticket": "3",
+                "last_deal_time_msc": 1_767_225_602_000,
+            },
+            "deals": deals,
+        },
+    )
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    ledger = adapter.history_accounting_deals(start, end)
+    projected = adapter.history_deals(start, end)
+
+    assert [row["ticket"] for row in ledger] == ["1", "2", "3"]
+    assert [row["ticket"] for row in projected] == ["2", "3"]
+    assert projected[0]["balance_before_open"] == 1000
+    assert projected[0]["commission"] == -1
+    assert projected[1]["total_commission"] == -2
+    # from_date is based on the canonical opening, never a close without its predecessor.
+    assert adapter.history_deals(
+        datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc), end
+    ) == ()
+
+
+def test_anchored_history_fails_closed_without_contiguous_mt5_history_indices(
+    tmp_path: Path,
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    row = {
+        "history_index": 1,
+        "ticket": "2",
+        "order_id": "12",
+        "position_id": "A",
+        "symbol": "EURUSD",
+        "deal_type": 0,
+        "entry": "IN",
+        "direction": "buy",
+        "volume": 0.1,
+        "price": 1.1,
+        "profit": 0,
+        "commission": 0,
+        "swap": 0,
+        "fee": 0,
+        "time_msc": 1_767_225_601_000,
+        "time": "2026-01-01T00:00:01Z",
+    }
+    _write(
+        adapter.files_dir,
+        "deals.json",
+        {
+            "anchor": {
+                "balance": 1_000,
+                "credit": 0,
+                "as_of": "2026-01-01T00:00:03Z",
+                "coherent": True,
+                "order_basis": "mt5_history_index_v1",
+                "deal_count": 1,
+                "last_deal_ticket": "2",
+                "last_deal_time_msc": 1_767_225_601_000,
+            },
+            "deals": [row],
+        },
+    )
+
+    assert adapter.history_anchor()["coherent"] is False
+    assert adapter.history_balance_rows()[0]["balance_before_open"] is None
+
+
 def test_snapshot_keys_positions_by_stable_identifier_with_ticket_fallback(tmp_path: Path) -> None:
     adapter = _ready_adapter(tmp_path)
     _write(
@@ -128,6 +254,22 @@ def test_rejects_snapshot_composed_from_different_publish_sequences(tmp_path: Pa
 
     with pytest.raises(Mql5FileAdapterError, match="snapshot_sequence_mismatch"):
         adapter.snapshot()
+
+
+@pytest.mark.parametrize("filename", ["history_orders.json", "deals.json"])
+def test_rejects_historical_snapshot_with_stale_file_sequence(
+    tmp_path: Path, filename: str
+) -> None:
+    adapter = _ready_adapter(tmp_path)
+    _write(adapter.files_dir, filename, [], sequence=0)
+    start = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    with pytest.raises(Mql5FileAdapterError, match="history_snapshot_sequence_mismatch"):
+        if filename == "history_orders.json":
+            adapter.history_orders(start, end)
+        else:
+            adapter.history_deals(start, end)
 
 
 def test_retries_one_snapshot_publish_boundary_before_accepting_a_consistent_bundle(
@@ -307,6 +449,58 @@ def test_event_files_are_read_in_sequence_and_acknowledged_separately(tmp_path: 
     assert adapter.pending_events() == ()
     assert not (adapter.files_dir / "events" / "event-10.json").exists()
     assert not (adapter.files_dir / "events" / "event-12.json").exists()
+
+
+def test_pending_event_marks_native_deal_already_committed_in_history(tmp_path: Path) -> None:
+    adapter = _ready_adapter(tmp_path)
+    adapter.history_handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    adapter.history_handoff_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "job_id": "11111111-1111-4111-8111-111111111111",
+                "connection_id": CONNECTION_ID,
+                "history_document_sha256": "a" * 64,
+                "anchor_sequence": 9,
+                "archived_deal_tickets": ["199"],
+                # Ticket 199 was deliberately not projected by history (for example an
+                # ambiguous reversal), but it still belongs to the frozen ledger boundary.
+                "imported_deal_tickets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write(
+        adapter.files_dir,
+        "events/event-10.json",
+        {
+            "event_type": "DEAL_ADD",
+            "deal_id": "199",
+            "position_id": "100",
+            "ticket": "199",
+            "entry": "IN",
+            "time": "2026-07-17T09:00:00Z",
+        },
+        sequence=10,
+    )
+    _write(
+        adapter.files_dir,
+        "events/event-11.json",
+        {
+            "event_type": "DEAL_ADD",
+            "deal_id": "200",
+            "position_id": "100",
+            "ticket": "200",
+            "entry": "OUT",
+            "time": "2026-07-17T10:00:00Z",
+        },
+        sequence=11,
+    )
+
+    archived, fresh = adapter.pending_events()
+    assert archived["history_archived"] is True
+    assert "history_archived" not in fresh
+    assert adapter.history_handoff_path.exists()
 
 
 def test_rejects_stale_heartbeat_and_corrupt_json_without_leaking_content(tmp_path: Path) -> None:

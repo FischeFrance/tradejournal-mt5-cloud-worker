@@ -35,18 +35,33 @@ def redact(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [redact(v) for v in value]
+    if isinstance(value, str):
+        return RedactionFilter.sanitize(value)
     return value
 
 
 class RedactionFilter(logging.Filter):
     _bearer = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
+    _signed_query = re.compile(
+        r"(?i)([?&](?:token|access_token|signature|sig)=)[^&\s\"']+"
+    )
+
+    @classmethod
+    def sanitize(cls, value: str) -> str:
+        without_bearer = cls._bearer.sub("Bearer <redacted>", value)
+        return cls._signed_query.sub(r"\1<redacted>", without_bearer)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = self._bearer.sub("Bearer <redacted>", str(record.msg))
+        record.msg = self.sanitize(str(record.msg))
         if record.args:
             record.args = (
                 tuple(redact(v) for v in record.args)
                 if isinstance(record.args, tuple)
                 else redact(record.args)
             )
+        # Third-party clients may pass URL objects as %-format arguments. Render once, then
+        # sanitize the complete line so secrets embedded in those objects cannot bypass the
+        # recursive value redactor above.
+        record.msg = self.sanitize(record.getMessage())
+        record.args = ()
         return True

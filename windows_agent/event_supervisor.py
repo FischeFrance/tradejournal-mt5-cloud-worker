@@ -86,6 +86,23 @@ class Mt5EventSupervisor:
                 connection_id = canonical_uuid(path.name)
             except ValueError:
                 continue
+            # Secrets prove ownership, not readiness.  The provision/history handler publishes
+            # `connected` only after the history bundle, the no-restart new_only handoff and the
+            # first durable live poll have all succeeded.  This local gate also survives an Agent
+            # restart, so a half-provisioned account can never leak historical rows through the
+            # live ingestion route.
+            progress_path = path / "state" / "job_progress.json"
+            if progress_path.is_symlink() or not progress_path.is_file():
+                continue
+            try:
+                progress = read_json(progress_path)
+            except (OSError, ValueError):
+                continue
+            if (
+                progress.get("connection_id") != connection_id
+                or progress.get("status") != "connected"
+            ):
+                continue
             secret_root = self.secrets.root / connection_id
             required = ("mt5_login", "mt5_server", "bridge_token")
             if all((secret_root / f"{name}.dpapi").is_file() for name in required):

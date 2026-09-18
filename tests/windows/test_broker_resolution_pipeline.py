@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,6 +8,10 @@ import pytest
 
 from windows_agent import real_handlers
 from windows_agent.agent_errors import CredentialEnvelopeInvalid
+from windows_agent.broker_endpoint_resolver import (
+    BrokerEndpointResolutionError,
+    VerifiedBrokerEndpoint,
+)
 from windows_agent.broker_registry import (
     BrokerRegistry,
     BrokerResolution,
@@ -16,6 +21,45 @@ from windows_agent.broker_resolution import (
     ZeroLicenseBrokerResolver,
     validate_resolution_plan,
 )
+from windows_agent.broker_wizard import BrokerWizardEvidence
+
+
+class AcknowledgingApi:
+    @staticmethod
+    def heartbeat(_job_id: str, _lease_id: str) -> dict[str, bool]:
+        return {"lease_valid": True}
+
+    @staticmethod
+    def progress(
+        _job_id: str,
+        _lease_id: str,
+        _event_code: str,
+        _event_status: str,
+        _detail_code: str | None = None,
+    ) -> dict[str, bool]:
+        return {"event_recorded": True}
+
+
+def _verified_endpoint(
+    *,
+    broker_label: str = "Generic Markets",
+    server_name: str = "Generic-Live",
+) -> VerifiedBrokerEndpoint:
+    return VerifiedBrokerEndpoint(
+        broker_label=broker_label,
+        server_name=server_name,
+        host="203.0.113.10",
+        port=443,
+        protocol="TCP/TLS",
+        observed_at_unix_ms=1,
+        discovery_method="MT5_MANAGED_INVESTOR_LOGIN",
+        verification_pid=123,
+        process_creation_time_unix_ms=1,
+        verification_session_id="12345678-1234-4234-8234-123456789abc",
+        confidence="HIGH",
+        artifact_relative_path="artifacts/fixture.json",
+        artifact_sha256="1" * 64,
+    )
 
 
 def test_stale_terminal_cleanup_failure_stops_before_start(
@@ -218,18 +262,12 @@ def test_provision_resolves_before_decrypting_credentials(
 ) -> None:
     events: list[str] = []
 
-    class Api:
-        @staticmethod
-        def heartbeat(_job_id: str, _lease_id: str) -> dict[str, bool]:
-            return {"lease_valid": True}
-
-    class Resolver:
-        @staticmethod
-        def resolve(expected_server: str, *, broker_hint: object = None) -> BrokerResolution:
-            events.append(f"resolve:{expected_server}:{broker_hint}")
-            return ZeroLicenseBrokerResolver().resolve(
-                expected_server, broker_hint=broker_hint
-            )
+    def resolve_endpoint(
+        broker_label: str | None,
+        server: str,
+    ) -> VerifiedBrokerEndpoint:
+        events.append(f"resolve:{broker_label}:{server}")
+        return _verified_endpoint()
 
     def reject_decrypt(_payload: dict, _secrets_root: Path) -> str:
         events.append("decrypt")
@@ -237,11 +275,11 @@ def test_provision_resolves_before_decrypting_credentials(
 
     monkeypatch.setattr(real_handlers, "_decrypt_envelope", reject_decrypt)
     handlers = real_handlers.build_real_handlers(
-        Api(),
+        AcknowledgingApi(),
         instances_root=tmp_path / "instances",
         secrets_root=tmp_path / "secrets",
         source_terminal=tmp_path / "terminal64.exe",
-        broker_resolver=Resolver(),
+        endpoint_resolver=resolve_endpoint,
     )
     job = {
         "job_id": "ordering",
@@ -252,7 +290,7 @@ def test_provision_resolves_before_decrypting_credentials(
         "payload": {
             "expected_login": 42,
             "expected_server": "Generic-Live",
-            "broker_hint": "Generic Markets",
+            "broker_label": "Generic Markets",
             "credential_envelope": {"opaque": True},
         },
     }
@@ -260,7 +298,7 @@ def test_provision_resolves_before_decrypting_credentials(
     with pytest.raises(CredentialEnvelopeInvalid):
         handlers["provision"](job)
 
-    assert events == ["resolve:Generic-Live:Generic Markets", "decrypt"]
+    assert events == ["resolve:Generic Markets:Generic-Live", "decrypt"]
 
 
 def test_invalid_hint_stops_before_decrypting_credentials(
@@ -294,7 +332,7 @@ def test_invalid_hint_stops_before_decrypting_credentials(
         "payload": {
             "expected_login": 42,
             "expected_server": "Generic-Live",
-            "broker_hint": "../ambiguous",
+            "broker_label": "bad\nlabel",
             "credential_envelope": {"opaque": True},
         },
     }
@@ -305,15 +343,11 @@ def test_invalid_hint_stops_before_decrypting_credentials(
     assert decrypt_called is False
 
 
-def test_provision_passes_generic_resolution_plan_to_native_helper(
+def test_provision_passes_verified_endpoint_to_native_helper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured: list[BrokerResolution] = []
-
-    class Api:
-        @staticmethod
-        def heartbeat(_job_id: str, _lease_id: str) -> dict[str, bool]:
-            return {"lease_valid": True}
+    captured: list[tuple[str, str]] = []
+    resolution_calls: list[tuple[str | None, str]] = []
 
     monkeypatch.setattr(
         real_handlers,
@@ -327,10 +361,19 @@ def test_provision_passes_generic_resolution_plan_to_native_helper(
     )
 
     def fake_native_helper(*args: object, **_kwargs: object) -> dict[str, object]:
-        plan = args[5]
-        assert isinstance(plan, BrokerResolution)
-        captured.append(plan)
+        server = args[5]
+        endpoint = args[6]
+        assert isinstance(server, str)
+        assert isinstance(endpoint, str)
+        captured.append((server, endpoint))
         return {"live_sync_started": True}
+
+    def resolve_endpoint(
+        broker_label: str | None,
+        server: str,
+    ) -> VerifiedBrokerEndpoint:
+        resolution_calls.append((broker_label, server))
+        return _verified_endpoint()
 
     monkeypatch.setattr(
         real_handlers, "_start_file_bridge_and_sync", fake_native_helper
@@ -339,10 +382,11 @@ def test_provision_passes_generic_resolution_plan_to_native_helper(
     source_terminal.parent.mkdir(parents=True)
     source_terminal.write_bytes(b"stub")
     handlers = real_handlers.build_real_handlers(
-        Api(),
+        AcknowledgingApi(),
         instances_root=tmp_path / "instances",
         secrets_root=tmp_path / "secrets",
         source_terminal=source_terminal,
+        endpoint_resolver=resolve_endpoint,
     )
     job = {
         "job_id": "generic-plan",
@@ -353,125 +397,157 @@ def test_provision_passes_generic_resolution_plan_to_native_helper(
         "payload": {
             "expected_login": 42,
             "expected_server": "Generic-Live",
-            "broker_hint": "Generic Markets",
+            "broker_label": "Generic Markets",
             "credential_envelope": {"opaque": True},
         },
     }
 
     result = handlers["provision"](job)
 
-    assert result == {"live_sync_started": True}
-    assert len(captured) == 1
-    assert captured[0].method is ResolutionMethod.TERMINAL_DISCOVERY
-    assert captured[0].expected_server == "Generic-Live"
-    assert captured[0].discovery_queries == (
-        "Generic-Live",
-        "Generic Markets",
+    assert result["live_sync_started"] is True
+    assert result["verified_server_name"] == "Generic-Live"
+    assert result["verified_broker_label"] == "Generic Markets"
+    assert resolution_calls == [("Generic Markets", "Generic-Live")]
+    assert captured == [("Generic-Live", "203.0.113.10:443")]
+
+
+def test_broker_wizard_runs_before_credential_decryption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def reject_endpoint(
+        _broker_label: str | None,
+        _server: str,
+    ) -> VerifiedBrokerEndpoint:
+        raise BrokerEndpointResolutionError("fixture registry miss")
+
+    def run_wizard(
+        root: Path,
+        search_text: str,
+        suggested_broker_label: str,
+        expected_server: str,
+        cancel_check: object,
+    ) -> BrokerWizardEvidence:
+        events.append("wizard")
+        assert search_text == suggested_broker_label == "Generic Markets"
+        assert expected_server == "Generic-Live"
+        assert cancel_check is None
+        artifact = root / "state" / "broker-wizard-result.json"
+        artifact.write_text('{"status":"SUCCESS"}', encoding="utf-8")
+        return BrokerWizardEvidence(
+            run_id="12345678-1234-4234-8234-123456789abc",
+            expected_server_name=expected_server,
+            selected_broker_label=suggested_broker_label,
+            censused_server_names=(expected_server,),
+            terminal_pid=123,
+            completed_at_unix_ms=1,
+            artifact_path=artifact,
+            artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        )
+
+    def reject_decrypt(_payload: dict, _secrets_root: Path) -> str:
+        events.append("decrypt")
+        raise CredentialEnvelopeInvalid("stop after ordering assertion")
+
+    monkeypatch.setattr(real_handlers, "_decrypt_envelope", reject_decrypt)
+    source_terminal = tmp_path / "template" / "terminal64.exe"
+    source_terminal.parent.mkdir(parents=True)
+    source_terminal.write_bytes(b"stub")
+    handlers = real_handlers.build_real_handlers(
+        AcknowledgingApi(),
+        instances_root=tmp_path / "instances",
+        secrets_root=tmp_path / "secrets",
+        source_terminal=source_terminal,
+        endpoint_resolver=reject_endpoint,
+        broker_wizard=run_wizard,
     )
 
-
-def test_native_helper_discovers_before_reading_stored_password(
-    tmp_path: Path,
-) -> None:
-    events: list[str] = []
-
-    class Api:
-        @staticmethod
-        def heartbeat(_job_id: str, _lease_id: str) -> dict[str, bool]:
-            return {"lease_valid": True}
-
-    class Store:
-        @staticmethod
-        def read(_cid: str, name: str) -> str:
-            events.append(f"read:{name}")
-            return "opaque-password"
-
-    class Runtime:
-        @staticmethod
-        def prepare_broker(**kwargs: object) -> None:
-            events.append("prepare")
-            assert kwargs == {
-                "expected_server": "Generic-Live",
-                "queries": ("Generic-Live",),
+    with pytest.raises(CredentialEnvelopeInvalid):
+        handlers["provision"](
+            {
+                "job_id": "job",
+                "job_type": "provision",
+                "connection_id": str(uuid4()),
+                "lease_id": "lease",
+                "history_mode": "new_only",
+                "payload": {
+                    "expected_login": 42,
+                    "expected_server": "Generic-Live",
+                    "broker_label": "Generic Markets",
+                    "credential_envelope": {"opaque": True},
+                },
             }
-
-        @staticmethod
-        def start(**_kwargs: object) -> None:
-            events.append("start")
-            raise real_handlers.NativeMt5Error("intentional_stop")
-
-    root = tmp_path / "instance"
-    root.mkdir()
-    plan = ZeroLicenseBrokerResolver().resolve("Generic-Live")
-    job = {"job_id": "job", "lease_id": "lease"}
-
-    with pytest.raises(Exception) as captured:
-        real_handlers._start_file_bridge_and_sync(
-            job,
-            Api(),
-            root,
-            str(uuid4()),
-            42,
-            plan,
-            "new_only",
-            None,
-            Store(),  # type: ignore[arg-type]
-            lambda _path: object(),
-            tmp_path / "bridge.ex5",
-            lambda _root, _cid: Runtime(),  # type: ignore[arg-type]
         )
 
-    assert captured.value.error_code == "mt5_initialize_failed"
-    assert events == ["prepare", "read:mt5_investor_password", "start"]
+    assert events == ["wizard", "decrypt"]
 
 
-def test_native_helper_stops_prepared_terminal_when_lease_is_lost(
+def test_broker_wizard_lease_guard_aborts_before_credential_decryption(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    guard_calls = 0
 
-    class Api:
-        calls = 0
+    def lease_guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        events.append(f"guard:{guard_calls}")
+        if guard_calls == 2:
+            raise real_handlers.LeaseLost("fixture lease lost")
 
-        @classmethod
-        def heartbeat(cls, _job_id: str, _lease_id: str) -> dict[str, bool]:
-            cls.calls += 1
-            return {"lease_valid": cls.calls == 1}
+    def reject_endpoint(
+        _broker_label: str | None,
+        _server: str,
+    ) -> VerifiedBrokerEndpoint:
+        raise BrokerEndpointResolutionError("fixture registry miss")
 
-    class Store:
-        @staticmethod
-        def read(_cid: str, _name: str) -> str:
-            events.append("unexpected-read")
-            return "opaque-password"
+    def run_wizard(
+        _root: Path,
+        _search_text: str,
+        _suggested_broker_label: str,
+        _expected_server: str,
+        cancel_check: object,
+    ) -> BrokerWizardEvidence:
+        events.append("wizard")
+        assert callable(cancel_check)
+        cancel_check()
+        raise AssertionError("lease loss must abort the wizard")
 
-    class Runtime:
-        @staticmethod
-        def prepare_broker(**_kwargs: object) -> None:
-            events.append("prepare")
+    def unexpected_decrypt(_payload: dict, _secrets_root: Path) -> str:
+        events.append("unexpected-decrypt")
+        return "opaque-password"
 
-        @staticmethod
-        def stop() -> bool:
-            events.append("stop")
-            return True
-
-    root = tmp_path / "instance"
-    root.mkdir()
-    plan = ZeroLicenseBrokerResolver().resolve("Generic-Live")
+    monkeypatch.setattr(real_handlers, "_decrypt_envelope", unexpected_decrypt)
+    source_terminal = tmp_path / "template" / "terminal64.exe"
+    source_terminal.parent.mkdir(parents=True)
+    source_terminal.write_bytes(b"stub")
+    handlers = real_handlers.build_real_handlers(
+        AcknowledgingApi(),
+        instances_root=tmp_path / "instances",
+        secrets_root=tmp_path / "secrets",
+        source_terminal=source_terminal,
+        endpoint_resolver=reject_endpoint,
+        broker_wizard=run_wizard,
+    )
+    job = {
+        "job_id": "job",
+        "job_type": "provision",
+        "connection_id": str(uuid4()),
+        "lease_id": "lease",
+        "history_mode": "new_only",
+        "payload": {
+            "expected_login": 42,
+            "expected_server": "Generic-Live",
+            "broker_label": "Generic Markets",
+            "credential_envelope": {"opaque": True},
+        },
+        "_lease_guard": lease_guard,
+    }
 
     with pytest.raises(real_handlers.LeaseLost):
-        real_handlers._start_file_bridge_and_sync(
-            {"job_id": "job", "lease_id": "lease"},
-            Api(),
-            root,
-            str(uuid4()),
-            42,
-            plan,
-            "new_only",
-            None,
-            Store(),  # type: ignore[arg-type]
-            lambda _path: object(),
-            tmp_path / "bridge.ex5",
-            lambda _root, _cid: Runtime(),  # type: ignore[arg-type]
-        )
+        handlers["provision"](job)
 
-    assert events == ["prepare", "stop"]
+    assert events == ["guard:1", "wizard", "guard:2"]

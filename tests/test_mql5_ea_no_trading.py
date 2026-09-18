@@ -118,6 +118,98 @@ def test_new_only_defers_account_reads_until_after_on_init():
     )
 
 
+def test_history_mode_publishes_one_immutable_ledger_snapshot_per_process():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    writer = text[text.index("void WriteAllSnapshots"):text.index("int OnInit")]
+
+    assert "if(!g_new_only && g_history_snapshot_written)" in writer
+    assert 'WriteJsonAtomic("heartbeat.json"' in writer
+    assert "g_history_snapshot_sequence" in writer
+    assert "if(snapshot_ok)" in writer
+    assert "g_history_snapshot_written = true;" in writer
+    assert writer.index("if(!g_new_only && g_history_snapshot_written)") < writer.index(
+        'BuildHistoryOrdersJson()'
+    )
+
+
+def test_history_ledger_anchor_is_committed_before_other_snapshots_and_revalidated():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    builder = text[text.index("string BuildDealsJson"):text.index("string BuildCandlesJson")]
+    validator = text[
+        text.index("bool RevalidateHistoryLedgerAnchor") : text.index(
+            "string BuildDealsJson"
+        )
+    ]
+    writer = text[text.index("void WriteAllSnapshots"):text.index("int OnInit")]
+    history_writer = writer[writer.index("HistoryLedgerAnchor ledger_anchor;") :]
+
+    # The anchor metadata persisted in deals.json must come from the same frozen ledger.
+    for required in (
+        "anchor.deal_count = exported_total",
+        "anchor.last_deal_ticket = selected_last_ticket",
+        "anchor.last_deal_time_msc = selected_last_time_msc",
+        "anchor.balance = balance_after",
+        "anchor.credit = credit_after",
+    ):
+        assert required in builder
+
+    # History writes the ledger first, then takes slower account/state snapshots.
+    assert history_writer.index("BuildDealsJson(ledger_anchor)") < history_writer.index(
+        'WriteJsonAtomic("deals.json"'
+    )
+    assert history_writer.index('WriteJsonAtomic("deals.json"') < history_writer.index(
+        'WriteJsonAtomic("history_orders.json"'
+    )
+    assert history_writer.index('WriteJsonAtomic("history_orders.json"') < history_writer.index(
+        'WriteJsonAtomic("account.json"'
+    )
+
+    # Immediately before the only historical heartbeat commit, all ledger high-water metadata
+    # and both economic anchors are checked again. A mismatch returns without a heartbeat.
+    for required in (
+        "HistoryDealsTotal()",
+        "count == anchor.deal_count",
+        "last_ticket == anchor.last_deal_ticket",
+        "last_time_msc == anchor.last_deal_time_msc",
+        "AccountInfoDouble(ACCOUNT_BALANCE)",
+        "AccountInfoDouble(ACCOUNT_CREDIT)",
+    ):
+        assert required in validator
+    assert history_writer.index("RevalidateHistoryLedgerAnchor(ledger_anchor)") < history_writer.index(
+        'WriteJsonAtomic("heartbeat.json"'
+    )
+    failed_commit = history_writer[
+        history_writer.index("if(!RevalidateHistoryLedgerAnchor(ledger_anchor))") : history_writer.index(
+            'WriteJsonAtomic("heartbeat.json"'
+        )
+    ]
+    assert "return;" in failed_commit
+
+
+def test_new_only_path_does_not_build_or_revalidate_the_historical_ledger():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    writer = text[text.index("void WriteAllSnapshots"):text.index("int OnInit")]
+    new_only = writer[
+        writer.index("if(g_new_only)") : writer.index("HistoryLedgerAnchor ledger_anchor;")
+    ]
+
+    assert "BuildDealsJson" not in new_only
+    assert "RevalidateHistoryLedgerAnchor" not in new_only
+    assert not re.search(r"\bHistorySelect\s*\(", new_only)
+    assert "return;" in new_only
+
+
+def test_history_handoff_switches_to_live_without_restarting_mt5():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(encoding="utf-8")
+    timer = text[text.index("void OnTimer"):text.index("void OnTradeTransaction")]
+
+    assert "if(!g_new_only && ReadNewOnlyMode())" in timer
+    assert 'WriteInitMarker("mode-new-only")' in timer
+    assert '\\"history_mode\\"' in text[
+        text.index("string BuildHeartbeatJson"):text.index("string BuildAccountJson")
+    ]
+
+
 def test_live_deal_cache_races_are_retried_from_the_timer():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
         encoding="utf-8"
@@ -129,10 +221,28 @@ def test_live_deal_cache_races_are_retried_from_the_timer():
     assert "g_pending_deal_tickets[i] == deal_ticket" in text
 
 
+def test_position_events_keep_ticket_but_use_stable_position_identifier():
+    text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
+        encoding="utf-8"
+    )
+    emitter = text[
+        text.index("void EmitPositionEvent") : text.index("void EmitHistoryOrderEvent")
+    ]
+
+    assert "position_id = PositionGetInteger(POSITION_IDENTIFIER);" in emitter
+    assert re.search(
+        r'BuildEventJson\("POSITION",\s*\(long\)position_ticket,\s*position_id,\s*0,\s*0,',
+        emitter,
+    )
+    assert "(long)position_ticket, (long)position_ticket" not in emitter
+
+
 def test_history_deal_snapshots_include_execution_semantics():
     text = (MT5_EXPERTS_DIR / "TradeJournalBridge.mq5").read_text(
         encoding="utf-8"
     )
+    assert '\\"history_index\\"' in text
+    assert "mt5_history_index_v1" in text
     builder = text[text.index("string BuildDealsJson"):text.index("string BuildCandlesJson")]
 
     assert "DEAL_ENTRY" in builder

@@ -209,7 +209,12 @@ def run_forever(runner: JobRunner, poll_seconds: float, stop_event: threading.Ev
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO)
-    logging.getLogger().addFilter(RedactionFilter())
+    root_logger = logging.getLogger()
+    root_logger.addFilter(RedactionFilter())
+    # Logger filters are not applied to records propagated by children such as httpx; handler
+    # filters are. Protect console execution with the same boundary as the Windows service.
+    for handler in root_logger.handlers:
+        handler.addFilter(RedactionFilter())
     config = load_runtime_config()
     runner = build_runner(config)
     stop_event = threading.Event()

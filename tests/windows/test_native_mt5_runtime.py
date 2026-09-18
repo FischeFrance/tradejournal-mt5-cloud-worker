@@ -509,6 +509,35 @@ def test_install_expert_rejects_unknown_history_mode(tmp_path: Path) -> None:
         runtime.install_expert(expert, "ten_year_snapshot")
 
 
+def test_running_bridge_acknowledges_atomic_switch_to_new_only(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True, exist_ok=True)
+    historical = json.loads(
+        _envelope(
+            {
+                "history_mode": "history",
+                "terminal_connected": True,
+            }
+        )
+    )
+    live = {
+        **historical,
+        "sequence": 2,
+        "payload": {
+            "history_mode": "new_only",
+            "terminal_connected": True,
+        },
+    }
+
+    with (
+        patch.object(runtime, "_read_json", side_effect=[historical, live]),
+        patch("windows_agent.worker.native_mt5_runtime.time.sleep"),
+    ):
+        runtime.switch_to_new_only(timeout=1)
+
+    assert (runtime.files / "history_mode").read_text(encoding="utf-8") == "new_only"
+
+
 def test_login_bootstrap_and_noninteractive_startup_configs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
     runtime = _runtime(tmp_path)
