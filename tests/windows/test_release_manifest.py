@@ -176,6 +176,16 @@ def test_deployment_gate_binds_and_rechecks_the_source_checkout() -> None:
         assert f"'{release_source}'" in script
 
 
+def test_deployment_normalizes_guarded_runtime_bindings_atomically() -> None:
+    script = (
+        REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "'TRADEJOURNAL_SOURCE_TERMINAL' = 'C:\\TradeJournal\\mt5-template\\terminal64.exe'" in script
+    assert "'TRADEJOURNAL_EXPERT_BINARY' = $goldenExpert" in script
+    assert "'TRADEJOURNAL_MT5_INTERACTIVE_USER' = 'TradeJournalMT5'" in script
+
+
 def test_deployment_opens_service_python_class_registry_key_for_writing() -> None:
     script = (
         REPOSITORY_ROOT / "scripts" / "windows" / "deploy-history-import-release.ps1"

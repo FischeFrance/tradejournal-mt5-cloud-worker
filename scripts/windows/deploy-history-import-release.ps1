@@ -506,6 +506,12 @@ if ($RecoveryConnectionId) {
 $pythonPathFound = $false
 $expertPinFound = $false
 $requiredSettings = [ordered]@{
+  # The deployment guard permits only the managed template paths and dedicated
+  # interactive identity. Normalize legacy service-scoped overrides atomically
+  # with the release switch, so a pre-barrier rollback restores them too.
+  'TRADEJOURNAL_SOURCE_TERMINAL' = 'C:\TradeJournal\mt5-template\terminal64.exe'
+  'TRADEJOURNAL_EXPERT_BINARY' = $goldenExpert
+  'TRADEJOURNAL_MT5_INTERACTIVE_USER' = 'TradeJournalMT5'
   'TRADEJOURNAL_MT5_MAINTENANCE_ENABLED' = '1'
   'TRADEJOURNAL_MT5_MAINTENANCE_LOCAL_TIME' = '23:30'
   'TRADEJOURNAL_MT5_MAINTENANCE_TIMEZONE' = 'Europe/Rome'
