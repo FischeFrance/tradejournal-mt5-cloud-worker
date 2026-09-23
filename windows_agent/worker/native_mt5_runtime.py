@@ -2967,7 +2967,22 @@ class NativeMt5Runtime:
         heartbeat: dict[str, Any],
     ) -> NativeMt5Status:
         self._release_interactive_task()
-        self.set_terminal_window_visibility(pid, visible=False)
+        try:
+            self.set_terminal_window_visibility(pid, visible=False)
+        except NativeMt5Error as exc:
+            # The terminal has already authenticated, synchronized in investor mode and
+            # published a valid heartbeat before this best-effort UI cleanup runs.  A
+            # disconnected RDP desktop can decline to process SW_HIDE even though the
+            # file bridge remains healthy; never turn that cosmetic failure into a
+            # terminal shutdown.
+            if str(exc) != "terminal_window_visibility_failed":
+                raise
+            logger.warning(
+                "native MT5 runtime: terminal window remained visible after verified "
+                "readiness (connection_id=%s, pid=%s); continuing with the terminal online",
+                self.connection_id,
+                pid,
+            )
         return NativeMt5Status(pid, account, heartbeat, self.files)
 
     def _wait_for_heartbeat(

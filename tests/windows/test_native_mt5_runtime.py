@@ -69,6 +69,43 @@ def _envelope(payload: dict[str, object]) -> str:
     )
 
 
+def test_ready_status_keeps_verified_terminal_online_when_window_hide_fails(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = _runtime(tmp_path)
+    account = {"login": "42", "server": "Demo", "trade_allowed": False}
+    heartbeat = {"terminal_connected": True}
+
+    with (
+        patch.object(runtime, "_release_interactive_task") as release_task,
+        patch.object(
+            runtime,
+            "set_terminal_window_visibility",
+            side_effect=NativeMt5Error("terminal_window_visibility_failed"),
+        ),
+    ):
+        status = runtime._ready_status(123, account, heartbeat)
+
+    release_task.assert_called_once_with()
+    assert status == NativeMt5Status(123, account, heartbeat, runtime.files)
+    assert "continuing with the terminal online" in caplog.text
+
+
+def test_ready_status_keeps_non_visibility_failures_fatal(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    with (
+        patch.object(runtime, "_release_interactive_task"),
+        patch.object(
+            runtime,
+            "set_terminal_window_visibility",
+            side_effect=NativeMt5Error("terminal_window_task_run_failed"),
+        ),
+    ):
+        with pytest.raises(NativeMt5Error, match="terminal_window_task_run_failed"):
+            runtime._ready_status(123, {}, {"terminal_connected": True})
+
+
 def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     expert = tmp_path / "bridge.ex5"
