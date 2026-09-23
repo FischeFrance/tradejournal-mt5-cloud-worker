@@ -2092,12 +2092,14 @@ def _run_history_sync(
         counts = HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
         if ingestion_sink is not None:
             result = outbox.drain(ingestion_sink)
-            dead_lettered = outbox.dead_letter_count()
-            if result.pending or dead_lettered or result.dry_run:
+            # EventOutbox has already durably quarantined permanent rejections. A historical
+            # dead-letter is not pending delivery work and must not make unrelated later
+            # history batches fail forever. Pending/transient delivery and dry-runs remain
+            # fail-closed so their causal prefix is never skipped.
+            if result.pending or result.dry_run:
                 raise HistorySyncFailed(
                     "history delivery incomplete: "
-                    f"pending={result.pending}, dead_lettered={dead_lettered}, "
-                    f"dry_run={result.dry_run}"
+                    f"pending={result.pending}, dry_run={result.dry_run}"
                 )
         return counts
     except Exception as exc:
