@@ -641,6 +641,100 @@ def test_rotated_marker_allows_managed_bridge_release_replacement(
         assert restarted.current_sha256 == InstanceProvisioner._sha256(terminal)
 
 
+def test_obsolete_anchor_marker_is_resealed_for_managed_bridge_replacement(
+    tmp_path: Path,
+) -> None:
+    manager, terminal, _base_digest, bundle, updater, config = _candidate_setup(
+        tmp_path
+    )
+    with (
+        patch.object(manager, "_verify_metaquotes_signature", return_value=SIGNER),
+        patch.object(manager, "_stop_staged_terminal"),
+        patch(
+            "windows_agent.provisioning.mt5_template.WindowsSecretStore.restrict_acl"
+        ),
+    ):
+        prepared = manager.prepare_verified_update(bundle, updater, config, SIGNER)
+        manager.commit_prepared_update(prepared)
+
+    current_anchor = InstanceProvisioner._sha256(terminal)
+    reanchored = Mt5TemplateManager(terminal, current_anchor)
+    marker_path = terminal.parent / ".tradejournal-vendor-update.json"
+    assert read_json(marker_path)["base_terminal_sha256"] != current_anchor
+
+    managed = terminal.parent / _MANAGED_RUNTIME_ASSETS[0]
+    previous = tmp_path / "previous-bridge.ex5"
+    shutil.copy2(managed, previous)
+    previous_digest = InstanceProvisioner._sha256(previous)
+    managed.write_bytes(b"new-tradejournal-release")
+    next_digest = InstanceProvisioner._sha256(managed)
+
+    with (
+        patch.object(reanchored, "_verify_metaquotes_signature", return_value=SIGNER),
+        patch(
+            "windows_agent.provisioning.mt5_template.WindowsSecretStore.restrict_acl"
+        ),
+    ):
+        # The existing validator already recognizes this marker as obsolete,
+        # but leaves it in place during a non-mutating preflight.
+        assert reanchored.validate_current_quiesced() == current_anchor
+        assert marker_path.is_file()
+        reanchored.reseal_managed_code_deployment(
+            previous,
+            previous_digest,
+            next_digest,
+        )
+        reanchored.reseal_managed_code_deployment(
+            previous,
+            previous_digest,
+            next_digest,
+        )
+        assert reanchored.validate_current_quiesced() == current_anchor
+
+    marker = read_json(marker_path)
+    assert marker["schema_version"] == 2
+    assert marker["base_terminal_sha256"] == current_anchor
+    assert marker["terminal_sha256"] == current_anchor
+    assert marker["code_manifest_sha256"] == InstanceProvisioner._code_manifest(
+        terminal.parent
+    )
+
+
+def test_reseal_rejects_companion_drift_under_current_anchor(tmp_path: Path) -> None:
+    manager, terminal, _base_digest, bundle, updater, config = _candidate_setup(
+        tmp_path
+    )
+    with (
+        patch.object(manager, "_verify_metaquotes_signature", return_value=SIGNER),
+        patch.object(manager, "_stop_staged_terminal"),
+        patch(
+            "windows_agent.provisioning.mt5_template.WindowsSecretStore.restrict_acl"
+        ),
+    ):
+        prepared = manager.prepare_verified_update(bundle, updater, config, SIGNER)
+        manager.commit_prepared_update(prepared)
+
+    managed = terminal.parent / _MANAGED_RUNTIME_ASSETS[0]
+    previous = tmp_path / "previous-bridge.ex5"
+    shutil.copy2(managed, previous)
+    previous_digest = InstanceProvisioner._sha256(previous)
+    managed.write_bytes(b"new-tradejournal-release")
+    next_digest = InstanceProvisioner._sha256(managed)
+    companion = terminal.parent / _MANAGED_RUNTIME_ASSETS[1]
+    companion.write_bytes(b"unexpected-companion-change")
+
+    with patch.object(manager, "_verify_metaquotes_signature", return_value=SIGNER):
+        with pytest.raises(
+            Mt5TemplateError,
+            match="MT5 managed deployment changed companion code",
+        ):
+            manager.reseal_managed_code_deployment(
+                previous,
+                previous_digest,
+                next_digest,
+            )
+
+
 def test_quiesced_validation_never_discards_interrupted_rotation(
     tmp_path: Path,
 ) -> None:

@@ -440,6 +440,17 @@ class Mt5TemplateManager:
             )
             marker_path = self.template_root / _MARKER_NAME
             marker = read_json(marker_path, {}) if marker_path.is_file() else {}
+            if (
+                marker
+                and marker.get("base_terminal_sha256") != self.configured_sha256
+                and terminal_digest == self.configured_sha256
+            ):
+                # Match _validate_template_root(): a configured terminal
+                # anchor that exactly matches the current signed terminal
+                # supersedes a record anchored to a previous terminal.  The
+                # new marker is written atomically below after re-verifying
+                # the terminal and the replacement Bridge binding.
+                marker = {}
             if marker:
                 if (
                     marker.get("schema_version") not in (1, 2)
