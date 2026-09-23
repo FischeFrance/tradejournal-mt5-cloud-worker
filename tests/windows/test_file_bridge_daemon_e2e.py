@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from windows_agent import real_handlers
 from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
 from windows_agent.job_runner import JobRunner
 from windows_agent.provisioning.secret_store import WindowsSecretStore
@@ -253,6 +254,39 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     assert runner.run_once() is True
     assert api.transitions[-1][1] == "complete"
     return cid, api, handlers
+
+
+def test_native_historical_sync_routes_new_only_to_incremental_sync(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A recovery job must not enter the bounded full-history importer."""
+    cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
+
+    def reject_full_import(*_args: object) -> dict[str, int]:
+        raise AssertionError("new_only must not use the full-history importer")
+
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_control_plane_history_import",
+        reject_full_import,
+    )
+    api.jobs.append({
+        "job_id": "history-new-only",
+        "job_type": "historical_sync",
+        "connection_id": cid,
+        "lease_id": "2",
+        "history_mode": "new_only",
+        "payload": {},
+    })
+
+    with patch("requests.post", return_value=MagicMock(status_code=200)):
+        assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once()
+
+    _, status, result = api.transitions[-1]
+    assert status == "complete"
+    assert result is not None
+    assert result["result"]["imported_deals"] == 0
 
 
 def test_legacy_live_sync_job_sends_one_health_heartbeat(tmp_path: Path, monkeypatch) -> None:

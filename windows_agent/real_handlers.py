@@ -1633,16 +1633,29 @@ def build_real_handlers(
                     root / "state",
                 )
                 _verify_investor_access(adapter)
-                counts = _run_control_plane_history_import(
-                    adapter,
-                    root,
-                    api,
-                    job,
-                    mode,
-                    from_date,
-                    str(login),
-                    server,
-                )
+                if mode == "new_only":
+                    # Incremental recovery is local and checkpointed.  It must
+                    # not enter the bounded full-history import path below.
+                    counts = _run_history_sync(
+                        adapter,
+                        root,
+                        mode,
+                        from_date,
+                        ingestion_sink,
+                        str(login),
+                        server,
+                    )
+                else:
+                    counts = _run_control_plane_history_import(
+                        adapter,
+                        root,
+                        api,
+                        job,
+                        mode,
+                        from_date,
+                        str(login),
+                        server,
+                    )
             except NativeMt5Error as exc:
                 raise _map_mt5_error(exc) from exc
             finally:

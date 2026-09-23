@@ -632,6 +632,99 @@ def test_historical_sync_requires_prior_provision(env):
     assert exc_info.value.error_code == "instance_provision_failed"
 
 
+def test_native_historical_sync_routes_new_only_to_incremental_sync(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A production recovery job must not invoke the full-history uploader."""
+    cid = str(uuid4())
+    InstanceProvisioner(env.instances_root, env.secrets_root).provision(
+        cid, env.source_terminal
+    )
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_login", "12345")
+    store.write(cid, "mt5_server", "Demo-Server")
+    expert = env.instances_root.parent / "TradeJournalBridge.ex5"
+    expert.write_bytes(b"bridge-v2")
+    expert_sha256 = hashlib.sha256(expert.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "validate_runtime_assets",
+        lambda *_args: "a" * 64,
+    )
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "record_verified_managed_asset_update",
+        classmethod(lambda *_args: "b" * 64),
+    )
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda _terminal: []),
+    )
+
+    class Runtime:
+        def stop(self) -> bool:
+            return True
+
+        def install_expert(self, *_args: object) -> None:
+            return None
+
+        def resume(self, **_kwargs: object) -> None:
+            return None
+
+    class Adapter:
+        @staticmethod
+        def account_info():
+            return SimpleNamespace(trade_allowed=False)
+
+        @staticmethod
+        def terminal_info():
+            return SimpleNamespace(connected=True)
+
+    class AdoptingProcessManager(FakeProcessManager):
+        def adopt(self, _executable):
+            return 1
+
+    calls: list[str] = []
+
+    def run_incremental(*args: object) -> dict[str, int]:
+        assert args[2] == "new_only"
+        calls.append("incremental")
+        return {"orders": 0, "deals": 0}
+
+    def reject_full_import(*_args: object) -> dict[str, int]:
+        raise AssertionError("new_only must not use the full-history importer")
+
+    monkeypatch.setattr(
+        real_handlers,
+        "Mql5FileMt5Adapter",
+        lambda *_args: Adapter(),
+    )
+    monkeypatch.setattr(real_handlers, "_run_history_sync", run_incremental)
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_control_plane_history_import",
+        reject_full_import,
+    )
+
+    result = build_real_handlers(
+        FakeApi(),
+        instances_root=env.instances_root,
+        secrets_root=env.secrets_root,
+        source_terminal=env.source_terminal,
+        process_factory=AdoptingProcessManager,
+        expert_binary=expert,
+        expert_sha256=expert_sha256,
+        runtime_factory=lambda *_args: Runtime(),
+    )["historical_sync"](_job("historical_sync", cid, history_mode="new_only"))
+
+    assert result["imported_orders"] == 0
+    assert result["imported_deals"] == 0
+    assert calls == ["incremental"]
+
+
 def test_historical_sync_reuses_dpapi_credentials_and_imports_records(env):
     cid = str(uuid4())
     api = FakeApi()
