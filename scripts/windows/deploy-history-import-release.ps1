@@ -859,7 +859,15 @@ try {
     # The guarded barrier is write-once. Never restore an old Bridge, marker,
     # environment or junction after new-code activation may have mutated state.
     if (-not $convergenceCompleted) {
-      throw 'Deployment convergence is incomplete; the new Agent service was left stopped.'
+      $guardCode = if (
+        $deploymentFailure.Exception.Data.Contains('DeployGuardCode')
+      ) {
+        [string]$deploymentFailure.Exception.Data['DeployGuardCode']
+      } else {
+        'unknown'
+      }
+      if ($guardCode -notmatch '^[a-z0-9_]{1,80}$') { $guardCode = 'unknown' }
+      throw "Deployment convergence is incomplete (guard code: $guardCode); the new Agent service was left stopped."
     }
     if (-not $servicePythonClassSwitched) {
       throw 'Deployment service binding is incomplete; the new Agent service was left stopped.'

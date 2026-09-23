@@ -1761,8 +1761,21 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
             except Exception as exc:
                 raise DeployGuardError("fpm_canary_not_verified") from exc
         report = coordinator.run_once(stop_event)
-        if fpm and not explicitly_verified and fpm not in report.checked_connections:
-            raise DeployGuardError("fpm_canary_not_verified")
+        if fpm and not explicitly_verified:
+            if fpm in report.checked_connections:
+                explicitly_verified = True
+            elif (
+                fpm in report.migrated_connections
+                and coordinator.rotator.matches_target(fpm, report.current_release)
+            ):
+                # A stale requested FPM can be skipped by the public-release
+                # canary probe and then rotated by the fleet pass. rotate_one
+                # already performed its restart/login/read-only health gate;
+                # prove its just-published target pin instead of rejecting a
+                # healthy deployment solely because it was not in `checked`.
+                explicitly_verified = True
+            else:
+                raise DeployGuardError("fpm_canary_not_verified")
         target = report.current_release
         fleet_count, pool_count = _fleet_postconditions(
             config,
@@ -1774,7 +1787,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
         if pool is not None and pool.ready_count() != pool_count:
             raise DeployGuardError("pool_state_invalid")
         _write_activation_schedule_state(config, request, status="completed")
-    except DeployGuardError:
+    except DeployGuardError as exc:
         try:
             _write_system_record(
                 attempt_path,

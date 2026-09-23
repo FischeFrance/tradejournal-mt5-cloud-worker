@@ -600,11 +600,21 @@ def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
     completed_state.parent.mkdir(parents=True)
     completed_state.write_text('{"status":"completed"}', encoding="utf-8")
     _write_preflight(guard_root, provisioned_count=4)
-    monkeypatch.setattr(deploy_guard, "_activation_config", lambda _request: config)
     monkeypatch.setattr(
-        deploy_guard, "_build_activation_coordinator", lambda _config: (coordinator, None)
+        deploy_guard,
+        "_activation_config",
+        lambda _request: config,
     )
-    monkeypatch.setattr(deploy_guard, "verify_interactive_task_identity", lambda _user: None)
+    monkeypatch.setattr(
+        deploy_guard,
+        "_build_activation_coordinator",
+        lambda _config: (coordinator, None),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "verify_interactive_task_identity",
+        lambda _user: None,
+    )
     monkeypatch.setattr(
         deploy_guard, "_fleet_postconditions", lambda *_args, **_kwargs: (4, 2)
     )
@@ -701,6 +711,145 @@ def test_converge_explicitly_probes_requested_readonly_recovery_account(
 
     assert probes == [FPM_CONNECTION_ID]
     assert result["release_id"] == "f" * 64
+
+
+@pytest.mark.parametrize(
+    ("matches_target", "expected_error"),
+    ((True, None), (False, "fpm_canary_not_verified")),
+)
+def test_converge_handles_requested_fpm_rotated_by_the_fleet_pass(
+    guard_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    matches_target: bool,
+    expected_error: str | None,
+) -> None:
+    config = _config(guard_root)
+    target = SimpleNamespace(release_id="f" * 64)
+    report = SimpleNamespace(
+        checked_connections=(),
+        migrated_connections=(FPM_CONNECTION_ID,),
+        current_release=target,
+    )
+    coordinator = SimpleNamespace(
+        rotator=SimpleNamespace(
+            matches_target=lambda _connection_id, _target: matches_target
+        ),
+        _current_release=lambda: target,
+        _canaries=lambda _target: (
+            SimpleNamespace(connection_id=FPM_CONNECTION_ID),
+        ),
+        run_once=lambda _stop: report,
+    )
+    _write_preflight(guard_root, provisioned_count=4)
+    monkeypatch.setattr(
+        deploy_guard,
+        "_activation_config",
+        lambda _request: config,
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_build_activation_coordinator",
+        lambda _config: (coordinator, None),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "verify_interactive_task_identity",
+        lambda _user: None,
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_fleet_postconditions",
+        lambda *_args, **_kwargs: (4, 2),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_activation_schedule_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_convergence_attempt",
+        lambda _config, request: (
+            guard_root / "state" / "rotated-fpm-attempt.json",
+            {
+                **deploy_guard._binding(request),
+                "nonce": request["nonce"],
+                "status": "running",
+                "scheduled_local_date": "2026-08-28",
+                "started_at_unix_ms": 1,
+                "finished_at_unix_ms": None,
+                "attempts": 1,
+                "failure_code": None,
+                "failure_detail": None,
+            },
+        ),
+    )
+
+    request = _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+    if expected_error is not None:
+        with pytest.raises(deploy_guard.DeployGuardError, match=expected_error):
+            deploy_guard._converge(request)
+    else:
+        result = deploy_guard._converge(request)
+        assert result["release_id"] == "f" * 64
+
+
+def test_converge_preserves_the_original_guard_failure_code(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(guard_root)
+    target = SimpleNamespace(release_id="f" * 64)
+    writes: list[dict[str, object]] = []
+    coordinator = SimpleNamespace(
+        _current_release=lambda: target,
+        _canaries=lambda _target: (
+            SimpleNamespace(connection_id=FPM_CONNECTION_ID),
+        ),
+        run_once=lambda _stop: (_ for _ in ()).throw(
+            deploy_guard.DeployGuardError("fleet_release_mismatch")
+        ),
+    )
+    _write_preflight(guard_root, provisioned_count=4)
+    monkeypatch.setattr(deploy_guard, "_activation_config", lambda _request: config)
+    monkeypatch.setattr(
+        deploy_guard, "_build_activation_coordinator", lambda _config: (coordinator, None)
+    )
+    monkeypatch.setattr(deploy_guard, "verify_interactive_task_identity", lambda _user: None)
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_activation_schedule_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_system_record",
+        lambda _path, record: writes.append(record),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_convergence_attempt",
+        lambda _config, request: (
+            guard_root / "state" / "failed-attempt.json",
+            {
+                **deploy_guard._binding(request),
+                "nonce": request["nonce"],
+                "status": "running",
+                "scheduled_local_date": "2026-08-28",
+                "started_at_unix_ms": 1,
+                "finished_at_unix_ms": None,
+                "attempts": 1,
+                "failure_code": None,
+                "failure_detail": None,
+            },
+        ),
+    )
+
+    with pytest.raises(deploy_guard.DeployGuardError, match="fleet_release_mismatch"):
+        deploy_guard._converge(
+            _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+        )
+
+    assert writes[-1]["failure_code"] == "fleet_release_mismatch"
 
 
 @pytest.mark.parametrize(

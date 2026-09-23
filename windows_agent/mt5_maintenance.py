@@ -416,13 +416,46 @@ class Mt5MaintenanceCoordinator:
                 raise Mt5MaintenanceError(
                     "MT5 canary recovery cursor is unavailable"
                 ) from exc
+            # A probe may be requested directly by the deployment guard before
+            # this instance has been rotated to the current golden release.
+            # Resume always installs its supplied Bridge, so using the golden
+            # binary here would mutate the instance outside the rotation
+            # transaction and leave its sealed code manifest stale.  Prove the
+            # existing instance release first, then restart it with its own
+            # sealed Bridge.  Fleet rotation remains the only path that moves
+            # an instance to a new Bridge/release.
+            state = read_json(canary.root / "state" / "instance.json", {})
+            if (
+                state.get("connection_id") != canary.connection_id
+                or state.get("status") != "provisioned"
+            ):
+                raise Mt5MaintenanceError("MT5 canary release integrity is invalid")
+            bridge = (
+                canary.root
+                / "terminal"
+                / "MQL5"
+                / "Experts"
+                / "TradeJournal"
+                / "TradeJournalBridge.ex5"
+            )
+            try:
+                Mt5InstanceRotator._validate_terminal_against_state(
+                    canary.root / "terminal",
+                    state,
+                )
+            except Mt5InstanceRotationError as exc:
+                raise Mt5MaintenanceError(
+                    "MT5 canary release integrity is invalid"
+                ) from exc
+            if not bridge.is_file():
+                raise Mt5MaintenanceError("MT5 canary bridge is unavailable")
             try:
                 if not runtime.stop():
                     raise Mt5MaintenanceError("MT5 canary stop failed")
                 status = runtime.resume(
                     login=canary.login,
                     server=canary.server,
-                    expert_binary=self.expert_binary,
+                    expert_binary=bridge,
                     history_mode="new_only",
                     history_from=recovery_from,
                 )

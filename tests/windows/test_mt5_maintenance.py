@@ -352,6 +352,16 @@ def _fixture(tmp_path: Path, servers: tuple[str, ...] = ("Broker-A",)):
         (root / "terminal").mkdir()
         instance_terminal = root / "terminal" / "terminal64.exe"
         instance_terminal.write_bytes(b"instance")
+        bridge = (
+            root
+            / "terminal"
+            / "MQL5"
+            / "Experts"
+            / "TradeJournal"
+            / "TradeJournalBridge.ex5"
+        )
+        bridge.parent.mkdir(parents=True)
+        bridge.write_bytes(b"instance-bridge")
         terminal_sha256 = InstanceProvisioner._sha256(instance_terminal)
         code_manifest_sha256 = InstanceProvisioner._code_manifest(
             instance_terminal.parent
@@ -1509,11 +1519,53 @@ def test_probe_installs_a_stop_event_cancellation_check(tmp_path: Path) -> None:
     coordinator.run_once(stop_event)
 
     assert len(runtime.cancel_checks) == 1
+    assert runtime.resume_calls[0]["expert_binary"] == (
+        instances
+        / _ids[0]
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
     stop_event.set()
     cancel_check = runtime.cancel_checks[0]
     assert callable(cancel_check)
     with pytest.raises(Mt5MaintenanceError, match="was interrupted"):
         cancel_check()
+
+
+def test_probe_rejects_a_bridge_that_no_longer_matches_its_sealed_release(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(tmp_path)
+    runtime = RuntimeController()
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        FakePool(),
+    )
+    bridge = (
+        instances
+        / ids[0]
+        / "terminal"
+        / "MQL5"
+        / "Experts"
+        / "TradeJournal"
+        / "TradeJournalBridge.ex5"
+    )
+    bridge.write_bytes(b"tampered-bridge")
+    canary = coordinator._exact_canary(ids[0], "Broker-A")
+
+    with pytest.raises(Mt5MaintenanceError, match="release integrity is invalid"):
+        coordinator._probe(canary, Event())
+
+    assert runtime.stop_calls == 0
+    assert runtime.resume_calls == []
 
 
 def test_failed_probe_rebases_canary_to_current_golden_and_aborts_cascade(
