@@ -60,6 +60,18 @@ class TradingIngestionSink:
     def pending_transition_count(self) -> int:
         return self._transition_outbox.pending_count()
 
+    def transition_delivery_confirmed(self) -> bool:
+        """Whether every durable transition has reached the ingestion endpoint.
+
+        A permanent rejection moves an item out of ``pending`` into the
+        dead-letter ledger.  It is therefore not an acknowledgement and must
+        never advance the local connection-state checkpoint.
+        """
+        return (
+            self._transition_outbox.pending_count() == 0
+            and self._transition_outbox.dead_letter_count() == 0
+        )
+
     def send_connection_transition(
         self,
         connection_id: str,

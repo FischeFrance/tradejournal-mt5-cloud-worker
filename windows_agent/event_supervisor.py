@@ -61,6 +61,13 @@ class Mt5EventSupervisor:
         self.secrets = WindowsSecretStore(secrets_root)
         self.ingestion_url = ingestion_url
         self._pending: set[str] = set()
+        # A persisted connection-state.json records what the previous service instance
+        # already delivered.  It must not suppress the first *verified* state report
+        # after this supervisor starts: a terminal maintenance job can fail after the
+        # bridge has recovered and leave the remote row stale until a real transition.
+        # This set is deliberately process-local, so it causes one reassertion per
+        # supervisor start rather than a second heartbeat loop.
+        self._startup_reassertions: set[str] = set()
         self._condition = threading.Condition()
         self._retry_failures: dict[str, int] = {}
         self._retry_after: dict[str, float] = {}
@@ -134,11 +141,21 @@ class Mt5EventSupervisor:
         state_path = root / "state" / "connection-state.json"
         previous = read_json(state_path, {})
         pending_state = previous.get("pending")
-        if isinstance(pending_state, dict) and flush_result is not None and flush_result.pending == 0:
+        if (
+            isinstance(pending_state, dict)
+            and flush_result is not None
+            and sink.transition_delivery_confirmed()
+        ):
             atomic_json(state_path, pending_state)
             previous = pending_state
             pending_state = None
-        if not isinstance(pending_state, dict) and previous.get("connected") != state["connected"]:
+            # The persisted pending state was acknowledged during this service
+            # lifetime, so it already constitutes the required startup reassertion.
+            self._startup_reassertions.discard(connection_id)
+        should_reassert = connection_id in self._startup_reassertions
+        if not isinstance(pending_state, dict) and (
+            previous.get("connected") != state["connected"] or should_reassert
+        ):
             atomic_json(state_path, {**previous, "pending": state})
             snapshot = adapter.account_snapshot() if state["connected"] else None
             result = sink.send_connection_transition(
@@ -147,8 +164,9 @@ class Mt5EventSupervisor:
                 state["connected"],
                 snapshot,
             )
-            if result.pending == 0:
+            if sink.transition_delivery_confirmed():
                 atomic_json(state_path, state)
+                self._startup_reassertions.discard(connection_id)
 
         pending_count = sink.pending_transition_count()
         if pending_count:
@@ -159,7 +177,7 @@ class Mt5EventSupervisor:
             self._retry_failures.pop(connection_id, None)
             self._retry_after.pop(connection_id, None)
 
-    def _discover(self) -> None:
+    def _discover(self, *, reassert: bool = False) -> None:
         if not self.instances_root.exists():
             return
         for path in self.instances_root.iterdir():
@@ -172,6 +190,8 @@ class Mt5EventSupervisor:
                 required = ("mt5_login", "mt5_server", "bridge_token")
                 if all((secret_root / f"{name}.dpapi").is_file() for name in required):
                     self._pending.add(connection_id)
+                    if reassert:
+                        self._startup_reassertions.add(connection_id)
 
     def run(
         self,
@@ -188,7 +208,7 @@ class Mt5EventSupervisor:
             if not observer.is_alive():
                 raise RuntimeError("MT5 event observer failed to start")
             with self._condition:
-                self._discover()
+                self._discover(reassert=True)
                 self._condition.notify()
             if ready_event is not None:
                 ready_event.set()

@@ -49,6 +49,7 @@ class FakeSink:
         self.transitions = []
         self.flushes = 0
         self.pending = 0
+        self.confirmed = True
 
     def __call__(self, payload):
         self.events.append(payload)
@@ -60,13 +61,16 @@ class FakeSink:
     def pending_transition_count(self):
         return self.pending
 
+    def transition_delivery_confirmed(self):
+        return self.confirmed and self.pending == 0
+
     def enqueue_many(self, payloads):
         self.events.extend(payloads)
         return SimpleNamespace(pending=self.pending)
 
     def send_connection_transition(self, *args):
         self.transitions.append(args)
-        return SimpleNamespace(pending=0)
+        return SimpleNamespace(pending=self.pending)
 
 
 def test_event_marker_wakes_one_snapshot_diff_and_status_is_sent_only_on_change(tmp_path):
@@ -138,6 +142,72 @@ def test_failed_transition_is_not_resent_on_every_local_heartbeat(tmp_path):
 
     assert len(sink.transitions) == 1
     assert sink.flushes == 1
+
+
+def test_startup_reasserts_a_verified_connected_state_even_when_it_is_persisted(tmp_path):
+    connection_id = str(uuid4())
+    root = tmp_path / "instances" / connection_id
+    files_dir = root / "terminal" / "MQL5" / "Files" / "TradeJournal"
+    files_dir.mkdir(parents=True)
+    sink = FakeSink()
+    adapter = FakeAdapter(files_dir)
+    atomic_json(root / "state" / "connection-state.json", adapter.connection_state())
+    supervisor = Mt5EventSupervisor(tmp_path / "instances", tmp_path / "secrets", "https://example.invalid")
+    supervisor._components = lambda _cid: (root, adapter, sink)  # type: ignore[method-assign]
+    supervisor._startup_reassertions.add(connection_id)
+
+    supervisor._process(connection_id)
+
+    assert len(sink.transitions) == 1
+    assert sink.transitions[0][2] is True
+    assert sink.transitions[0][3] == adapter.account_snapshot()
+    assert connection_id not in supervisor._startup_reassertions
+    assert (root / "state" / "connection-state.json").exists()
+
+
+def test_startup_reassertion_waits_for_durable_acknowledgement(tmp_path):
+    connection_id = str(uuid4())
+    root = tmp_path / "instances" / connection_id
+    files_dir = root / "terminal" / "MQL5" / "Files" / "TradeJournal"
+    files_dir.mkdir(parents=True)
+    sink = FakeSink()
+    sink.pending = 1
+    adapter = FakeAdapter(files_dir)
+    atomic_json(root / "state" / "connection-state.json", adapter.connection_state())
+    supervisor = Mt5EventSupervisor(tmp_path / "instances", tmp_path / "secrets", "https://example.invalid")
+    supervisor._components = lambda _cid: (root, adapter, sink)  # type: ignore[method-assign]
+    supervisor._startup_reassertions.add(connection_id)
+
+    supervisor._process(connection_id)
+    assert len(sink.transitions) == 1
+    assert connection_id in supervisor._startup_reassertions
+
+    sink.pending = 0
+    supervisor._retry_after[connection_id] = 0
+    supervisor._process(connection_id)
+
+    assert len(sink.transitions) == 1
+    assert connection_id not in supervisor._startup_reassertions
+
+
+def test_startup_reassertion_does_not_treat_a_dead_letter_as_delivery(tmp_path):
+    connection_id = str(uuid4())
+    root = tmp_path / "instances" / connection_id
+    files_dir = root / "terminal" / "MQL5" / "Files" / "TradeJournal"
+    files_dir.mkdir(parents=True)
+    sink = FakeSink()
+    sink.confirmed = False
+    adapter = FakeAdapter(files_dir)
+    atomic_json(root / "state" / "connection-state.json", adapter.connection_state())
+    supervisor = Mt5EventSupervisor(tmp_path / "instances", tmp_path / "secrets", "https://example.invalid")
+    supervisor._components = lambda _cid: (root, adapter, sink)  # type: ignore[method-assign]
+    supervisor._startup_reassertions.add(connection_id)
+
+    supervisor._process(connection_id)
+    supervisor._process(connection_id)
+
+    assert len(sink.transitions) == 1
+    assert connection_id in supervisor._startup_reassertions
 
 
 def test_run_fails_fast_when_observer_dies_after_readiness(
