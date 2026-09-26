@@ -259,6 +259,16 @@ release richiesta. La convergenza può occupare gran parte della finestra perch�
 istanze vengono verificati in modo conservativo; un timeout di trasporto non autorizza mai l'avvio
 del nuovo servizio senza il record di convergenza.
 
+Per il solo triage di un rollout, un amministratore può leggere
+`C:\TradeJournal\state\deployment-diagnostics\convergence.json`. Il documento contiene
+esclusivamente `deployment_id`, `source_revision`, `status`, `attempts` e `failure_code`: non
+contiene `failure_detail`, environment, percorsi, account o segreti. Il suo DACL concede scrittura
+solo a `LocalSystem` e lettura agli `Administrators`; è una proiezione diagnostica non
+autorevole, mai letta dal gate. I record sotto `C:\TradeJournal\state\deploy-guard` restano invece
+SYSTEM-only e sono l'unica evidenza usata per autorizzare la barriera e l'avvio del servizio.
+`attempts` vale `0` soltanto quando il comando `converge` è fallito prima di iniziare una passata
+di convergenza; non equivale a una flotta parzialmente verificata.
+
 Subito dopo la convergenza e prima del primo avvio, il deploy aggiorna anche il valore pywin32
 `PythonClass`, che contiene il percorso assoluto del wrapper Windows nella release immutabile.
 Aggiornare soltanto `PYTHONPATH` o la junction non basta: il wrapper precedente non potrebbe

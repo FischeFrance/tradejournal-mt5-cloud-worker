@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import shutil
@@ -92,7 +92,9 @@ class WindowsSecretStore:
         # Services running as LocalSystem do not have a SAM-compatible user name that can be
         # resolved with LookupAccountName.  The access token always contains the effective SID,
         # so use it directly and keep the DPAPI blob readable only by the identity that wrote it.
-        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+        )
         try:
             sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
         finally:
@@ -129,8 +131,7 @@ class WindowsSecretStore:
         descriptor = win32security.SECURITY_DESCRIPTOR()
         acl = win32security.ACL()
         inheritance = (
-            win32security.OBJECT_INHERIT_ACE
-            | win32security.CONTAINER_INHERIT_ACE
+            win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
             if path.is_dir()
             else 0
         )
@@ -141,6 +142,58 @@ class WindowsSecretStore:
                 win32con.GENERIC_ALL,
                 sid,
             )
+        descriptor.SetSecurityDescriptorDacl(1, acl, 0)
+        win32security.SetFileSecurity(
+            str(path),
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+
+    @staticmethod
+    def restrict_system_write_administrators_read_acl(path: Path) -> None:
+        """Let Administrators inspect a diagnostic without making it guard input.
+
+        The deployment guard's authoritative records remain SYSTEM-only.  A
+        deliberately separate diagnostic may be read by Administrators, but
+        only LocalSystem receives write/delete-capable rights through this
+        DACL.  Directory access includes traversal/listing so the projection
+        can be opened without granting mutation rights to its contents.
+        """
+        if os.name != "nt":
+            return
+
+        import win32con
+        import win32security
+
+        system_sid = win32security.CreateWellKnownSid(
+            win32security.WinLocalSystemSid, None
+        )
+        administrators_sid = win32security.CreateWellKnownSid(
+            win32security.WinBuiltinAdministratorsSid, None
+        )
+        descriptor = win32security.SECURITY_DESCRIPTOR()
+        acl = win32security.ACL()
+        inheritance = (
+            win32security.OBJECT_INHERIT_ACE | win32security.CONTAINER_INHERIT_ACE
+            if path.is_dir()
+            else 0
+        )
+        acl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION_DS,
+            inheritance,
+            win32con.GENERIC_ALL,
+            system_sid,
+        )
+        administrator_access = win32con.GENERIC_READ
+        if path.is_dir():
+            administrator_access |= win32con.GENERIC_EXECUTE
+        acl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION_DS,
+            inheritance,
+            administrator_access,
+            administrators_sid,
+        )
         descriptor.SetSecurityDescriptorDacl(1, acl, 0)
         win32security.SetFileSecurity(
             str(path),

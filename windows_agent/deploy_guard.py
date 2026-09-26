@@ -84,6 +84,11 @@ STATE_ROOT = TRADEJOURNAL_ROOT / "state" / "deploy-guard"
 REQUEST_PATH = TRADEJOURNAL_ROOT / "state" / "deploy-guard-request.json"
 RESULT_PATH = TRADEJOURNAL_ROOT / "state" / "deploy-guard-result.json"
 AGENT_READINESS_PATH = TRADEJOURNAL_ROOT / "state" / "agent-readiness.json"
+# This is intentionally outside STATE_ROOT.  STATE_ROOT contains authoritative
+# guard evidence and remains SYSTEM-only; this small projection is readable by
+# Administrators for recovery diagnostics only.
+CONVERGENCE_OUTCOME_ROOT = TRADEJOURNAL_ROOT / "state" / "deployment-diagnostics"
+CONVERGENCE_OUTCOME_PATH = CONVERGENCE_OUTCOME_ROOT / "convergence.json"
 # Public name consumed by the Windows service.  Keep the shorter alias for
 # compatibility with early deployment-script drafts, but use this canonical
 # name at the service boundary.
@@ -92,6 +97,7 @@ SERVICE_REGISTRY_PATH = r"SYSTEM\CurrentControlSet\Services\TradeJournalMT5Agent
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
+_FAILURE_CODE = re.compile(r"[a-z0-9_]{1,80}")
 _ACTIONS = frozenset(
     {
         "preflight",
@@ -139,9 +145,7 @@ _PAYLOAD_FIELDS = {
     "barrier_status": frozenset(),
     "converge": frozenset({"fpm_connection_id"}),
     "restore": frozenset(),
-    "verify_active": frozenset(
-        {"fpm_connection_id", "max_heartbeat_age_seconds"}
-    ),
+    "verify_active": frozenset({"fpm_connection_id", "max_heartbeat_age_seconds"}),
 }
 
 
@@ -203,9 +207,9 @@ def _sha256_file(path: Path, code: str) -> str:
 
 
 def _json_bytes(document: Mapping[str, Any]) -> bytes:
-    return (
-        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
+    return (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
 
 
 def _restrict_shared(path: Path) -> None:
@@ -329,9 +333,7 @@ def _assert_request_acl(path: Path) -> None:
         if dacl is None:
             raise DeployGuardError("request_acl_invalid")
         allowed_sids = (
-            win32security.CreateWellKnownSid(
-                win32security.WinLocalSystemSid, None
-            ),
+            win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None),
             win32security.CreateWellKnownSid(
                 win32security.WinBuiltinAdministratorsSid, None
             ),
@@ -374,9 +376,7 @@ def _load_request() -> dict[str, Any]:
     if not isinstance(action, str) or action not in _ACTIONS:
         raise DeployGuardError("request_invalid")
     value["nonce"] = _uuid4(value.get("nonce"), "request_nonce_invalid")
-    value["deployment_id"] = _uuid4(
-        value.get("deployment_id"), "deployment_id_invalid"
-    )
+    value["deployment_id"] = _uuid4(value.get("deployment_id"), "deployment_id_invalid")
     revision = value.get("source_revision")
     if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
         raise DeployGuardError("source_revision_invalid")
@@ -600,8 +600,7 @@ def _assert_maintenance_policy(config: AgentRuntimeConfig) -> None:
         or scheduled.hour != REQUIRED_MAINTENANCE_HOUR
         or scheduled.minute != REQUIRED_MAINTENANCE_MINUTE
         or scheduled.second != 0
-        or config.mt5_maintenance_grace_minutes
-        != REQUIRED_MAINTENANCE_GRACE_MINUTES
+        or config.mt5_maintenance_grace_minutes != REQUIRED_MAINTENANCE_GRACE_MINUTES
     ):
         raise DeployGuardError("maintenance_policy_invalid")
 
@@ -631,7 +630,10 @@ def _iter_terminal_processes(config: AgentRuntimeConfig) -> list[tuple[int, Path
                 if not isinstance(executable_raw, str) or not executable_raw:
                     raise DeployGuardError("mt5_process_probe_failed")
                 executable = Path(executable_raw)
-                if name != "terminal64.exe" or "liveupdate" in executable_raw.casefold():
+                if (
+                    name != "terminal64.exe"
+                    or "liveupdate" in executable_raw.casefold()
+                ):
                     raise DeployGuardError("mt5_update_process_running")
                 relative = os.path.relpath(_path_text(executable), instances)
                 parts = Path(relative).parts
@@ -704,7 +706,9 @@ def _binding(request: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _assert_record_binding(record: Mapping[str, Any], request: Mapping[str, Any]) -> None:
+def _assert_record_binding(
+    record: Mapping[str, Any], request: Mapping[str, Any]
+) -> None:
     if any(record.get(name) != value for name, value in _binding(request).items()):
         raise DeployGuardError("deployment_binding_mismatch")
 
@@ -831,6 +835,16 @@ _CONVERGE_ATTEMPT_FIELDS = frozenset(
         "failure_detail",
     }
 )
+_CONVERGENCE_OUTCOME_FIELDS = frozenset(
+    {
+        "deployment_id",
+        "source_revision",
+        "status",
+        "attempts",
+        "failure_code",
+    }
+)
+_CONVERGENCE_OUTCOME_STATUSES = frozenset({"running", "completed", "failed"})
 
 
 def _snapshot_digest(
@@ -851,7 +865,9 @@ def _provisioned_instance_count(config: AgentRuntimeConfig) -> int:
     if not config.instances_root.exists():
         return 0
     try:
-        for child in sorted(config.instances_root.iterdir(), key=lambda item: item.name):
+        for child in sorted(
+            config.instances_root.iterdir(), key=lambda item: item.name
+        ):
             try:
                 canonical_uuid(child.name)
             except ValueError:
@@ -905,15 +921,11 @@ def _preflight(request: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             raise DeployGuardError("current_release_invalid") from exc
     try:
-        old_expert_sha256 = _sha256_file(
-            GOLDEN_EXPERT_PATH, "golden_expert_invalid"
-        )
+        old_expert_sha256 = _sha256_file(GOLDEN_EXPERT_PATH, "golden_expert_invalid")
         if GOLDEN_MARKER_PATH.exists() and not GOLDEN_MARKER_PATH.is_file():
             raise OSError
         marker = (
-            GOLDEN_MARKER_PATH.read_bytes()
-            if GOLDEN_MARKER_PATH.is_file()
-            else None
+            GOLDEN_MARKER_PATH.read_bytes() if GOLDEN_MARKER_PATH.is_file() else None
         )
         old_environment = _get_service_environment()
     except OSError as exc:
@@ -971,7 +983,9 @@ def _snapshot(request: dict[str, Any]) -> dict[str, Any]:
         bridge = GOLDEN_EXPERT_PATH.read_bytes()
         if GOLDEN_MARKER_PATH.exists() and not GOLDEN_MARKER_PATH.is_file():
             raise OSError
-        marker = GOLDEN_MARKER_PATH.read_bytes() if GOLDEN_MARKER_PATH.is_file() else None
+        marker = (
+            GOLDEN_MARKER_PATH.read_bytes() if GOLDEN_MARKER_PATH.is_file() else None
+        )
     except OSError as exc:
         raise DeployGuardError("golden_snapshot_failed") from exc
     if not bridge:
@@ -1022,21 +1036,23 @@ def _snapshot(request: dict[str, Any]) -> dict[str, Any]:
     return {"snapshot_sha256": digest}
 
 
-def _load_snapshot(request: Mapping[str, Any]) -> tuple[dict[str, Any], bytes, bytes | None]:
+def _load_snapshot(
+    request: Mapping[str, Any],
+) -> tuple[dict[str, Any], bytes, bytes | None]:
     record = _read_deployment_record(request, "snapshot", _SNAPSHOT_FIELDS)
     root = _deployment_root(request["deployment_id"])
     try:
         bridge = (root / "bridge.bin").read_bytes()
-        marker = (root / "marker.bin").read_bytes() if record["marker_present"] else None
+        marker = (
+            (root / "marker.bin").read_bytes() if record["marker_present"] else None
+        )
     except OSError as exc:
         raise DeployGuardError("snapshot_integrity_invalid") from exc
     if (
         not bridge
         or _sha256_bytes(bridge) != record["bridge_sha256"]
         or (marker is None) != (not record["marker_present"])
-        or (
-            marker is not None and _sha256_bytes(marker) != record["marker_sha256"]
-        )
+        or (marker is not None and _sha256_bytes(marker) != record["marker_sha256"])
         or _snapshot_digest(
             bridge, marker, record["environment"], record["current_target"]
         )
@@ -1060,9 +1076,10 @@ def _switch(request: dict[str, Any]) -> dict[str, Any]:
         payload.get("previous_expert_sha256"), "previous_expert_digest_invalid"
     )
     next_digest = _digest(payload.get("new_expert_sha256"), "new_expert_digest_invalid")
-    if next_digest != config.expert_sha256 or _sha256_file(
-        new_expert, "new_expert_invalid"
-    ) != next_digest:
+    if (
+        next_digest != config.expert_sha256
+        or _sha256_file(new_expert, "new_expert_invalid") != next_digest
+    ):
         raise DeployGuardError("new_expert_digest_mismatch")
     if (
         preflight.get("new_expert_sha256") != next_digest
@@ -1187,7 +1204,9 @@ def _arm_activation_window(
     )
 
 
-def _assert_switch_intact(request: Mapping[str, Any]) -> tuple[AgentRuntimeConfig, dict[str, Any]]:
+def _assert_switch_intact(
+    request: Mapping[str, Any],
+) -> tuple[AgentRuntimeConfig, dict[str, Any]]:
     """Re-prove every byte selected by switch immediately before the PONR."""
 
     switch = _read_deployment_record(request, "switch", _SWITCH_FIELDS)
@@ -1212,7 +1231,9 @@ def _assert_switch_intact(request: Mapping[str, Any]) -> tuple[AgentRuntimeConfi
         _assert_maintenance_policy(config)
         manager = Mt5TemplateManager(config.source_terminal, config.terminal_sha256)
         manager.validate_current_quiesced()
-        code_manifest = InstanceProvisioner._code_manifest(config.source_terminal.parent)
+        code_manifest = InstanceProvisioner._code_manifest(
+            config.source_terminal.parent
+        )
         verify_release(expected_release)
     except DeployGuardError:
         raise
@@ -1278,9 +1299,7 @@ def _arm(request: dict[str, Any]) -> dict[str, Any]:
     immediate = request["payload"].get("operator_approved_immediate", False)
     if not isinstance(immediate, bool):
         raise DeployGuardError("immediate_activation_approval_invalid")
-    start, end, activation_mode = _arm_activation_window(
-        config, immediate=immediate
-    )
+    start, end, activation_mode = _arm_activation_window(config, immediate=immediate)
     now_ms = int(time.time() * 1000)
     record = {
         **_binding(request),
@@ -1309,9 +1328,7 @@ def _barrier(request: dict[str, Any]) -> dict[str, Any]:
     if barrier_path.exists():
         record = _read_deployment_record(request, "barrier", _BARRIER_FIELDS)
         return {
-            "activation_started_at_unix_ms": record[
-                "activation_started_at_unix_ms"
-            ]
+            "activation_started_at_unix_ms": record["activation_started_at_unix_ms"]
         }
     now_ms = int(time.time() * 1000)
     if not arm["window_started_at_unix_ms"] <= now_ms <= arm["window_ends_at_unix_ms"]:
@@ -1353,9 +1370,7 @@ def _barrier_status(request: dict[str, Any]) -> dict[str, Any]:
     record = _barrier_for_request(request)
     return {
         "activation_barrier_crossed": True,
-        "activation_started_at_unix_ms": record[
-            "activation_started_at_unix_ms"
-        ],
+        "activation_started_at_unix_ms": record["activation_started_at_unix_ms"],
     }
 
 
@@ -1392,9 +1407,8 @@ def _activation_config(request: Mapping[str, Any]) -> AgentRuntimeConfig:
             raise DeployGuardError("immediate_activation_window_expired")
     else:
         raise DeployGuardError("activation_mode_invalid")
-    if (
-        _path_text(_current_target())
-        != _path_text(RELEASE_ROOT / f"agent-{request['source_revision'][:12]}")
+    if _path_text(_current_target()) != _path_text(
+        RELEASE_ROOT / f"agent-{request['source_revision'][:12]}"
     ):
         raise DeployGuardError("active_release_mismatch")
     return config
@@ -1511,10 +1525,128 @@ def _write_activation_schedule_state(
         raise DeployGuardError("maintenance_schedule_state_write_failed") from exc
 
 
-def _write_system_record(path: Path, document: Mapping[str, Any]) -> None:
-    _atomic_bytes(path, _json_bytes(document))
+def _restrict_system_record(path: Path) -> None:
     if os.name == "nt":
         WindowsSecretStore.restrict_acl(path)
+
+
+def _write_system_record(path: Path, document: Mapping[str, Any]) -> None:
+    _atomic_bytes(path, _json_bytes(document))
+    _restrict_system_record(path)
+
+
+def _restrict_administrator_diagnostic(path: Path) -> None:
+    if os.name == "nt":
+        WindowsSecretStore.restrict_system_write_administrators_read_acl(path)
+
+
+def _write_administrator_diagnostic(path: Path, document: Mapping[str, Any]) -> None:
+    """Atomically publish a non-authoritative, Administrator-readable record.
+
+    This deliberately does not reuse _atomic_bytes(): shared service state
+    grants Administrators full control, while this projection is SYSTEM-write
+    and Administrator-read.  Guard decisions never consume this path.
+    """
+    root = path.parent
+    temporary = root / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        if root.exists():
+            if InstanceProvisioner._is_reparse_point(root) or not root.is_dir():
+                raise OSError
+        else:
+            root.mkdir(parents=True, exist_ok=False)
+        _restrict_administrator_diagnostic(root)
+        if path.exists() and (
+            InstanceProvisioner._is_reparse_point(path) or not path.is_file()
+        ):
+            raise OSError
+        if temporary.exists():
+            raise OSError
+        payload = _json_bytes(document)
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _restrict_administrator_diagnostic(temporary)
+        durable_replace(temporary, path)
+        _restrict_administrator_diagnostic(path)
+        fsync_directory(root)
+    except OSError as exc:
+        raise DeployGuardError("deployment_diagnostic_write_failed") from exc
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _convergence_outcome(
+    request: Mapping[str, Any],
+    *,
+    status: str,
+    attempts: object,
+    failure_code: object,
+) -> dict[str, Any]:
+    """Return the only data allowed to cross the SYSTEM diagnostic boundary."""
+    deployment_id = _uuid4(
+        request.get("deployment_id"), "deployment_diagnostic_invalid"
+    )
+    source_revision = request.get("source_revision")
+    if (
+        not isinstance(source_revision, str)
+        or _REVISION.fullmatch(source_revision) is None
+    ):
+        raise DeployGuardError("deployment_diagnostic_invalid")
+    if status not in _CONVERGENCE_OUTCOME_STATUSES:
+        raise DeployGuardError("deployment_diagnostic_invalid")
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or not 0 <= attempts < 3
+    ):
+        raise DeployGuardError("deployment_diagnostic_invalid")
+    if status == "failed":
+        if (
+            not isinstance(failure_code, str)
+            or _FAILURE_CODE.fullmatch(failure_code) is None
+        ):
+            raise DeployGuardError("deployment_diagnostic_invalid")
+    elif failure_code is not None:
+        raise DeployGuardError("deployment_diagnostic_invalid")
+    outcome = {
+        "deployment_id": deployment_id,
+        "source_revision": source_revision,
+        "status": status,
+        "attempts": attempts,
+        "failure_code": failure_code,
+    }
+    if set(outcome) != _CONVERGENCE_OUTCOME_FIELDS:
+        raise DeployGuardError("deployment_diagnostic_invalid")
+    return outcome
+
+
+def _publish_convergence_outcome(
+    request: Mapping[str, Any],
+    *,
+    status: str,
+    attempts: object,
+    failure_code: object,
+) -> None:
+    """Best-effort observability which cannot alter a guarded deployment."""
+    try:
+        _write_administrator_diagnostic(
+            CONVERGENCE_OUTCOME_PATH,
+            _convergence_outcome(
+                request,
+                status=status,
+                attempts=attempts,
+                failure_code=failure_code,
+            ),
+        )
+    except Exception:
+        # A diagnostic projection is never proof for activation and must not
+        # turn a completed SYSTEM convergence into a failed deployment.
+        return
 
 
 def _convergence_attempt(
@@ -1585,11 +1717,23 @@ def _convergence_attempt(
             "failure_detail": None,
         }
         _write_system_record(path, record)
+        _publish_convergence_outcome(
+            request,
+            status="running",
+            attempts=record["attempts"],
+            failure_code=None,
+        )
         return path, record
     try:
         _exclusive_json(path, record, system_only=True)
     except FileExistsError as exc:
         raise DeployGuardError("deployment_convergence_retry_deferred") from exc
+    _publish_convergence_outcome(
+        request,
+        status="running",
+        attempts=record["attempts"],
+        failure_code=None,
+    )
     return path, record
 
 
@@ -1676,6 +1820,44 @@ def _fleet_postconditions(
 
 
 def _converge(request: dict[str, Any]) -> dict[str, Any]:
+    """Publish a diagnostic outcome without making it part of guard control."""
+    outcome_attempts = {"count": 0}
+    _publish_convergence_outcome(
+        request,
+        status="running",
+        attempts=outcome_attempts["count"],
+        failure_code=None,
+    )
+    try:
+        result = _converge_guarded(request, outcome_attempts)
+    except DeployGuardError as exc:
+        _publish_convergence_outcome(
+            request,
+            status="failed",
+            attempts=outcome_attempts["count"],
+            failure_code=exc.code,
+        )
+        raise
+    except Exception:
+        _publish_convergence_outcome(
+            request,
+            status="failed",
+            attempts=outcome_attempts["count"],
+            failure_code="deployment_convergence_failed",
+        )
+        raise
+    _publish_convergence_outcome(
+        request,
+        status="completed",
+        attempts=outcome_attempts["count"],
+        failure_code=None,
+    )
+    return result
+
+
+def _converge_guarded(
+    request: dict[str, Any], outcome_attempts: dict[str, int]
+) -> dict[str, Any]:
     """Run one barrier-bound MT5 pass regardless of daily scheduler state."""
 
     _assert_service_stopped()
@@ -1723,6 +1905,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
             "fpm_connection_id": fpm,
         }
     attempt_path, attempt = _convergence_attempt(config, request)
+    outcome_attempts["count"] = int(attempt["attempts"])
     try:
         verify_interactive_task_identity(config.mt5_interactive_user)
         coordinator, pool = _build_activation_coordinator(config)
@@ -1740,10 +1923,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
                 server = _required_recovery_server(
                     coordinator.secrets.read(fpm, "mt5_server")
                 )
-                if (
-                    state.get("status") != "provisioned"
-                    or login <= 0
-                ):
+                if state.get("status") != "provisioned" or login <= 0:
                     raise ValueError
                 # _probe is the exact restart/login/heartbeat/read-only gate
                 # used by run_once.  Probe this requested connection explicitly
@@ -1808,9 +1988,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
         raise
     except Exception as exc:
         failure_detail = (
-            str(exc)[:200]
-            if isinstance(exc, Mt5MaintenanceError)
-            else None
+            str(exc)[:200] if isinstance(exc, Mt5MaintenanceError) else None
         )
         try:
             _write_system_record(
@@ -1894,15 +2072,14 @@ def _restore(request: dict[str, Any]) -> dict[str, Any]:
         _remove_current_target()
     # Re-read every restored byte.  This is deliberately independent of an
     # interactive user/session so a failed pre-barrier rollout is recoverable.
-    observed_marker = GOLDEN_MARKER_PATH.read_bytes() if GOLDEN_MARKER_PATH.is_file() else None
+    observed_marker = (
+        GOLDEN_MARKER_PATH.read_bytes() if GOLDEN_MARKER_PATH.is_file() else None
+    )
     if (
         GOLDEN_EXPERT_PATH.read_bytes() != bridge
         or observed_marker != marker
         or _get_service_environment() != snapshot["environment"]
-        or (
-            old_target is None
-            and _current_target_optional() is not None
-        )
+        or (old_target is None and _current_target_optional() is not None)
         or (
             old_target is not None
             and _path_text(_current_target()) != _path_text(old_target)
@@ -1975,10 +2152,7 @@ def assert_service_activation_allowed(
         or isinstance(convergence.get("pool_ready_count"), bool)
         or convergence["pool_ready_count"] < 0
         or not isinstance(convergence.get("fpm_connection_id"), str)
-        or (
-            convergence["fleet_count"] > 0
-            and not convergence["fpm_connection_id"]
-        )
+        or (convergence["fleet_count"] > 0 and not convergence["fpm_connection_id"])
     ):
         raise DeployGuardError("deployment_convergence_invalid")
     if convergence["fpm_connection_id"]:
@@ -1990,9 +2164,7 @@ def assert_service_activation_allowed(
         "schema_version": SCHEMA_VERSION,
         "source_revision": revision,
         "deployment_id": deployment_id,
-        "activation_started_at_unix_ms": record[
-            "activation_started_at_unix_ms"
-        ],
+        "activation_started_at_unix_ms": record["activation_started_at_unix_ms"],
     }
 
 
@@ -2005,7 +2177,11 @@ def _read_envelope(
             raise ValueError
         generated = value.get("generated_at")
         parsed = datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
-        parsed = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        parsed = (
+            parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None
+            else parsed.astimezone(timezone.utc)
+        )
         identity = value.get("account_identity")
         payload = value.get("payload")
         sequence = value.get("sequence")
@@ -2021,14 +2197,19 @@ def _read_envelope(
             or sequence <= 0
         ):
             raise ValueError
-        if str(value["server_identity"]).casefold() != str(identity["server"]).casefold():
+        if (
+            str(value["server_identity"]).casefold()
+            != str(identity["server"]).casefold()
+        ):
             raise ValueError
         return identity, payload, int(parsed.timestamp() * 1000), sequence
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise DeployGuardError(code) from exc
 
 
-def _validate_instance_release(root: Path, target: Mt5TemplateRelease) -> dict[str, Any]:
+def _validate_instance_release(
+    root: Path, target: Mt5TemplateRelease
+) -> dict[str, Any]:
     try:
         state = read_json(root / "state" / "instance.json")
         if not Mt5InstanceRotator._matches_target(root, state, target):
@@ -2053,9 +2234,7 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
     # service-specific registry overrides.  Bind directly to its strict request;
     # the service process itself uses assert_service_activation_allowed().
     barrier = _barrier_for_request(request)
-    convergence = _read_deployment_record(
-        request, "converge", _CONVERGE_FIELDS
-    )
+    convergence = _read_deployment_record(request, "converge", _CONVERGE_FIELDS)
     status, service_pid = _service_status()
     if status != "running" or service_pid <= 0:
         raise DeployGuardError("service_not_running")
@@ -2107,7 +2286,9 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
         config = load_runtime_config(environment)
         manager = Mt5TemplateManager(config.source_terminal, config.terminal_sha256)
         terminal_digest = manager.validate_current_quiesced()
-        target = Mt5TemplateRelease.from_template(config.source_terminal, terminal_digest)
+        target = Mt5TemplateRelease.from_template(
+            config.source_terminal, terminal_digest
+        )
     except Exception as exc:
         raise DeployGuardError("active_template_invalid") from exc
     expected_release = RELEASE_ROOT / f"agent-{request['source_revision'][:12]}"

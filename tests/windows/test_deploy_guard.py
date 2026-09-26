@@ -97,6 +97,13 @@ def guard_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(deploy_guard, "STATE_ROOT", root / "state" / "deploy-guard")
     monkeypatch.setattr(deploy_guard, "REQUEST_PATH", root / "state" / "request.json")
     monkeypatch.setattr(deploy_guard, "RESULT_PATH", root / "state" / "result.json")
+    diagnostics = root / "state" / "deployment-diagnostics"
+    monkeypatch.setattr(deploy_guard, "CONVERGENCE_OUTCOME_ROOT", diagnostics)
+    monkeypatch.setattr(
+        deploy_guard,
+        "CONVERGENCE_OUTCOME_PATH",
+        diagnostics / "convergence.json",
+    )
     readiness = root / "state" / "agent-readiness.json"
     monkeypatch.setattr(deploy_guard, "AGENT_READINESS_PATH", readiness)
     monkeypatch.setattr(deploy_guard, "SERVICE_READINESS_PATH", readiness)
@@ -209,7 +216,9 @@ def test_effective_environment_merges_machine_and_service_case_insensitively(
 def test_guard_hard_codes_the_2330_rome_policy(
     guard_root: Path, changes: dict[str, object]
 ) -> None:
-    with pytest.raises(deploy_guard.DeployGuardError, match="maintenance_policy_invalid"):
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="maintenance_policy_invalid"
+    ):
         deploy_guard._assert_maintenance_policy(_config(guard_root, **changes))
 
 
@@ -222,7 +231,9 @@ def test_snapshot_requires_durable_preflight_and_preserves_exact_bytes(
     deploy_guard.GOLDEN_MARKER_PATH.write_bytes(marker)
     request = _request("snapshot")
 
-    with pytest.raises(deploy_guard.DeployGuardError, match="deployment_preflight_invalid"):
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="deployment_preflight_invalid"
+    ):
         deploy_guard._snapshot(request)  # type: ignore[arg-type]
 
     _write_preflight(guard_root, environment=environment)
@@ -265,7 +276,9 @@ def test_switch_reseals_and_retry_with_new_nonce_does_not_mutate_again(
         deploy_guard._json_bytes({"environment": environment})
     )
     preflight_path.write_bytes(deploy_guard._json_bytes(preflight))
-    monkeypatch.setattr(deploy_guard, "_get_service_environment", lambda: list(holder["environment"]))
+    monkeypatch.setattr(
+        deploy_guard, "_get_service_environment", lambda: list(holder["environment"])
+    )
     monkeypatch.setattr(
         deploy_guard,
         "_set_service_environment",
@@ -309,7 +322,9 @@ def test_restore_is_exact_without_identity_and_permanently_kills_transaction(
     marker = b"old-marker-bytes\x00"
     deploy_guard.GOLDEN_MARKER_PATH.write_bytes(marker)
     _write_preflight(guard_root, environment=environment)
-    monkeypatch.setattr(deploy_guard, "_get_service_environment", lambda: list(holder["environment"]))
+    monkeypatch.setattr(
+        deploy_guard, "_get_service_environment", lambda: list(holder["environment"])
+    )
     monkeypatch.setattr(
         deploy_guard,
         "_set_service_environment",
@@ -364,10 +379,14 @@ def test_barrier_requires_fresh_identity_and_is_idempotent_across_nonce(
             deploy_guard.DeployGuardError("interactive_identity_invalid")
         ),
     )
-    with pytest.raises(deploy_guard.DeployGuardError, match="interactive_identity_invalid"):
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="interactive_identity_invalid"
+    ):
         deploy_guard._barrier(request)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(deploy_guard, "_assert_pre_barrier_identity", lambda _request: None)
+    monkeypatch.setattr(
+        deploy_guard, "_assert_pre_barrier_identity", lambda _request: None
+    )
     first = deploy_guard._barrier(request)  # type: ignore[arg-type]
     second = deploy_guard._barrier(_request("barrier"))
     assert first == second
@@ -393,7 +412,9 @@ def test_barrier_removes_stale_readiness_and_status_is_authoritative(
     deploy_guard.AGENT_READINESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     deploy_guard.AGENT_READINESS_PATH.write_text("stale", encoding="utf-8")
     monkeypatch.setattr(deploy_guard, "_assert_switch_intact", lambda _request: None)
-    monkeypatch.setattr(deploy_guard, "_assert_pre_barrier_identity", lambda _request: None)
+    monkeypatch.setattr(
+        deploy_guard, "_assert_pre_barrier_identity", lambda _request: None
+    )
     request = _request("barrier")
 
     before = deploy_guard._barrier_status(_request("barrier_status"))
@@ -539,10 +560,7 @@ def test_pre_barrier_rejects_fleet_changes_since_preflight(
 ) -> None:
     config = _config(guard_root)
     fpm_executable = (
-        config.instances_root
-        / FPM_CONNECTION_ID
-        / "terminal"
-        / "terminal64.exe"
+        config.instances_root / FPM_CONNECTION_ID / "terminal" / "terminal64.exe"
     )
     other_executable = (
         config.instances_root
@@ -562,16 +580,12 @@ def test_pre_barrier_rejects_fleet_changes_since_preflight(
         "_iter_terminal_processes",
         lambda _config: [(41, fpm_executable)],
     )
-    monkeypatch.setattr(
-        deploy_guard, "_provisioned_instance_count", lambda _config: 2
-    )
+    monkeypatch.setattr(deploy_guard, "_provisioned_instance_count", lambda _config: 2)
 
     with pytest.raises(deploy_guard.DeployGuardError, match="deployment_fleet_drifted"):
         deploy_guard._assert_pre_barrier_identity(_request("arm"))
 
-    monkeypatch.setattr(
-        deploy_guard, "_provisioned_instance_count", lambda _config: 1
-    )
+    monkeypatch.setattr(deploy_guard, "_provisioned_instance_count", lambda _config: 1)
     monkeypatch.setattr(
         deploy_guard,
         "_iter_terminal_processes",
@@ -580,6 +594,130 @@ def test_pre_barrier_rejects_fleet_changes_since_preflight(
 
     with pytest.raises(deploy_guard.DeployGuardError, match="deployment_fleet_drifted"):
         deploy_guard._assert_pre_barrier_identity(_request("barrier"))
+
+
+def test_convergence_projection_is_strictly_allowlisted(
+    guard_root: Path,
+) -> None:
+    request = _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+
+    deploy_guard._publish_convergence_outcome(
+        request,
+        status="failed",
+        attempts=2,
+        failure_code="fpm_canary_not_verified",
+    )
+
+    document = json.loads(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH.read_text(encoding="utf-8")
+    )
+    assert document == {
+        "deployment_id": DEPLOYMENT_ID,
+        "source_revision": REVISION,
+        "status": "failed",
+        "attempts": 2,
+        "failure_code": "fpm_canary_not_verified",
+    }
+    assert set(document) == deploy_guard._CONVERGENCE_OUTCOME_FIELDS
+    assert "failure_detail" not in json.dumps(document)
+    assert "secret" not in json.dumps(document)
+
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="deployment_diagnostic_invalid"
+    ):
+        deploy_guard._convergence_outcome(
+            request,
+            status="failed",
+            attempts=2,
+            failure_code="secret C:\\private",
+        )
+
+
+def test_convergence_projection_is_separate_from_system_guard_records(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    administrator_acl_paths: list[Path] = []
+    system_acl_paths: list[Path] = []
+    monkeypatch.setattr(
+        deploy_guard,
+        "_restrict_administrator_diagnostic",
+        lambda path: administrator_acl_paths.append(path),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_restrict_system_record",
+        lambda path: system_acl_paths.append(path),
+    )
+
+    request = _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+    outcome = deploy_guard._convergence_outcome(
+        request,
+        status="completed",
+        attempts=1,
+        failure_code=None,
+    )
+    deploy_guard._write_administrator_diagnostic(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH, outcome
+    )
+    system_record = deploy_guard._record_path(DEPLOYMENT_ID, "system-only")
+    deploy_guard._write_system_record(system_record, {"authoritative": True})
+
+    assert not deploy_guard.CONVERGENCE_OUTCOME_PATH.is_relative_to(
+        deploy_guard.STATE_ROOT
+    )
+    assert deploy_guard.CONVERGENCE_OUTCOME_ROOT in administrator_acl_paths
+    assert deploy_guard.CONVERGENCE_OUTCOME_PATH in administrator_acl_paths
+    assert system_record in system_acl_paths
+    assert system_record not in administrator_acl_paths
+
+
+def test_convergence_projection_failure_never_changes_guard_outcome(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_administrator_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            deploy_guard.DeployGuardError("deployment_diagnostic_write_failed")
+        ),
+    )
+
+    deploy_guard._publish_convergence_outcome(
+        request,
+        status="running",
+        attempts=1,
+        failure_code=None,
+    )
+
+    assert not deploy_guard.CONVERGENCE_OUTCOME_PATH.exists()
+
+
+def test_converge_persists_a_zero_attempt_preflight_failure(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        deploy_guard,
+        "_assert_service_stopped",
+        lambda: (_ for _ in ()).throw(
+            deploy_guard.DeployGuardError("service_must_be_stopped")
+        ),
+    )
+
+    with pytest.raises(deploy_guard.DeployGuardError, match="service_must_be_stopped"):
+        deploy_guard._converge(
+            _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+        )
+
+    assert json.loads(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH.read_text(encoding="utf-8")
+    ) == {
+        "deployment_id": DEPLOYMENT_ID,
+        "source_revision": REVISION,
+        "status": "failed",
+        "attempts": 0,
+        "failure_code": "service_must_be_stopped",
+    }
 
 
 def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
@@ -618,7 +756,9 @@ def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
     monkeypatch.setattr(
         deploy_guard, "_fleet_postconditions", lambda *_args, **_kwargs: (4, 2)
     )
-    monkeypatch.setattr(deploy_guard, "_write_activation_schedule_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deploy_guard, "_write_activation_schedule_state", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         deploy_guard,
         "_convergence_attempt",
@@ -646,6 +786,15 @@ def test_converge_runs_explicitly_even_if_daily_scheduler_was_completed(
     assert result["release_id"] == "d" * 64
     assert result["fleet_count"] == 4
     assert result["pool_ready_count"] == 2
+    assert json.loads(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH.read_text(encoding="utf-8")
+    ) == {
+        "deployment_id": DEPLOYMENT_ID,
+        "source_revision": REVISION,
+        "status": "completed",
+        "attempts": 1,
+        "failure_code": None,
+    }
 
 
 def test_converge_explicitly_probes_requested_readonly_recovery_account(
@@ -679,13 +828,19 @@ def test_converge_explicitly_probes_requested_readonly_recovery_account(
     _write_preflight(guard_root, provisioned_count=4)
     monkeypatch.setattr(deploy_guard, "_activation_config", lambda _request: config)
     monkeypatch.setattr(
-        deploy_guard, "_build_activation_coordinator", lambda _config: (coordinator, None)
+        deploy_guard,
+        "_build_activation_coordinator",
+        lambda _config: (coordinator, None),
     )
-    monkeypatch.setattr(deploy_guard, "verify_interactive_task_identity", lambda _user: None)
+    monkeypatch.setattr(
+        deploy_guard, "verify_interactive_task_identity", lambda _user: None
+    )
     monkeypatch.setattr(
         deploy_guard, "_fleet_postconditions", lambda *_args, **_kwargs: (4, 2)
     )
-    monkeypatch.setattr(deploy_guard, "_write_activation_schedule_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        deploy_guard, "_write_activation_schedule_state", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         deploy_guard,
         "_convergence_attempt",
@@ -735,9 +890,7 @@ def test_converge_handles_requested_fpm_rotated_by_the_fleet_pass(
             matches_target=lambda _connection_id, _target: matches_target
         ),
         _current_release=lambda: target,
-        _canaries=lambda _target: (
-            SimpleNamespace(connection_id=FPM_CONNECTION_ID),
-        ),
+        _canaries=lambda _target: (SimpleNamespace(connection_id=FPM_CONNECTION_ID),),
         run_once=lambda _stop: report,
     )
     _write_preflight(guard_root, provisioned_count=4)
@@ -802,9 +955,7 @@ def test_converge_preserves_the_original_guard_failure_code(
     writes: list[dict[str, object]] = []
     coordinator = SimpleNamespace(
         _current_release=lambda: target,
-        _canaries=lambda _target: (
-            SimpleNamespace(connection_id=FPM_CONNECTION_ID),
-        ),
+        _canaries=lambda _target: (SimpleNamespace(connection_id=FPM_CONNECTION_ID),),
         run_once=lambda _stop: (_ for _ in ()).throw(
             deploy_guard.DeployGuardError("fleet_release_mismatch")
         ),
@@ -812,9 +963,13 @@ def test_converge_preserves_the_original_guard_failure_code(
     _write_preflight(guard_root, provisioned_count=4)
     monkeypatch.setattr(deploy_guard, "_activation_config", lambda _request: config)
     monkeypatch.setattr(
-        deploy_guard, "_build_activation_coordinator", lambda _config: (coordinator, None)
+        deploy_guard,
+        "_build_activation_coordinator",
+        lambda _config: (coordinator, None),
     )
-    monkeypatch.setattr(deploy_guard, "verify_interactive_task_identity", lambda _user: None)
+    monkeypatch.setattr(
+        deploy_guard, "verify_interactive_task_identity", lambda _user: None
+    )
     monkeypatch.setattr(
         deploy_guard,
         "_write_activation_schedule_state",
@@ -850,6 +1005,89 @@ def test_converge_preserves_the_original_guard_failure_code(
         )
 
     assert writes[-1]["failure_code"] == "fleet_release_mismatch"
+    assert json.loads(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH.read_text(encoding="utf-8")
+    ) == {
+        "deployment_id": DEPLOYMENT_ID,
+        "source_revision": REVISION,
+        "status": "failed",
+        "attempts": 1,
+        "failure_code": "fleet_release_mismatch",
+    }
+
+
+def test_convergence_projection_excludes_system_failure_detail(
+    guard_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(guard_root)
+    target = SimpleNamespace(release_id="f" * 64)
+    writes: list[dict[str, object]] = []
+    coordinator = SimpleNamespace(
+        _current_release=lambda: target,
+        _canaries=lambda _target: (SimpleNamespace(connection_id=FPM_CONNECTION_ID),),
+        run_once=lambda _stop: (_ for _ in ()).throw(
+            deploy_guard.Mt5MaintenanceError("secret=C:\\TradeJournal\\private")
+        ),
+    )
+    _write_preflight(guard_root, provisioned_count=4)
+    monkeypatch.setattr(deploy_guard, "_activation_config", lambda _request: config)
+    monkeypatch.setattr(
+        deploy_guard,
+        "_build_activation_coordinator",
+        lambda _config: (coordinator, None),
+    )
+    monkeypatch.setattr(
+        deploy_guard, "verify_interactive_task_identity", lambda _user: None
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_activation_schedule_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_write_system_record",
+        lambda _path, record: writes.append(record),
+    )
+    monkeypatch.setattr(
+        deploy_guard,
+        "_convergence_attempt",
+        lambda _config, request: (
+            guard_root / "state" / "failure-detail-attempt.json",
+            {
+                **deploy_guard._binding(request),
+                "nonce": request["nonce"],
+                "status": "running",
+                "scheduled_local_date": "2026-08-28",
+                "started_at_unix_ms": 1,
+                "finished_at_unix_ms": None,
+                "attempts": 1,
+                "failure_code": None,
+                "failure_detail": None,
+            },
+        ),
+    )
+
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="deployment_convergence_failed"
+    ):
+        deploy_guard._converge(
+            _request("converge", {"fpm_connection_id": FPM_CONNECTION_ID})
+        )
+
+    assert writes[-1]["failure_detail"] == "secret=C:\\TradeJournal\\private"
+    projection = json.loads(
+        deploy_guard.CONVERGENCE_OUTCOME_PATH.read_text(encoding="utf-8")
+    )
+    assert projection == {
+        "deployment_id": DEPLOYMENT_ID,
+        "source_revision": REVISION,
+        "status": "failed",
+        "attempts": 1,
+        "failure_code": "deployment_convergence_failed",
+    }
+    assert "secret" not in json.dumps(projection)
+    assert "failure_detail" not in projection
 
 
 @pytest.mark.parametrize(
@@ -988,7 +1226,9 @@ def test_verify_active_rejects_readiness_from_another_service_pid(
         },
     )
 
-    with pytest.raises(deploy_guard.DeployGuardError, match="service_readiness_invalid"):
+    with pytest.raises(
+        deploy_guard.DeployGuardError, match="service_readiness_invalid"
+    ):
         deploy_guard._verify_active(
             _request(
                 "verify_active",
@@ -1060,9 +1300,7 @@ def test_verify_active_supports_clean_host_without_fpm_account(
     monkeypatch.setattr(
         psutil,
         "Process",
-        lambda _pid: SimpleNamespace(
-            create_time=lambda: service_created_ms / 1000
-        ),
+        lambda _pid: SimpleNamespace(create_time=lambda: service_created_ms / 1000),
     )
     monkeypatch.setattr(deploy_guard, "_get_service_environment", lambda: [])
     monkeypatch.setattr(
@@ -1145,9 +1383,7 @@ def test_immediate_activation_is_bounded_and_keeps_nightly_claim_available(
         lambda _config, now=None: current,
     )
 
-    start, end, mode = deploy_guard._arm_activation_window(
-        config, immediate=True
-    )
+    start, end, mode = deploy_guard._arm_activation_window(config, immediate=True)
 
     assert start == current
     assert end - start == timedelta(minutes=120)
