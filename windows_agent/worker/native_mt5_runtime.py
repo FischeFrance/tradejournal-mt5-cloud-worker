@@ -49,6 +49,12 @@ from ..state_store import atomic_json
 
 logger = logging.getLogger(__name__)
 
+# An EA can remain authenticated and alive while it rebuilds a durable source
+# continuity boundary.  Keep this distinct from an absent/failed terminal so
+# callers can retry the history path without stopping the process that performs
+# the recovery.
+SOURCE_RECOVERY_REQUIRED = "source_recovery_required"
+
 
 class NativeMt5Error(RuntimeError):
     """Sanitized native-terminal failure; never contains credentials."""
@@ -829,20 +835,96 @@ class NativeMt5Runtime:
         connection_tmp = self.files / "connection_id.tmp"
         self._write_text_durable(connection_tmp, self.connection_id, "utf-8")
         durable_replace(connection_tmp, self.files / "connection_id")
+        self._publish_history_mode(history_mode, history_from)
+        return destination
+
+    def _publish_history_mode(
+        self,
+        history_mode: str,
+        history_from: datetime | None = None,
+    ) -> None:
+        """Durably publish a bridge-mode transaction, with mode as commit marker.
+
+        The EA polls ``history_mode`` on every timer tick.  Write its associated
+        cutoff first and the mode last so it can never observe ``new_only`` with
+        the stale full-history cutoff from the preceding import.
+        """
+        if history_mode not in ("new_only", "from_date", "all_available"):
+            raise NativeMt5Error("invalid_history_mode")
+        if history_mode == "from_date" and history_from is None:
+            raise NativeMt5Error("history_from_missing")
+        from_unix = 0
+        if history_mode in ("from_date", "new_only") and history_from is not None:
+            try:
+                from_unix = int(history_from.timestamp())
+            except (AttributeError, OverflowError, OSError, ValueError) as exc:
+                raise NativeMt5Error("history_from_invalid") from exc
+            if from_unix <= 0:
+                raise NativeMt5Error("history_from_invalid")
+        self.files.mkdir(parents=True, exist_ok=True)
+        from_tmp = self.files / "history_from_unix.tmp"
+        self._write_text_durable(from_tmp, str(from_unix), "utf-8")
+        durable_replace(from_tmp, self.files / "history_from_unix")
         mode_tmp = self.files / "history_mode.tmp"
         self._write_text_durable(mode_tmp, history_mode, "utf-8")
         durable_replace(mode_tmp, self.files / "history_mode")
-        from_tmp = self.files / "history_from_unix.tmp"
-        from_unix = 0
-        if history_mode == "from_date" and history_from is None:
-            raise NativeMt5Error("history_from_missing")
-        if history_mode in ("from_date", "new_only") and history_from is not None:
-            from_unix = int(history_from.timestamp())
-            if from_unix <= 0:
-                raise NativeMt5Error("history_from_invalid")
-        self._write_text_durable(from_tmp, str(from_unix), "utf-8")
-        durable_replace(from_tmp, self.files / "history_from_unix")
-        return destination
+
+    def switch_to_new_only(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Handoff a frozen history EA to live mode without stopping MT5.
+
+        A stop/resume creates a blind period between the archive's frozen native
+        tickets and the new event stream.  The running EA observes this durable
+        mode marker in OnTimer, writes a fresh sequence and confirms it through
+        heartbeat.  A retry after a crash is idempotent: it waits for the same
+        predicate and never rewinds a bridge cursor.
+        """
+        if timeout <= 0:
+            raise NativeMt5Error("history_mode_switch_timeout")
+        self._check_cancelled()
+        before_raw = self._read_json(self.files / "heartbeat.json")
+        before_sequence = (
+            before_raw.get("sequence")
+            if isinstance(before_raw, dict) and type(before_raw.get("sequence")) is int
+            else 0
+        )
+        self._publish_history_mode("new_only")
+        deadline = time.monotonic() + timeout
+        source_recovery_seen = False
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            heartbeat_raw = self._read_json(self.files / "heartbeat.json")
+            heartbeat = self._payload(heartbeat_raw, "heartbeat") if heartbeat_raw else None
+            sequence = (
+                heartbeat_raw.get("sequence")
+                if isinstance(heartbeat_raw, dict)
+                and type(heartbeat_raw.get("sequence")) is int
+                else 0
+            )
+            if (
+                isinstance(heartbeat, dict)
+                and heartbeat.get("history_mode") == "new_only"
+                and heartbeat.get("source_recovery_required") is True
+                and sequence > before_sequence
+            ):
+                # The mode switch reached the running EA, but it deliberately
+                # refuses activation until its source replay is durable. This
+                # is retryable history work, not a terminal-start failure.
+                source_recovery_seen = True
+            if (
+                isinstance(heartbeat, dict)
+                and heartbeat.get("history_mode") == "new_only"
+                and heartbeat.get("terminal_connected") is True
+                # This is a release capability gate, not a truthy flag.  An
+                # old/malformed heartbeat cannot be used to activate a V2
+                # handoff while its source journal continuity is unknown.
+                and heartbeat.get("source_recovery_required") is False
+                and sequence > before_sequence
+            ):
+                return heartbeat
+            time.sleep(0.2)
+        if source_recovery_seen:
+            raise NativeMt5Error(SOURCE_RECOVERY_REQUIRED)
+        raise NativeMt5Error("history_mode_switch_timeout")
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -2989,6 +3071,7 @@ class NativeMt5Runtime:
         self, timeout: float, login: int | None = None, server: str | None = None
     ) -> NativeMt5Status:
         deadline = time.monotonic() + timeout
+        source_recovery_seen = False
         while time.monotonic() < deadline:
             self._check_cancelled()
             pid = 0
@@ -3040,6 +3123,20 @@ class NativeMt5Runtime:
             if heartbeat is None:
                 time.sleep(1)
                 continue
+            # A readable heartbeat with an unresolved local source gap is an
+            # explicit unhealthy state, not readiness. The EA performs its
+            # replay in-place; wait for its subsequent clean heartbeat rather
+            # than allowing provisioning/activation to mark the connection up.
+            # Require the explicit boolean false.  Missing/nonboolean values
+            # are an old or malformed EA and must never become a healthy
+            # readiness signal during a staged rollout.
+            if heartbeat.get("source_recovery_required") is True:
+                source_recovery_seen = True
+                time.sleep(1)
+                continue
+            if heartbeat.get("source_recovery_required") is not False:
+                time.sleep(1)
+                continue
             if login is None:
                 return self._ready_status(pid, account or {}, heartbeat)
             if account is None:
@@ -3082,6 +3179,15 @@ class NativeMt5Runtime:
             if bool(account.get("trade_allowed", True)):
                 raise NativeMt5Error("investor_readonly_not_verified")
             return self._ready_status(pid, account, heartbeat)
+        if source_recovery_seen:
+            logger.warning(
+                "native MT5 runtime: source continuity recovery is still pending "
+                "after %.0fs (connection_id=%s, symbol=%s); terminal is left running",
+                timeout,
+                self.connection_id,
+                self._last_symbol,
+            )
+            raise NativeMt5Error(SOURCE_RECOVERY_REQUIRED)
         logger.error(
             "native MT5 runtime: heartbeat.json never appeared within %.0fs "
             "(connection_id=%s, symbol=%s) -- check whether that symbol exists in this "
@@ -3265,6 +3371,14 @@ class NativeMt5Runtime:
                 requested_server=server,
                 effective_server=effective_server,
             )
+        except NativeMt5Error as exc:
+            if str(exc) == SOURCE_RECOVERY_REQUIRED:
+                # The EA is alive and retrying its source marker/history in
+                # place. Stopping it would discard the only recovery process.
+                raise
+            self.stop()
+            self._discard_pending_verified_vendor_updates()
+            raise
         except Exception:
             # A failed bootstrap has no consumer yet, so its isolated terminal must not be
             # retained. Successful starts deliberately remain alive for history/live sync.
@@ -3341,6 +3455,14 @@ class NativeMt5Runtime:
                 )
             self._publish_pending_verified_vendor_updates()
             return status
+        except NativeMt5Error as exc:
+            if str(exc) == SOURCE_RECOVERY_REQUIRED:
+                # Preserve the authenticated EA while it publishes a clean
+                # continuity heartbeat on a later timer tick.
+                raise
+            self.stop()
+            self._discard_pending_verified_vendor_updates()
+            raise
         except Exception:
             self.stop()
             self._discard_pending_verified_vendor_updates()

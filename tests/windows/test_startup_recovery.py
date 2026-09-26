@@ -13,6 +13,8 @@ from windows_agent.real_handlers import (
     reconcile_startup_instances,
     recover_startup_instances,
 )
+from windows_agent.state_store import read_json
+from windows_agent.worker.native_mt5_runtime import NativeMt5Error
 
 
 class FakeRuntime:
@@ -230,3 +232,54 @@ def test_startup_recovery_fails_closed_without_bridge_token(tmp_path: Path, monk
     assert FakeRuntime.calls == []
     assert FakeRuntime.installs == []
     assert FakeProcessManager.adopted == []
+
+
+def test_startup_recovery_keeps_terminal_running_for_source_recovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    connection_id, instances_root, secrets_root, expert = _published_instance(
+        tmp_path,
+        monkeypatch,
+    )
+    store = WindowsSecretStore(secrets_root)
+    store.write(connection_id, "mt5_login", "42")
+    store.write(connection_id, "mt5_server", "Demo")
+    store.write(connection_id, "bridge_token", "tjmt5_test")
+
+    class SourceRecoveryRuntime(FakeRuntime):
+        stopped = False
+
+        def resume(self, **kwargs: Any) -> None:
+            type(self).calls.append(
+                {
+                    "connection_id": self.connection_id,
+                    **kwargs,
+                }
+            )
+            raise NativeMt5Error("source_recovery_required")
+
+        def stop(self) -> None:
+            type(self).stopped = True
+
+    SourceRecoveryRuntime.calls = []
+    SourceRecoveryRuntime.installs = []
+    SourceRecoveryRuntime.stopped = False
+
+    result = recover_startup_instances(
+        instances_root,
+        secrets_root,
+        (connection_id,),
+        expert,
+        hashlib.sha256(expert.read_bytes()).hexdigest(),
+        process_factory=FakeProcessManager,
+        process_finder=lambda _terminal: [],
+        runtime_factory=SourceRecoveryRuntime,
+    )
+
+    assert result.recovered == ()
+    assert result.failed == (connection_id,)
+    assert SourceRecoveryRuntime.stopped is False
+    root = instances_root / connection_id
+    progress = read_json(root / "state" / "job_progress.json")
+    assert progress["status"] == "source_recovery_required"

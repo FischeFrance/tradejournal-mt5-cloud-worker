@@ -253,6 +253,94 @@ def test_start_hands_discovery_chart_directly_to_bridge(tmp_path: Path) -> None:
     assert not startup.exists()
 
 
+def test_start_keeps_authenticated_terminal_alive_for_source_recovery(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    bootstrap = runtime.state / "login-bootstrap.ini"
+    startup = runtime.state / "startup.ini"
+    runtime.state.mkdir()
+    bootstrap.write_text("temporary")
+    startup.write_text("temporary")
+
+    with (
+        patch.object(
+            runtime,
+            "_write_startup_config",
+            side_effect=[bootstrap, startup],
+        ),
+        patch.object(
+            runtime,
+            "_start_and_wait_for_authorization",
+            side_effect=[({}, "Demo"), ({}, "Demo")],
+        ),
+        patch.object(runtime, "_wait_for_account_database"),
+        patch.object(runtime, "_wait_for_discovery_start", return_value=True),
+        patch.object(runtime, "_probe_broker_symbol", return_value="EURUSD.raw"),
+        patch.object(
+            runtime,
+            "_wait_for_heartbeat",
+            side_effect=NativeMt5Error("source_recovery_required"),
+        ),
+        patch.object(runtime, "_running_terminal_pids", return_value=[]),
+        patch.object(runtime, "stop", return_value=True) as stop,
+        patch.object(runtime, "_discard_pending_verified_vendor_updates") as discard,
+    ):
+        with pytest.raises(NativeMt5Error, match="^source_recovery_required$"):
+            runtime.start(
+                login=42,
+                server="Demo",
+                investor_password="placeholder",
+                expert_binary=expert,
+            )
+
+    # The one pre-discovery stop is expected. The recovery result must not add
+    # a cleanup stop after the authenticated bridge is already running.
+    assert stop.call_count == 1
+    discard.assert_not_called()
+    assert not bootstrap.exists()
+    assert not startup.exists()
+
+
+def test_resume_keeps_authenticated_terminal_alive_for_source_recovery(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    config = runtime.state / "resume.ini"
+    runtime.state.mkdir()
+    config.write_text("temporary")
+
+    with (
+        patch.object(runtime, "_bridge_template_symbol", return_value="EURUSD"),
+        patch.object(runtime, "install_expert"),
+        patch.object(runtime, "_remove_readiness_files"),
+        patch.object(runtime, "_reset_managed_chart_profile"),
+        patch.object(runtime, "_write_startup_config", return_value=config),
+        patch.object(runtime, "_start_and_wait_for_authorization"),
+        patch.object(
+            runtime,
+            "_wait_for_heartbeat",
+            side_effect=NativeMt5Error("source_recovery_required"),
+        ),
+        patch.object(runtime, "stop", return_value=True) as stop,
+        patch.object(runtime, "_discard_pending_verified_vendor_updates") as discard,
+    ):
+        with pytest.raises(NativeMt5Error, match="^source_recovery_required$"):
+            runtime.resume(
+                login=42,
+                server="Demo",
+                expert_binary=expert,
+            )
+
+    stop.assert_not_called()
+    discard.assert_not_called()
+    assert not config.exists()
+
+
 def test_start_process_uses_portable_config(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     config = runtime.state / "startup.ini"
@@ -769,7 +857,7 @@ def test_identity_and_readonly_guards(
     runtime.files.mkdir(parents=True)
     (runtime.files / "account.json").write_text(_envelope(account))
     (runtime.files / "heartbeat.json").write_text(
-        _envelope({"terminal_connected": True})
+        _envelope({"terminal_connected": True, "source_recovery_required": False})
     )
     bootstrap = runtime.state / "login-bootstrap.ini"
     startup = runtime.state / "startup.ini"
@@ -823,7 +911,7 @@ def test_readiness_cleanup_fails_closed_when_stale_file_cannot_be_removed(
     runtime.files.mkdir(parents=True)
     stale = runtime.files / "heartbeat.json"
     stale.write_text(
-        _envelope({"terminal_connected": True}),
+        _envelope({"terminal_connected": True, "source_recovery_required": False}),
         encoding="utf-8",
     )
     original_unlink = Path.unlink
@@ -857,7 +945,7 @@ def test_heartbeat_from_before_current_launch_is_rejected(
         encoding="utf-8",
     )
     (runtime.files / "heartbeat.json").write_text(
-        _envelope({"terminal_connected": True}),
+        _envelope({"terminal_connected": True, "source_recovery_required": False}),
         encoding="utf-8",
     )
     runtime._readiness_not_before = datetime.now(timezone.utc)
@@ -868,3 +956,86 @@ def test_heartbeat_from_before_current_launch_is_rejected(
         pytest.raises(NativeMt5Error, match="^terminal_not_ready$"),
     ):
         runtime._wait_for_heartbeat(0.01, 42, "Demo")
+
+
+@pytest.mark.parametrize(
+    ("recovery_flag", "error_code"),
+    [
+        (True, "source_recovery_required"),
+        (None, "history_mode_switch_timeout"),
+        ("false", "history_mode_switch_timeout"),
+    ],
+)
+def test_history_mode_switch_requires_explicit_clean_source_continuity(
+    tmp_path: Path, recovery_flag: object, error_code: str
+) -> None:
+    runtime = _runtime(tmp_path)
+    before = json.loads(
+        _envelope(
+            {"terminal_connected": True, "source_recovery_required": False}
+        )
+    )
+    before["sequence"] = 7
+    rejected = json.loads(
+        _envelope(
+            {
+                "terminal_connected": True,
+                "history_mode": "new_only",
+                "source_recovery_required": recovery_flag,
+            }
+        )
+    )
+    rejected["sequence"] = 8
+    reads = 0
+
+    def read_heartbeat(_path: Path):
+        nonlocal reads
+        reads += 1
+        return before if reads == 1 else rejected
+
+    with (
+        patch.object(runtime, "_read_json", side_effect=read_heartbeat),
+        patch.object(runtime, "_publish_history_mode") as publish,
+        patch("windows_agent.worker.native_mt5_runtime.time.sleep"),
+        patch(
+            "windows_agent.worker.native_mt5_runtime.time.monotonic",
+            side_effect=[0.0, 0.0, 0.02],
+        ),
+        pytest.raises(NativeMt5Error, match=f"^{error_code}$"),
+    ):
+        runtime.switch_to_new_only(timeout=0.01)
+    publish.assert_called_once_with("new_only")
+
+
+@pytest.mark.parametrize(
+    ("recovery_flag", "error_code"),
+    [
+        (True, "source_recovery_required"),
+        (None, "terminal_not_ready"),
+        (0, "terminal_not_ready"),
+    ],
+)
+def test_readiness_rejects_untrusted_source_continuity(
+    tmp_path: Path, recovery_flag: object, error_code: str
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "heartbeat.json").write_text(
+        _envelope(
+            {
+                "terminal_connected": True,
+                "source_recovery_required": recovery_flag,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (
+        patch.object(runtime, "_running_terminal_pids", return_value=[123]),
+        patch("windows_agent.worker.native_mt5_runtime.time.sleep"),
+        patch(
+            "windows_agent.worker.native_mt5_runtime.time.monotonic",
+            side_effect=[0.0, 0.0, 0.02],
+        ),
+        pytest.raises(NativeMt5Error, match=f"^{error_code}$"),
+    ):
+        runtime._wait_for_heartbeat(0.01)

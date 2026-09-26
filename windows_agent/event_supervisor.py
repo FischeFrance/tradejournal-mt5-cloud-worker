@@ -24,6 +24,45 @@ from .worker.trading_ingestion_sink import TradingIngestionSink
 logger = logging.getLogger(__name__)
 
 
+_SOURCE_RECOVERY_OBSERVED_SEQUENCE = "_source_recovery_observed_sequence"
+_SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE = (
+    "_source_recovery_reasserts_through_sequence"
+)
+_TRANSITION_ENQUEUED = "_transition_enqueued"
+
+
+def _source_recovery_v2_acknowledged(state: dict) -> bool:
+    """Whether an optional v2 recovery fence is coherent.
+
+    ``Mql5FileMt5Adapter`` requires these fields for every real bridge after
+    the v2 rollout.  Keeping an all-fields-absent branch preserves the narrow
+    fake/legacy adapter seam used by isolated unit tests; a partially supplied
+    or mismatched fence is never treated as a clean source.
+    """
+
+    names = (
+        "source_recovery_protocol_version",
+        "source_recovery_request_generation",
+        "source_recovery_ack_generation",
+    )
+    values = tuple(state.get(name) for name in names)
+    if values == (None, None, None):
+        return True
+    protocol, request_generation, ack_generation = values
+    return (
+        isinstance(protocol, int)
+        and not isinstance(protocol, bool)
+        and protocol == 2
+        and isinstance(request_generation, int)
+        and not isinstance(request_generation, bool)
+        and request_generation >= 0
+        and isinstance(ack_generation, int)
+        and not isinstance(ack_generation, bool)
+        and ack_generation >= 0
+        and request_generation == ack_generation
+    )
+
+
 class _SnapshotState:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -106,7 +145,77 @@ class Mt5EventSupervisor:
     def _process_locked(self, connection_id: str) -> None:
         root, adapter, sink = self._components(connection_id)
         files_dir = adapter.files_dir
+        # A signed history archive may have been accepted while its frozen
+        # live baseline is still awaiting the in-process new_only handoff.
+        # Do not let the generic filesystem watcher consume/ack the same
+        # source prefix before that durable activation commits.
+        if (root / "state" / "history-handoff-pending.json").exists():
+            return
+        state = adapter.connection_state()
+        # The adapter already derives source_recovery_required from the v2
+        # control files.  Keep the supervisor's transition path independently
+        # fail-closed as well: a hand-built/stale state with a mismatched
+        # request/ack pair can never reassert connected remotely.
+        if not _source_recovery_v2_acknowledged(state):
+            state = {
+                **state,
+                "connected": False,
+                "source_recovery_required": True,
+            }
+        state_path = root / "state" / "connection-state.json"
+        previous = read_json(state_path, {})
         event_files = sorted((files_dir / "events").glob("event-*.json"))
+        # Missing/nonboolean is not a compatible healthy state during the
+        # continuity rollout. Leave the local wake files untouched until the
+        # EA explicitly certifies that source recovery is clear. Do not even
+        # emit a remote connection transition from this ambiguous state: the
+        # next clean heartbeat is the only authority that may reactivate it.
+        if state.get("source_recovery_required") is not False:
+            observed_sequence = state.get("sequence")
+            previous_sequence = previous.get(_SOURCE_RECOVERY_OBSERVED_SEQUENCE)
+            if (
+                not isinstance(observed_sequence, int)
+                or isinstance(observed_sequence, bool)
+                or observed_sequence < 0
+            ):
+                observed_sequence = (
+                    previous_sequence
+                    if isinstance(previous_sequence, int)
+                    and not isinstance(previous_sequence, bool)
+                    and previous_sequence >= 0
+                    else 0
+                )
+            if (
+                not isinstance(previous_sequence, int)
+                or isinstance(previous_sequence, bool)
+                or observed_sequence > previous_sequence
+            ):
+                atomic_json(
+                    state_path,
+                    {
+                        **previous,
+                        _SOURCE_RECOVERY_OBSERVED_SEQUENCE: observed_sequence,
+                    },
+                )
+            return
+        observed_recovery_sequence = previous.get(
+            _SOURCE_RECOVERY_OBSERVED_SEQUENCE
+        )
+        if (
+            isinstance(observed_recovery_sequence, int)
+            and not isinstance(observed_recovery_sequence, bool)
+        ):
+            clean_sequence = state.get("sequence")
+            # Clearing the capability bit in an old/regressed heartbeat is not
+            # proof that the EA advanced beyond the recovery observation.  Keep
+            # both wake files and the durable marker untouched until a strictly
+            # newer clean heartbeat arrives.
+            if (
+                not isinstance(clean_sequence, int)
+                or isinstance(clean_sequence, bool)
+                or clean_sequence <= observed_recovery_sequence
+            ):
+                return
         if event_files:
             dedup = PersistentDedup(root / "state" / "live-dedup.sqlite")
             try:
@@ -133,39 +242,152 @@ class Mt5EventSupervisor:
                     event_file.unlink()
                 except FileNotFoundError:
                     pass
+        pending_state = previous.get("pending")
+        if (
+            isinstance(pending_state, dict)
+            and pending_state.get(_TRANSITION_ENQUEUED) is not True
+        ):
+            pending_sequence = pending_state.get("sequence")
+            pending_connected = pending_state.get("connected")
+            if (
+                not isinstance(pending_sequence, int)
+                or isinstance(pending_sequence, bool)
+                or pending_sequence < 0
+                or not isinstance(pending_connected, bool)
+            ):
+                # A corrupt local intent cannot be acknowledged or replaced by
+                # the current heartbeat without losing its causal boundary.
+                return
+            pending_recovery_reassertion = isinstance(
+                pending_state.get(_SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE),
+                int,
+            ) and not isinstance(
+                pending_state.get(_SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE),
+                bool,
+            )
+            pending_snapshot = (
+                adapter.account_snapshot()
+                if pending_connected and not pending_recovery_reassertion
+                else None
+            )
+            # Enqueue and checkpoint are deliberately separate.  A crash after
+            # the durable enqueue simply re-enqueues the deterministic event id;
+            # a crash before it leaves this flag false and cannot be mistaken
+            # for a remote acknowledgement on the next empty flush.
+            sink.enqueue_connection_transition(
+                connection_id,
+                pending_sequence,
+                pending_connected,
+                pending_snapshot,
+            )
+            pending_state = {**pending_state, _TRANSITION_ENQUEUED: True}
+            previous = {**previous, "pending": pending_state}
+            atomic_json(state_path, previous)
+
         flush_result = None
         if time.monotonic() >= self._retry_after.get(connection_id, 0):
             flush_result = sink.flush_transitions()
 
-        state = adapter.connection_state()
-        state_path = root / "state" / "connection-state.json"
-        previous = read_json(state_path, {})
         pending_state = previous.get("pending")
         if (
             isinstance(pending_state, dict)
+            and pending_state.get(_TRANSITION_ENQUEUED) is True
             and flush_result is not None
             and sink.transition_delivery_confirmed()
         ):
-            atomic_json(state_path, pending_state)
-            previous = pending_state
+            committed_state = {
+                key: value
+                for key, value in pending_state.items()
+                if key
+                not in (
+                    _SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE,
+                    _TRANSITION_ENQUEUED,
+                )
+            }
+            observed_sequence = previous.get(_SOURCE_RECOVERY_OBSERVED_SEQUENCE)
+            reasserted_through = pending_state.get(
+                _SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE
+            )
+            recovery_transition_was_enqueued = (
+                pending_state.get(_TRANSITION_ENQUEUED) is True
+            )
+            recovery_reasserted = (
+                recovery_transition_was_enqueued
+                and isinstance(observed_sequence, int)
+                and not isinstance(observed_sequence, bool)
+                and isinstance(reasserted_through, int)
+                and not isinstance(reasserted_through, bool)
+                and reasserted_through >= observed_sequence
+            )
+            if (
+                isinstance(observed_sequence, int)
+                and not isinstance(observed_sequence, bool)
+                and not recovery_reasserted
+            ):
+                committed_state[_SOURCE_RECOVERY_OBSERVED_SEQUENCE] = (
+                    observed_sequence
+                )
+            atomic_json(state_path, committed_state)
+            previous = committed_state
             pending_state = None
             # The persisted pending state was acknowledged during this service
             # lifetime, so it already constitutes the required startup reassertion.
             self._startup_reassertions.discard(connection_id)
-        should_reassert = connection_id in self._startup_reassertions
+        observed_sequence = previous.get(_SOURCE_RECOVERY_OBSERVED_SEQUENCE)
+        source_recovery_reassertion = (
+            state.get("connected") is True
+            and isinstance(observed_sequence, int)
+            and not isinstance(observed_sequence, bool)
+        )
+        should_reassert = (
+            connection_id in self._startup_reassertions
+            or source_recovery_reassertion
+        )
         if not isinstance(pending_state, dict) and (
             previous.get("connected") != state["connected"] or should_reassert
         ):
-            atomic_json(state_path, {**previous, "pending": state})
-            snapshot = adapter.account_snapshot() if state["connected"] else None
-            result = sink.send_connection_transition(
+            pending_transition = dict(state)
+            pending_transition[_TRANSITION_ENQUEUED] = False
+            if source_recovery_reassertion:
+                pending_transition[_SOURCE_RECOVERY_REASSERTS_THROUGH_SEQUENCE] = (
+                    observed_sequence
+                )
+            persisted_transition = {**previous, "pending": pending_transition}
+            atomic_json(state_path, persisted_transition)
+            # The recovery acknowledgement must take the dedicated,
+            # token-authenticated connection-transition path.  Attaching an
+            # account snapshot would route it through the account-heartbeat
+            # RPC instead, leaving the control-plane recovery marker (and its
+            # parked history job) uncleared.  Ordinary connection transitions
+            # still carry their snapshot exactly as before.
+            snapshot = (
+                adapter.account_snapshot()
+                if state["connected"] and not source_recovery_reassertion
+                else None
+            )
+            sink.enqueue_connection_transition(
                 connection_id,
                 state["sequence"],
                 state["connected"],
                 snapshot,
             )
+            pending_transition[_TRANSITION_ENQUEUED] = True
+            atomic_json(
+                state_path,
+                {**previous, "pending": pending_transition},
+            )
+            sink.flush_transitions()
             if sink.transition_delivery_confirmed():
-                atomic_json(state_path, state)
+                committed_state = dict(state)
+                if (
+                    isinstance(observed_sequence, int)
+                    and not isinstance(observed_sequence, bool)
+                    and not source_recovery_reassertion
+                ):
+                    committed_state[_SOURCE_RECOVERY_OBSERVED_SEQUENCE] = (
+                        observed_sequence
+                    )
+                atomic_json(state_path, committed_state)
                 self._startup_reassertions.discard(connection_id)
 
         pending_count = sink.pending_transition_count()

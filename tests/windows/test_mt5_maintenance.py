@@ -14,6 +14,7 @@ from windows_agent.mt5_maintenance import (
     Mt5CanaryOnlyReport,
     Mt5MaintenanceCoordinator,
     Mt5MaintenanceError,
+    Mt5MaintenanceSourceRecoveryPending,
 )
 from windows_agent.provisioning.mt5_instance import InstanceProvisioner
 from windows_agent.provisioning.mt5_instance_rotation import (
@@ -279,10 +280,15 @@ class FakeRotator:
 
 class RuntimeController:
     def __init__(
-        self, *, publish_update: bool = False, fail_resume: bool = False
+        self,
+        *,
+        publish_update: bool = False,
+        fail_resume: bool = False,
+        source_recovery: bool = False,
     ) -> None:
         self.publish_update = publish_update
         self.fail_resume = fail_resume
+        self.source_recovery = source_recovery
         self.callbacks: list[tuple[object, bool]] = []
         self.cancel_checks: list[object] = []
         self.factory_calls: list[tuple[Path, str]] = []
@@ -327,6 +333,7 @@ class RuntimeController:
                     {
                         "terminal_connected": True,
                         "account_trade_allowed": False,
+                        "source_recovery_required": owner.source_recovery,
                     },
                     root / "terminal" / "MQL5" / "Files" / "TradeJournal",
                 )
@@ -582,6 +589,54 @@ def test_canary_only_targets_exact_fpm_account_without_shared_mutations(
     assert pool.calls == []
     assert rotator.rotate_one_calls == []
     assert rotator.rotate_all_calls == []
+
+
+def test_canary_source_recovery_keeps_the_resumed_terminal_running(
+    tmp_path: Path,
+) -> None:
+    ids, instances, expert, manager, rotator, secrets = _fixture(tmp_path)
+    runtime = RuntimeController(source_recovery=True)
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        runtime,
+        FakePool(),
+        FakePendingStore(manager),
+    )
+
+    with pytest.raises(
+        Mt5MaintenanceSourceRecoveryPending, match="source recovery is pending"
+    ) as exc_info:
+        coordinator.run_canary_only(ids[0], "Broker-A", Event())
+
+    assert exc_info.value.error_code == "source_recovery_required"
+
+    # The probe's planned stop happened before resume. Source recovery itself
+    # must not trigger the old restore path's second stop/rotation.
+    assert runtime.stop_calls == 1
+    assert len(runtime.resume_calls) == 1
+    assert rotator.rotate_one_calls == []
+
+
+def test_canary_status_requires_explicitly_clear_source_recovery(
+    tmp_path: Path,
+) -> None:
+    status = NativeMt5Status(
+        1,
+        {"trade_allowed": False},
+        {
+            "terminal_connected": True,
+            "account_trade_allowed": False,
+            "source_recovery_required": True,
+        },
+        tmp_path,
+    )
+
+    with pytest.raises(Mt5MaintenanceError, match="health check failed"):
+        Mt5MaintenanceCoordinator._validate_status(status)
 
 
 def test_canary_only_captures_pending_update_without_consuming_or_promoting(

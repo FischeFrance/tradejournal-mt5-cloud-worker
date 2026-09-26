@@ -218,7 +218,16 @@ def test_deployment_gate_includes_direct_tests_and_powershell_parser() -> None:
         "test_release_manifest.py",
         "test_event_normalizer.py",
         "test_mql5_ea_no_trading.py",
+        "test_history_balance.py",
+        "test_mql5_source_journal.py",
+        "test_event_outbox.py",
+        "test_mql5_file_adapter.py",
+        "test_live_sync_balance_snapshot.py",
+        "test_live_sync_outbox.py",
+        "test_history_outbox.py",
+        "test_trading_ingestion_sink.py",
         "test_windows_smoke.py') + '::test_powershell_scripts_parse",
+        "test_windows_smoke.py') + '::test_mt5_compiler_selector",
     ):
         assert path in script
 

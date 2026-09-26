@@ -19,6 +19,10 @@ from worker.atomic_file import durable_replace
 MAX_COMPRESSED_BYTES = 6 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 48 * 1024 * 1024
 MAX_EVENTS = 50_000
+# The control-plane history parser bounds a single trade group.  Native MT5
+# fills are now retained separately (open, scale-ins, partial closes, final),
+# so split a longer lifecycle without losing the common external trade id.
+MAX_EVENTS_PER_TRADE = 4
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,35 @@ def _archive_path(root: Path, job_id: str) -> Path:
     return root / "data" / "history-imports" / f"{job_id}.json.gz"
 
 
+def _validate_archive_document(document: object, job_id: str, connection_id: str) -> dict:
+    """Validate both freshly built and cached V2 archive group bounds."""
+    if (
+        not isinstance(document, dict)
+        or document.get("job_id") != job_id
+        or document.get("connection_id") != connection_id
+        or not isinstance(document.get("trades"), list)
+    ):
+        raise ValueError("persisted history archive identity is invalid")
+    for group in document["trades"]:
+        if not isinstance(group, dict):
+            raise ValueError("persisted history archive trade invalid")
+        external_id = group.get("external_trade_id")
+        events = group.get("events")
+        if (
+            not isinstance(external_id, str)
+            or not external_id
+            or not isinstance(events, list)
+            or not 1 <= len(events) <= MAX_EVENTS_PER_TRADE
+            or any(
+                not isinstance(event, dict)
+                or str(event.get("external_trade_id") or "") != external_id
+                for event in events
+            )
+        ):
+            raise ValueError("persisted history archive trade invalid")
+    return document
+
+
 def _decode_archive(path: Path, job_id: str, connection_id: str) -> tuple[bytes, dict]:
     compressed = path.read_bytes()
     if len(compressed) > MAX_COMPRESSED_BYTES:
@@ -42,14 +75,7 @@ def _decode_archive(path: Path, job_id: str, connection_id: str) -> tuple[bytes,
     if len(raw) > MAX_UNCOMPRESSED_BYTES:
         raise ValueError("history archive exceeds uncompressed limit")
     document = json.loads(raw)
-    if (
-        not isinstance(document, dict)
-        or document.get("job_id") != job_id
-        or document.get("connection_id") != connection_id
-        or not isinstance(document.get("trades"), list)
-    ):
-        raise ValueError("persisted history archive identity is invalid")
-    return compressed, document
+    return compressed, _validate_archive_document(document, job_id, connection_id)
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
@@ -118,10 +144,15 @@ def build_history_archive(
         "history_mode": history_mode,
         "from_date": from_date.astimezone(timezone.utc).isoformat() if from_date else None,
         "trades": [
-            {"external_trade_id": external_id, "events": trade_events}
+            {
+                "external_trade_id": external_id,
+                "events": trade_events[offset : offset + MAX_EVENTS_PER_TRADE],
+            }
             for external_id, trade_events in grouped.items()
+            for offset in range(0, len(trade_events), MAX_EVENTS_PER_TRADE)
         ],
     }
+    _validate_archive_document(document, job_id, connection_id)
     raw = json.dumps(
         document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -147,6 +178,7 @@ def deliver_history_archive(
     lease_id: str,
     archive: HistoryArchive,
     require_lease: Callable[[], None],
+    retain_archive: bool = False,
 ) -> dict:
     require_lease()
     prepared = api.history_file_prepare(
@@ -160,10 +192,11 @@ def deliver_history_archive(
     if prepared.get("error_code") == "lease_lost":
         raise RuntimeError("lease_lost")
     if prepared["already_imported"]:
-        try:
-            archive.path.unlink()
-        except FileNotFoundError:
-            pass
+        if not retain_archive:
+            try:
+                archive.path.unlink()
+            except FileNotFoundError:
+                pass
         return {
             "accepted": prepared["accepted"],
             "inserted": prepared["inserted"],
@@ -175,8 +208,9 @@ def deliver_history_archive(
     imported = api.history_file_import(job_id, lease_id, archive.event_count)
     if imported.get("error_code") == "lease_lost":
         raise RuntimeError("lease_lost")
-    try:
-        archive.path.unlink()
-    except FileNotFoundError:
-        pass
+    if not retain_archive:
+        try:
+            archive.path.unlink()
+        except FileNotFoundError:
+            pass
     return imported

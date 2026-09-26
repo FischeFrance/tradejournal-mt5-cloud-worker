@@ -57,6 +57,7 @@ from .runtime_config import (
 )
 from .security import canonical_uuid
 from .state_store import atomic_json, read_json
+from .worker.native_mt5_runtime import SOURCE_RECOVERY_REQUIRED
 
 
 SCHEMA_VERSION = 1
@@ -1807,6 +1808,15 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
             pass
         raise
     except Exception as exc:
+        # Source replay is a deliberate, local continuity state. It must be
+        # visible to the guarded caller as retryable instead of collapsing into
+        # a generic deployment failure that surrounding account workflows may
+        # treat as an initialization fault.
+        failure_code = (
+            SOURCE_RECOVERY_REQUIRED
+            if getattr(exc, "error_code", None) == SOURCE_RECOVERY_REQUIRED
+            else "deployment_convergence_failed"
+        )
         failure_detail = (
             str(exc)[:200]
             if isinstance(exc, Mt5MaintenanceError)
@@ -1819,7 +1829,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
                     **attempt,
                     "status": "failed",
                     "finished_at_unix_ms": int(time.time() * 1000),
-                    "failure_code": "deployment_convergence_failed",
+                    "failure_code": failure_code,
                     "failure_detail": failure_detail,
                 },
             )
@@ -1829,7 +1839,7 @@ def _converge(request: dict[str, Any]) -> dict[str, Any]:
             _write_activation_schedule_state(config, request, status="failed")
         except DeployGuardError:
             pass
-        raise DeployGuardError("deployment_convergence_failed") from exc
+        raise DeployGuardError(failure_code) from exc
     record = {
         **_binding(request),
         "nonce": request["nonce"],
@@ -2199,6 +2209,7 @@ def _verify_active(request: dict[str, Any]) -> dict[str, Any]:
             or account.get("trade_allowed") is not False
             or heartbeat.get("terminal_connected") is not True
             or heartbeat.get("account_trade_allowed") is not False
+            or heartbeat.get("source_recovery_required") is not False
             or health_now_ms - min(account_ms, heartbeat_ms) > max_age * 1000
             or max(account_ms, heartbeat_ms) > health_now_ms + 2000
             or not barrier["activation_started_at_unix_ms"] - 2000

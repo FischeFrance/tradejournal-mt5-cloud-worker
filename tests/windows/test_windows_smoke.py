@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+import pytest
 
 from windows_agent.job_runner import JobRunner
 from windows_agent.provisioning.mt5_instance import InstanceProvisioner
@@ -98,8 +102,6 @@ def test_full_mock_agent_smoke(tmp_path, monkeypatch):
 
 
 def test_powershell_scripts_parse():
-    import subprocess
-
     root = Path(__file__).parents[2] / "scripts" / "windows"
     for script in root.glob("*.ps1"):
         command = f"[scriptblock]::Create((Get-Content -Raw -LiteralPath '{script}')) | Out-Null"
@@ -109,3 +111,26 @@ def test_powershell_scripts_parse():
             text=True,
         )
         assert result.returncode == 0, f"{script.name}: {result.stderr}"
+
+
+def test_mt5_compiler_selector():
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    repository = Path(__file__).parents[2]
+    script = repository / "tests" / "windows" / "verify_mt5_compiler_selection.ps1"
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(script),
+            "-RepositoryRoot",
+            str(repository),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

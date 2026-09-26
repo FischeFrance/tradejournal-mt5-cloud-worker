@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from windows_agent.api_client import AgentApiClient
+from windows_agent.agent_errors import SourceRecoveryRequired
 from windows_agent.config import AgentConfig
 from windows_agent.job_runner import JobRunner
 from windows_agent.provisioning.instance_layout import InstanceLayout, SUBDIRS
@@ -161,7 +162,10 @@ def test_partial_close_and_new_deal():
         "deals": {"9": {"position_ticket": "1", "commission": -1, "swap": -0.2}},
     }
     events = detect_windows_events(old, new)
-    assert any(
+    # Snapshot-only volume reductions contain no closing deal economics. They
+    # are intentionally not emitted as generic partial closes (LiveSync asks
+    # the managed bridge for certified history before advancing this state).
+    assert not any(
         x["event_type"] == "trade_volume_changed" and x["partial_close"] for x in events
     )
     assert any(x["event_type"] == "deal_recorded" for x in events)
@@ -205,6 +209,39 @@ def test_lease_lost_never_completes(tmp_path):
         tmp_path / "job.json", api, {"provision": lambda job: {"ok": True}}
     )
     assert runner.run_once() is False and "complete" not in api.transitions
+
+
+def test_job_runner_preserves_explicit_source_recovery_error_code(tmp_path):
+    class Api:
+        def __init__(self) -> None:
+            self.jobs = [{
+                "job_id": "j-source", "job_type": "provision",
+                "connection_id": "c", "lease_id": "l",
+            }]
+            self.transitions: list[tuple[str, dict | None]] = []
+
+        def claim(self):
+            return self.jobs.pop(0) if self.jobs else {}
+
+        @staticmethod
+        def heartbeat(_job, _lease):
+            return {"lease_valid": True}
+
+        def transition(self, _job, _lease, status, result=None):
+            self.transitions.append((status, result))
+            return {"status": "failed" if status == "fail" else status}
+
+    api = Api()
+    runner = JobRunner(
+        tmp_path / "job.json",
+        api,
+        {"provision": lambda _job: (_ for _ in ()).throw(SourceRecoveryRequired("retry"))},
+    )
+
+    assert runner.run_once() is True
+    assert api.transitions[-1] == (
+        "fail", {"error_code": "source_recovery_required"}
+    )
 
 
 def test_fake_provision_deprovision_idempotent(tmp_path, monkeypatch):

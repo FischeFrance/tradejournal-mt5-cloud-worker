@@ -57,7 +57,18 @@ class FakeNativeRuntime:
         files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"
         files.mkdir(parents=True, exist_ok=True)
         records = {
-            "heartbeat.json": {"terminal_connected": True, "account_trade_allowed": False},
+            # The managed bridge now advertises the v2 recovery fence even
+            # before the first Windows recovery request (its coherent initial
+            # state is 0/0).  Keep this end-to-end fake on the same contract
+            # so it cannot silently exercise a legacy mixed rollout.
+            "heartbeat.json": {
+                "terminal_connected": True,
+                "account_trade_allowed": False,
+                "source_recovery_required": False,
+                "source_recovery_protocol_version": 2,
+                "source_recovery_request_generation": 0,
+                "source_recovery_ack_generation": 0,
+            },
             "account.json": {
                 "login": "42",
                 "server": "Demo",
@@ -81,6 +92,40 @@ class FakeNativeRuntime:
 
     def resume(self, **kwargs: Any) -> NativeMt5Status:
         return self.start(**kwargs)
+
+    def switch_to_new_only(self, timeout: float = 30.0) -> dict[str, object]:
+        """Model the in-process V2 history→live handoff, without a restart."""
+
+        assert timeout > 0
+        files = self.root / "terminal" / "MQL5" / "Files" / "TradeJournal"
+        heartbeat_path = files / "heartbeat.json"
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        sequence = int(heartbeat["sequence"]) + 1
+        generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for name in (
+            "heartbeat.json",
+            "account.json",
+            "positions.json",
+            "orders.json",
+            "history_orders.json",
+            "deals.json",
+        ):
+            path = files / name
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            envelope["sequence"] = sequence
+            envelope["generated_at"] = generated_at
+            if name == "heartbeat.json":
+                envelope["payload"].update(
+                    {
+                        "history_mode": "new_only",
+                        "source_recovery_required": False,
+                        "source_recovery_protocol_version": 2,
+                        "source_recovery_request_generation": 0,
+                        "source_recovery_ack_generation": 0,
+                    }
+                )
+            path.write_text(json.dumps(envelope), encoding="utf-8")
+        return dict(heartbeat["payload"])
 
     @staticmethod
     def stop() -> bool:
@@ -262,6 +307,12 @@ def test_native_historical_sync_routes_new_only_to_incremental_sync(
 ) -> None:
     """A recovery job must not enter the bounded full-history importer."""
     cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
+    state = tmp_path / "instances" / cid / "state"
+    # Provision's all-history bootstrap intentionally leaves its audit record
+    # behind after activation. The later recovery below exercises the exact
+    # committed-pending path rather than a no-artifact shortcut.
+    assert (state / "history-handoff-pending.json").is_file()
+    assert (state / "history-live-handoff.json").is_file()
 
     def reject_full_import(*_args: object) -> dict[str, int]:
         raise AssertionError("new_only must not use the full-history importer")
@@ -287,6 +338,46 @@ def test_native_historical_sync_routes_new_only_to_incremental_sync(
     assert status == "complete"
     assert result is not None
     assert result["result"]["imported_deals"] == 0
+
+
+def test_native_historical_sync_rejects_uncommitted_pending_new_only_before_import(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An incoherent ACTIVE record cannot turn a prior handoff into live sync."""
+    cid, api, handlers = _provisioned_env(tmp_path, monkeypatch)
+    state = tmp_path / "instances" / cid / "state"
+    active_path = state / "history-live-handoff.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    active["archive_sha256"] = "0" * 64
+    active_path.write_text(json.dumps(active), encoding="utf-8")
+
+    full_import_calls: list[object] = []
+
+    def reject_full_import(*_args: object) -> dict[str, int]:
+        full_import_calls.append("called")
+        raise AssertionError("new_only must not use the full-history importer")
+
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_control_plane_history_import",
+        reject_full_import,
+    )
+    api.jobs.append({
+        "job_id": "history-new-only-uncommitted",
+        "job_type": "historical_sync",
+        "connection_id": cid,
+        "lease_id": "2",
+        "history_mode": "new_only",
+        "payload": {},
+    })
+
+    assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once()
+
+    _, status, result = api.transitions[-1]
+    assert status == "fail"
+    assert result == {"error_code": "history_sync_failed"}
+    assert full_import_calls == []
 
 
 def test_legacy_live_sync_job_sends_one_health_heartbeat(tmp_path: Path, monkeypatch) -> None:

@@ -15,7 +15,12 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from windows_agent import real_handlers
-from windows_agent.agent_errors import DeprovisionFailed
+from windows_agent.agent_errors import (
+    DeprovisionFailed,
+    HistorySyncFailed,
+    Mt5InitializeFailed,
+    SourceRecoveryRequired,
+)
 from windows_agent.agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
 from windows_agent.job_runner import JobRunner, LeaseLost
 from windows_agent.provisioning.instance_layout import InstanceLayout
@@ -28,6 +33,8 @@ from windows_agent.worker.direct_mt5_adapter import (
     Mt5Error,
     Mt5IpcError,
 )
+from windows_agent.worker.native_mt5_runtime import NativeMt5Error
+from windows_agent.worker.live_sync import CertifiedHistoryRecoveryRequired
 
 ENCRYPTION_KEY = base64.b64encode(b"0" * 32).decode("ascii")
 
@@ -319,6 +326,61 @@ def test_provision_missing_envelope_is_credential_envelope_invalid(env):
     with pytest.raises(Exception) as exc_info:
         handlers["provision"](job)
     assert exc_info.value.error_code == "credential_envelope_invalid"
+
+
+def test_source_recovery_maps_to_explicit_retryable_history_sync_failure() -> None:
+    mapped = real_handlers._map_mt5_error(
+        NativeMt5Error("source_recovery_required")
+    )
+
+    assert isinstance(mapped, HistorySyncFailed)
+    assert isinstance(mapped, SourceRecoveryRequired)
+    assert mapped.error_code == "source_recovery_required"
+
+
+def test_investor_access_distinguishes_source_recovery_from_invalid_state() -> None:
+    class SourceRecoveryAdapter:
+        @staticmethod
+        def account_info():
+            return SimpleNamespace(trade_allowed=False)
+
+        @staticmethod
+        def connection_state():
+            return {"source_recovery_required": True}
+
+        @staticmethod
+        def terminal_info():
+            raise AssertionError("source recovery must short-circuit before readiness")
+
+    with pytest.raises(SourceRecoveryRequired, match="^source_recovery_required$"):
+        real_handlers._verify_investor_access(SourceRecoveryAdapter())
+
+    class InvalidAdapter(SourceRecoveryAdapter):
+        @staticmethod
+        def connection_state():
+            return {"source_recovery_required": None}
+
+    with pytest.raises(Mt5InitializeFailed, match="source continuity state invalid"):
+        real_handlers._verify_investor_access(InvalidAdapter())
+
+
+def test_live_sync_recovery_is_mapped_to_explicit_control_plane_code(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecoveringLiveSync:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        @staticmethod
+        def poll_once() -> int:
+            raise CertifiedHistoryRecoveryRequired("source replay needed")
+
+    monkeypatch.setattr(real_handlers, "LiveSync", RecoveringLiveSync)
+
+    with pytest.raises(SourceRecoveryRequired) as exc_info:
+        real_handlers._run_live_sync_once(object(), tmp_path)
+
+    assert exc_info.value.error_code == "source_recovery_required"
 
 
 def test_provision_wrong_key_is_credential_decryption_failed(env):
@@ -723,6 +785,110 @@ def test_native_historical_sync_routes_new_only_to_incremental_sync(
     assert result["imported_orders"] == 0
     assert result["imported_deals"] == 0
     assert calls == ["incremental"]
+
+
+def test_native_historical_sync_retries_pending_handoff_without_stop_or_restart(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable V2 handoff must be resumed before any terminal mutation."""
+    cid = str(uuid4())
+    root = InstanceProvisioner(env.instances_root, env.secrets_root).provision(
+        cid, env.source_terminal
+    )
+    store = WindowsSecretStore(env.secrets_root)
+    store.write(cid, "mt5_login", "12345")
+    store.write(cid, "mt5_server", "Demo-Server")
+    expert = env.instances_root.parent / "TradeJournalBridge.ex5"
+    expert.write_bytes(b"bridge-v2")
+    expert_sha256 = hashlib.sha256(expert.read_bytes()).hexdigest()
+    (root / "state").mkdir(exist_ok=True)
+    (root / "state" / "history-handoff-pending.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": "job-historical_sync",
+                "connection_id": cid,
+                "delivery": {"inserted": 1, "duplicates": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        InstanceProvisioner,
+        "validate_runtime_assets",
+        lambda *_args: "a" * 64,
+    )
+    monkeypatch.setattr(
+        real_handlers.ProcessManager,
+        "find",
+        staticmethod(lambda _terminal: []),
+    )
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+            self.install_calls = 0
+            self.resume_calls = 0
+            self.switch_calls = 0
+
+        def stop(self) -> bool:
+            self.stop_calls += 1
+            raise AssertionError("pending handoff must not stop MT5")
+
+        def install_expert(self, *_args: object) -> None:
+            self.install_calls += 1
+
+        def resume(self, **_kwargs: object) -> None:
+            self.resume_calls += 1
+
+        def switch_to_new_only(self) -> None:
+            self.switch_calls += 1
+
+    class Adapter:
+        @staticmethod
+        def account_info():
+            return SimpleNamespace(trade_allowed=False)
+
+        @staticmethod
+        def terminal_info():
+            return SimpleNamespace(connected=True)
+
+    runtime = Runtime()
+    control_calls: list[object] = []
+    activation_calls: list[object] = []
+    monkeypatch.setattr(real_handlers, "Mql5FileMt5Adapter", lambda *_args: Adapter())
+    monkeypatch.setattr(
+        real_handlers,
+        "_run_control_plane_history_import",
+        lambda *_args: control_calls.append("retry")
+        or {"orders": 0, "deals": 1, "positions": 1, "events": 1, "delivered": 1},
+    )
+    monkeypatch.setattr(
+        real_handlers,
+        "_activate_v2_history_handoff",
+        lambda *_args: activation_calls.append("activate") or 7,
+    )
+
+    result = build_real_handlers(
+        FakeApi(),
+        instances_root=env.instances_root,
+        secrets_root=env.secrets_root,
+        source_terminal=env.source_terminal,
+        process_factory=FakeProcessManager,
+        expert_binary=expert,
+        expert_sha256=expert_sha256,
+        runtime_factory=lambda *_args: runtime,
+    )["historical_sync"](_job("historical_sync", cid, history_mode="all_available"))
+
+    assert result["imported_deals"] == 1
+    assert control_calls == ["retry"]
+    assert activation_calls == ["activate"]
+    assert runtime.stop_calls == 0
+    assert runtime.install_calls == 0
+    assert runtime.resume_calls == 0
+    assert runtime.switch_calls == 1
 
 
 def test_historical_sync_reuses_dpapi_credentials_and_imports_records(env):

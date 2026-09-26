@@ -79,6 +79,22 @@ class TradingIngestionSink:
         connected: bool,
         account_snapshot: dict[str, Any] | None = None,
     ) -> DrainResult:
+        self.enqueue_connection_transition(
+            connection_id,
+            sequence,
+            connected,
+            account_snapshot,
+        )
+        return self.flush_transitions()
+
+    def enqueue_connection_transition(
+        self,
+        connection_id: str,
+        sequence: int,
+        connected: bool,
+        account_snapshot: dict[str, Any] | None = None,
+    ) -> int:
+        """Persist a transition before any network delivery is attempted."""
         payload: dict[str, Any] = {
             "event_id": (
                 f"connection-transition:{connection_id}:{sequence}:{int(connected)}"
@@ -88,8 +104,7 @@ class TradingIngestionSink:
         }
         if connected and account_snapshot:
             payload.update(account_snapshot)
-        self._transition_outbox.enqueue_many([payload])
-        return self.flush_transitions()
+        return self._transition_outbox.enqueue_many([payload])
 
     def send_heartbeat(self, account_info: Any | None = None) -> bool:
         payload: dict[str, Any] = {"event_type": "heartbeat"}

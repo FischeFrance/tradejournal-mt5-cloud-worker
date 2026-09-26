@@ -34,6 +34,7 @@ from .agent_errors import (
     Mt5InitializeFailed,
     SecretStoreFailed,
     ServerIdentityMismatch,
+    SourceRecoveryRequired,
     TerminalStartFailed,
 )
 from .agent_secrets import AGENT_SCOPE_ID, PROVISIONING_KEY_SECRET_NAME
@@ -90,10 +91,15 @@ from .worker.historical_trade_import import (
     build_historical_trade_events,
 )
 from .worker.history_file_import import build_history_archive, deliver_history_archive
-from .worker.live_sync import LiveSync
+from .worker.history_balance import reconstruct_trade_deals
+from .worker.live_sync import CertifiedHistoryRecoveryRequired, LiveSync
 from .worker.local_event_sink import LocalEventSink
 from .worker.mql5_file_adapter import Mql5FileMt5Adapter
-from .worker.native_mt5_runtime import NativeMt5Error, NativeMt5Runtime
+from .worker.native_mt5_runtime import (
+    SOURCE_RECOVERY_REQUIRED,
+    NativeMt5Error,
+    NativeMt5Runtime,
+)
 from .worker.trading_ingestion_sink import TradingIngestionSink
 
 
@@ -376,6 +382,11 @@ def _map_mt5_error(exc: Mt5Error) -> AgentError:
     if isinstance(exc, (Mt5IpcError, Mt5ProcessCrashed)):
         return Mt5InitializeFailed(str(exc))
     text = str(exc).casefold()
+    if text == SOURCE_RECOVERY_REQUIRED:
+        # The terminal remains authenticated but its local source journal is
+        # rebuilding. This must be retried through the history path, not
+        # classified as a broken MT5 initialization.
+        return SourceRecoveryRequired(SOURCE_RECOVERY_REQUIRED)
     if text == "server_identity_mismatch":
         return ServerIdentityMismatch("server_identity_mismatch")
     if (
@@ -384,6 +395,12 @@ def _map_mt5_error(exc: Mt5Error) -> AgentError:
     ):
         return Mt5AuthorizationFailed(str(exc))
     return Mt5InitializeFailed(str(exc))
+
+
+def _is_source_recovery_failure(exc: BaseException) -> bool:
+    """Return true only for the explicit, retryable continuity state."""
+
+    return isinstance(exc, SourceRecoveryRequired)
 
 
 _ENDPOINT_FAILURE_REASONS = {
@@ -679,11 +696,24 @@ def recover_startup_instances(
             )
             recovered.append(connection_id)
         except Exception as exc:
-            if runtime is not None:
+            source_recovery = (
+                isinstance(exc, NativeMt5Error)
+                and str(exc) == SOURCE_RECOVERY_REQUIRED
+            )
+            if runtime is not None and not source_recovery:
                 try:
                     runtime.stop()
                 except Exception:
                     pass
+            if source_recovery:
+                # Resume intentionally leaves the authenticated EA alive so
+                # its next timer can persist/replay the source boundary.
+                _progress(
+                    root,
+                    status=SOURCE_RECOVERY_REQUIRED,
+                    recovery="service_startup",
+                    connection_id=connection_id,
+                )
             connection_label = str(raw_connection_id)
             failed.append(connection_label)
             error_code = (
@@ -1533,7 +1563,17 @@ def build_real_handlers(
             # Lease uncertainty is not authority to destroy local state: a
             # reclaimed job may already be continuing on another agent.
             raise
-        except Exception:
+        except Exception as exc:
+            if _is_source_recovery_failure(exc):
+                # This status is a durable, retryable recovery job. The
+                # terminal is already alive and must not be discarded merely
+                # because it has not yet certified its source watermark.
+                _progress_if_exists(
+                    root,
+                    status=SOURCE_RECOVERY_REQUIRED,
+                    connection_id=cid,
+                )
+                raise
             if protected_at_start or _is_protected_instance(root, cid):
                 # A failed duplicate/re-provision attempt must never remove a
                 # previously activated account.
@@ -1605,47 +1645,53 @@ def build_real_handlers(
             runtime = _configure_runtime(runtime_factory(root, cid), job)
             restored = False
             terminal_stopped = False
+            history_runtime_running = False
             try:
-                if not runtime.stop():
-                    raise TerminalStartFailed("terminal_stop_failed")
-                terminal_stopped = True
-                runtime.install_expert(expert_binary, mode, from_date)
-                provisioner.record_verified_managed_asset_update(
-                    root, cid, trusted_expert_sha256
-                )
-                runtime.resume(
-                    login=login,
-                    server=server,
-                    expert_binary=expert_binary,
-                    history_mode=mode,
-                    history_from=from_date,
-                )
-                try:
-                    process_factory(state_path).adopt(terminal)
-                except (AttributeError, RuntimeError):
-                    pass
-                _progress(root, status="importing_history")
-                adapter = Mql5FileMt5Adapter(
-                    root / "terminal" / "MQL5" / "Files" / "TradeJournal",
-                    cid,
-                    login,
-                    server,
-                    root / "state",
-                )
-                _verify_investor_access(adapter)
-                if mode == "new_only":
-                    # Incremental recovery is local and checkpointed.  It must
-                    # not enter the bounded full-history import path below.
-                    counts = _run_history_sync(
-                        adapter,
-                        root,
-                        mode,
-                        from_date,
-                        ingestion_sink,
-                        str(login),
-                        server,
+                pending_handoff = _v2_handoff_pending_path(root)
+                pending_artifact = read_json(pending_handoff, {})
+                active_handoff = read_json(_v2_handoff_active_path(root), {})
+                # Activation retains the pending artifact as a durable audit
+                # record.  It is no longer unfinished work when ACTIVE proves
+                # the exact same archive/baseline has become live.  In that
+                # state a later ``new_only`` recovery must stay in the live
+                # EA: routing it through the control-plane history importer
+                # is invalid (that importer deliberately accepts only bounded
+                # or all-history jobs), and stopping MT5 would reopen the
+                # archive-to-live blind window we just closed.
+                completed_prior_handoff = (
+                    pending_handoff.exists()
+                    and _v2_handoff_pending_is_committed(
+                        pending_artifact,
+                        active_handoff,
+                        connection_id=cid,
                     )
-                else:
+                    and pending_artifact.get("job_id") != str(job["job_id"])
+                )
+                if pending_handoff.exists() and not completed_prior_handoff:
+                    # A persisted frozen archive/baseline is a recovery
+                    # commit. Never stop or reconfigure its EA before retrying
+                    # the exact pending delivery/activation: doing so would
+                    # open the very archive→live blind window the artifact
+                    # exists to close. A different job is rejected by the
+                    # control-plane helper without touching the terminal.
+                    if mode == "new_only":
+                        # A new_only job has no immutable archive to retry.
+                        # Never give it to the full-history importer merely
+                        # because a prior handoff is incomplete or corrupt:
+                        # that importer correctly rejects this mode, but the
+                        # rejection must occur before any ambiguous handoff
+                        # action can be attempted.
+                        raise HistorySyncFailed(
+                            "unfinished history handoff requires its original full-history retry"
+                        )
+                    adapter = Mql5FileMt5Adapter(
+                        root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+                        cid,
+                        login,
+                        server,
+                        root / "state",
+                    )
+                    _verify_investor_access(adapter)
                     counts = _run_control_plane_history_import(
                         adapter,
                         root,
@@ -1656,25 +1702,162 @@ def build_real_handlers(
                         str(login),
                         server,
                     )
-            except NativeMt5Error as exc:
-                raise _map_mt5_error(exc) from exc
-            finally:
-                if terminal_stopped:
+                    runtime.switch_to_new_only()
+                    live_adapter = Mql5FileMt5Adapter(
+                        root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+                        cid,
+                        login,
+                        server,
+                        root / "state",
+                    )
+                    _verify_investor_access(live_adapter)
+                    _activate_v2_history_handoff(live_adapter, root, job)
+                    archive_path = root / "data" / "history-imports" / f"{job['job_id']}.json.gz"
                     try:
-                        recovery_from = new_only_recovery_from(root)
-                        runtime.stop()
-                        runtime.resume(
-                            login=login,
-                            server=server,
-                            expert_binary=expert_binary,
-                            history_mode="new_only",
-                            history_from=recovery_from,
-                        )
+                        archive_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    restored = True
+                elif completed_prior_handoff and mode == "new_only":
+                    adapter = Mql5FileMt5Adapter(
+                        root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+                        cid,
+                        login,
+                        server,
+                        root / "state",
+                    )
+                    _verify_investor_access(adapter)
+                    counts = _run_history_sync(
+                        adapter,
+                        root,
+                        mode,
+                        from_date,
+                        ingestion_sink,
+                        str(login),
+                        server,
+                    )
+                    # The EA is already running new_only behind an active
+                    # handoff.  Do not switch/stop it a second time.
+                    restored = True
+                else:
+                    if not runtime.stop():
+                        raise TerminalStartFailed("terminal_stop_failed")
+                    terminal_stopped = True
+                    runtime.install_expert(expert_binary, mode, from_date)
+                    provisioner.record_verified_managed_asset_update(
+                        root, cid, trusted_expert_sha256
+                    )
+                    runtime.resume(
+                        login=login,
+                        server=server,
+                        expert_binary=expert_binary,
+                        history_mode=mode,
+                        history_from=from_date,
+                    )
+                    history_runtime_running = True
+                    try:
                         process_factory(state_path).adopt(terminal)
+                    except (AttributeError, RuntimeError):
+                        pass
+                    _progress(root, status="importing_history")
+                    adapter = Mql5FileMt5Adapter(
+                        root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+                        cid,
+                        login,
+                        server,
+                        root / "state",
+                    )
+                    _verify_investor_access(adapter)
+                    if mode == "new_only":
+                        # Incremental recovery is local and checkpointed.  It must
+                        # not enter the bounded full-history import path below.
+                        counts = _run_history_sync(
+                            adapter,
+                            root,
+                            mode,
+                            from_date,
+                            ingestion_sink,
+                            str(login),
+                            server,
+                        )
+                        # The runtime was already resumed in new_only; do not
+                        # stop/restart it merely to activate the live supervisor.
                         restored = True
+                    else:
+                        counts = _run_control_plane_history_import(
+                            adapter,
+                            root,
+                            api,
+                            job,
+                            mode,
+                            from_date,
+                            str(login),
+                            server,
+                        )
+                        # Archive acceptance precedes any acknowledgement. If
+                        # this was a full-ledger V2 handoff, switch in place
+                        # then acknowledge its exact frozen anchor. A bounded
+                        # archive has no prefix activation; its pending files
+                        # remain for ordinary live delivery after the same
+                        # in-place mode switch.
+                        runtime.switch_to_new_only()
+                        live_adapter = Mql5FileMt5Adapter(
+                            root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+                            cid,
+                            login,
+                            server,
+                            root / "state",
+                        )
+                        _verify_investor_access(live_adapter)
+                        if _v2_handoff_pending_path(root).exists():
+                            _activate_v2_history_handoff(live_adapter, root, job)
+                            archive_path = root / "data" / "history-imports" / f"{job['job_id']}.json.gz"
+                            try:
+                                archive_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                        restored = True
+            except NativeMt5Error as exc:
+                if str(exc) == SOURCE_RECOVERY_REQUIRED:
+                    # resume()/switch_to_new_only() left the EA running; do
+                    # not invoke the finally restoration path and create a
+                    # second blind window before the source replay completes.
+                    restored = True
+                raise _map_mt5_error(exc) from exc
+            except HistorySyncFailed as exc:
+                if _is_source_recovery_failure(exc):
+                    # A file-adapter heartbeat can expose the same state after
+                    # resume succeeds. It is still an in-place recovery, not
+                    # authority to stop/reconfigure the terminal.
+                    restored = True
+                raise
+            finally:
+                if terminal_stopped and not restored:
+                    try:
+                        if history_runtime_running:
+                            # Once the frozen history EA has run, never create
+                            # a stop/resume blind window. Its in-place switch
+                            # is also the safest failure recovery: pending
+                            # archive state remains durable for a later retry.
+                            runtime.switch_to_new_only()
+                        else:
+                            # The terminal was stopped before the history EA
+                            # ever became live, so no frozen boundary exists.
+                            # Starting new_only here restores availability
+                            # without an additional stop operation.
+                            recovery_from = new_only_recovery_from(root)
+                            runtime.resume(
+                                login=login,
+                                server=server,
+                                expert_binary=expert_binary,
+                                history_mode="new_only",
+                                history_from=recovery_from,
+                            )
+                            process_factory(state_path).adopt(terminal)
+                            restored = True
                     except Exception as exc:
                         raise LiveSyncFailed(
-                            "Auto-Sync could not be restored after history import"
+                            "Auto-Sync could not be restored safely after history import"
                         ) from exc
             if restored and ingestion_sink is not None:
                 live_adapter = Mql5FileMt5Adapter(
@@ -1883,6 +2066,8 @@ def build_real_handlers(
                     raise AccountIdentityMismatch(code) from exc
                 if code == "terminal_start_failed":
                     raise TerminalStartFailed(code) from exc
+                if code == SOURCE_RECOVERY_REQUIRED:
+                    raise SourceRecoveryRequired(code) from exc
                 raise Mt5InitializeFailed(code) from exc
             except (OSError, ValueError) as exc:
                 raise InstanceProvisionFailed(
@@ -1995,6 +2180,16 @@ def _discard_failed_provision(
 
 def _verify_investor_access(adapter: Any) -> Any:
     account = adapter.account_info()
+    connection_state = getattr(adapter, "connection_state", None)
+    if callable(connection_state):
+        state = connection_state()
+        # A file adapter with this capability must explicitly certify its
+        # source journal.  Do not let the legacy terminal_info façade turn a
+        # missing/true/nonboolean flag into an activation acknowledgement.
+        if isinstance(state, dict) and state.get("source_recovery_required") is True:
+            raise SourceRecoveryRequired(SOURCE_RECOVERY_REQUIRED)
+        if not isinstance(state, dict) or state.get("source_recovery_required") is not False:
+            raise Mt5InitializeFailed("source continuity state invalid")
     terminal_info = adapter.terminal_info()
     if not bool(getattr(terminal_info, "connected", False)):
         raise Mt5InitializeFailed("terminal not connected")
@@ -2009,6 +2204,66 @@ def _history_time(value: object) -> str:
     if isinstance(value, str) and value:
         return value
     return datetime.now(timezone.utc).isoformat()
+
+
+def _history_moment(value: object) -> datetime | None:
+    """Parse a broker timestamp without silently substituting ``now``."""
+    if isinstance(value, datetime):
+        return (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (
+        parsed.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None
+        else parsed.astimezone(timezone.utc)
+    )
+
+
+def _window_projected_history_rows(
+    rows: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    mode: HistoryMode,
+) -> list[dict[str, Any]]:
+    """Apply the UI window *after* walking the complete MT5 ledger.
+
+    For a bounded replay, retain a complete lifecycle only when its opening is
+    in the requested window.  This prevents a closing fill from being imported
+    without its predecessor, while preserving native ledger order for every
+    included fill.
+    """
+    if mode == "all_available":
+        return [dict(row) for row in rows if row.get("project_as_trade", True) is True]
+
+    eligible_positions = {
+        str(row.get("position_id", row.get("position_ticket", "")))
+        for row in rows
+        if row.get("project_as_trade", True) is True
+        and row.get("history_event_type") == "trade_opened"
+        and (moment := _history_moment(row.get("time", row.get("close_time")))) is not None
+        and start <= moment < end
+    }
+    return [
+        dict(row)
+        for row in rows
+        if row.get("project_as_trade", True) is True
+        and str(row.get("position_id", row.get("position_ticket", ""))) in eligible_positions
+        and (moment := _history_moment(row.get("time", row.get("close_time")))) is not None
+        and moment < end
+    ]
 
 
 def _history_event(entry: dict, login: str, server: str) -> dict:
@@ -2110,6 +2365,41 @@ def _run_history_sync(
         dedup.close()
 
 
+def _merge_history_event_lifecycles(
+    trade_events: list[dict[str, Any]], pending_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Insert an order lifecycle before its matching trade without reordering fills.
+
+    Trade events arrive in certified MT5 history-index order. A global timestamp
+    sort could invert broker fills; only a pending lifecycle sharing the same
+    external id is inserted immediately before that lifecycle's first trade.
+    Other pending groups retain their builder order after the native stream.
+    """
+    merged = list(trade_events)
+    pending_by_trade: dict[str, list[dict[str, Any]]] = {}
+    unmatched: list[dict[str, Any]] = []
+    trade_ids = {
+        str(event.get("external_trade_id", "")) for event in trade_events
+    }
+    for event in pending_events:
+        external_id = str(event.get("external_trade_id", ""))
+        if external_id in trade_ids:
+            pending_by_trade.setdefault(external_id, []).append(event)
+        else:
+            unmatched.append(event)
+    offset = 0
+    for index, event in enumerate(trade_events):
+        external_id = str(event.get("external_trade_id", ""))
+        prefix = pending_by_trade.pop(external_id, None)
+        if prefix:
+            merged[index + offset : index + offset] = prefix
+            offset += len(prefix)
+    # A malformed/empty trade id cannot be safely tied to a position. Preserve
+    # it as a standalone pending lifecycle rather than fabricating an order.
+    merged.extend(unmatched)
+    return merged
+
+
 def _run_control_plane_history_import(
     adapter: Any,
     root: Path,
@@ -2128,56 +2418,311 @@ def _run_control_plane_history_import(
     else:
         raise HistorySyncFailed("full history import requires a bounded history window")
 
-    try:
-        raw_orders = adapter.history_orders(start, now)
-        raw_deals = adapter.history_deals(start, now)
-        orders = [
-            value._asdict() if hasattr(value, "_asdict") else dict(value)
-            for value in raw_orders
-        ]
-        deals = [
-            value._asdict() if hasattr(value, "_asdict") else dict(value)
-            for value in raw_deals
-        ]
-        events, aggregate_counts = build_historical_trade_events(
-            deals, login, server
+    # A completed local activation is the recovery commit. Never query mutable
+    # MT5 again for the same job: the archived ticket set and baseline already
+    # define its history/live boundary.
+    active = read_json(_v2_handoff_active_path(root), {})
+    pending = read_json(_v2_handoff_pending_path(root), {})
+    pending_is_committed = _v2_handoff_pending_is_committed(
+        pending,
+        active,
+        connection_id=str(job["connection_id"]),
+    )
+    # An active boundary for the current job cannot make a different pending
+    # artifact safe.  In particular, do this before retiring any precommit:
+    # otherwise a crash/interleaving can silently discard A while B's caller
+    # switches the terminal and acknowledges the wrong archive.
+    if (
+        active.get("schema_version") == 1
+        and active.get("job_id") == str(job["job_id"])
+        and active.get("connection_id") == str(job["connection_id"])
+        and pending
+        and (
+            pending.get("job_id") != str(job["job_id"])
+            or pending.get("connection_id") != str(job["connection_id"])
         )
-        pending_events, pending_counts = build_historical_pending_order_events(
-            orders, login, server
-        )
-        events.extend(pending_events)
-        events.sort(key=lambda event: (str(event["event_time"]), str(event["event_type"])))
-    except Exception as exc:
-        raise HistorySyncFailed("history snapshot could not be reconstructed") from exc
+    ):
+        raise HistorySyncFailed("active history handoff has mismatched pending artifact")
+    # A process can crash after the pending/active commit but before the
+    # best-effort precommit cleanup.  An active artifact is the proof needed
+    # to retire that stale journal before a later, distinct history job.
+    _retire_committed_v2_archive_precommit(root)
+    if (
+        pending_is_committed
+        and pending.get("job_id") == str(job["job_id"])
+        and isinstance(pending.get("summary"), dict)
+    ):
+        summary = dict(pending["summary"])
+        return {
+            **summary,
+            "delivered": int(pending["delivery"]["inserted"]),
+            "duplicates": int(pending["delivery"]["duplicates"]),
+        }
 
+    if pending and (
+        pending.get("job_id") != str(job["job_id"])
+        or pending.get("connection_id") != str(job["connection_id"])
+    ):
+        # A previous job may leave its durable audit artifact after activation.
+        # It is safe to rotate only when the active commit proves that exact
+        # prior archive has already become the live boundary.
+        if pending_is_committed:
+            pending = {}
+        else:
+            raise HistorySyncFailed("unfinished history handoff conflicts with new job")
+
+    archive_preexisting = False
+    handoff_enabled = False
+    ledger_anchor: dict[str, Any] | None = None
     try:
-        archive = build_history_archive(
-            root,
-            job_id=str(job["job_id"]),
-            connection_id=str(job["connection_id"]),
-            account_number=login,
-            server=server,
-            history_mode=mode,
-            from_date=from_date,
-            events=events,
-        )
-        response = deliver_history_archive(
-            api,
-            job_id=str(job["job_id"]),
-            lease_id=str(job["lease_id"]),
-            archive=archive,
-            require_lease=lambda: _require_lease(api, job),
-        )
-        atomic_json(
-            root / "state" / "history.json",
-            {
-                "through": now.isoformat(),
+        if pending:
+            if (
+                pending.get("schema_version") != 1
+                or pending.get("job_id") != str(job["job_id"])
+                or pending.get("connection_id") != str(job["connection_id"])
+                or not isinstance(pending.get("summary"), dict)
+            ):
+                raise HistorySyncFailed("history handoff artifact mismatched")
+            summary = dict(pending["summary"])
+            archive_path = root / "data" / "history-imports" / f"{job['job_id']}.json.gz"
+            if not archive_path.is_file():
+                raise HistorySyncFailed("history handoff archive unavailable")
+            # Existing archives are decoded/identity-checked by this helper;
+            # ``events`` is ignored on this exact retry path.
+            archive = build_history_archive(
+                root,
+                job_id=str(job["job_id"]),
+                connection_id=str(job["connection_id"]),
+                account_number=login,
+                server=server,
+                history_mode=mode,
+                from_date=from_date,
+                events=[],
+            )
+            handoff_enabled = _persist_v2_history_handoff(
+                adapter,
+                root,
+                job=job,
+                archive=archive,
+                archive_preexisting=True,
+                summary=summary,
+            )
+            if not handoff_enabled:
+                raise HistorySyncFailed("history handoff adapter support changed")
+            _clear_v2_archive_precommit(root, job)
+        else:
+            archive_path = root / "data" / "history-imports" / f"{job['job_id']}.json.gz"
+            # A V2 activation consumes a contiguous native event prefix. It
+            # can be used only for an all-ledger archive; a bounded export
+            # intentionally excludes some positions from that prefix.
+            v2_prefix_handoff = (
+                mode == "all_available" and _supports_v2_history_handoff(adapter)
+            )
+            archive_preexisting = archive_path.exists()
+            if archive_preexisting:
+                # Only the explicit precommit can prove that these bytes were
+                # never submitted: a crash could have occurred after archive
+                # construction but before the frozen handoff artifact.  Drop
+                # and rebuild those bytes against a fresh coherent bundle.
+                if v2_prefix_handoff:
+                    _discard_orphan_v2_archive(root, job, archive_path)
+                    archive_preexisting = False
+            ledger_bundle_reader = getattr(adapter, "history_ledger_bundle", None)
+            orders_bundle_reader = getattr(adapter, "history_orders_bundle", None)
+            frozen_snapshot: dict[str, Any] | None = None
+            frozen_checkpoint: dict[str, Any] | None = None
+            expected_sequence: int | None = None
+            if callable(ledger_bundle_reader) and callable(orders_bundle_reader):
+                # The V2 archive, snapshot baseline and event acknowledgement
+                # must share one producer generation. Retry instead of binding
+                # a later checkpoint to mutable history bytes.
+                for _attempt in range(3):
+                    ledger_anchor, raw_ledger, ledger_sequence = ledger_bundle_reader()
+                    raw_orders, orders_sequence = orders_bundle_reader(start, now)
+                    candidate_snapshot = adapter.snapshot()
+                    candidate_checkpoint = adapter.checkpoint()
+                    checkpoint_sequence = (
+                        candidate_checkpoint.get("sequence")
+                        if isinstance(candidate_checkpoint, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(ledger_sequence, int)
+                        and ledger_sequence == orders_sequence == checkpoint_sequence
+                        and isinstance(candidate_snapshot, dict)
+                    ):
+                        frozen_snapshot = candidate_snapshot
+                        frozen_checkpoint = candidate_checkpoint
+                        expected_sequence = ledger_sequence
+                        break
+                else:
+                    raise HistorySyncFailed("history handoff boundary unstable")
+                reconstructed = reconstruct_trade_deals(raw_ledger, ledger_anchor)
+                raw_deals = tuple(
+                    _window_projected_history_rows(
+                        [dict(row) for row in reconstructed], start, now, mode
+                    )
+                )
+            else:
+                raw_orders = adapter.history_orders(start, now)
+                ledger_reader = getattr(adapter, "history_ledger", None)
+                if callable(ledger_reader):
+                    ledger_anchor, raw_ledger = ledger_reader()
+                    reconstructed = reconstruct_trade_deals(raw_ledger, ledger_anchor)
+                    raw_deals = tuple(
+                        _window_projected_history_rows(
+                            [dict(row) for row in reconstructed], start, now, mode
+                        )
+                    )
+                else:
+                    # Legacy/direct adapters do not publish a certified full ledger.
+                    raw_deals = adapter.history_deals(start, now)
+            orders = [
+                value._asdict() if hasattr(value, "_asdict") else dict(value)
+                for value in raw_orders
+            ]
+            deals = [
+                value._asdict() if hasattr(value, "_asdict") else dict(value)
+                for value in raw_deals
+            ]
+            trade_events, aggregate_counts = build_historical_trade_events(deals, login, server)
+            pending_events, pending_counts = build_historical_pending_order_events(orders, login, server)
+            # The frozen archive can already contain a terminal pending-order
+            # lifecycle.  Preserve its native order ids alongside deal ids so
+            # a delayed HISTORY_* callback after the live boundary is
+            # acknowledged/suppressed rather than recreating that lifecycle.
+            archived_order_tickets = _valid_native_ticket_set(
+                sorted(
+                    {
+                        str(event.get("external_trade_id"))
+                        for event in pending_events
+                        if re.fullmatch(
+                            r"[0-9]{1,32}",
+                            str(event.get("external_trade_id") or ""),
+                        )
+                    },
+                    key=lambda item: (len(item), item),
+                )
+            )
+            events = _merge_history_event_lifecycles(trade_events, pending_events)
+            # A historical projection may omit a native row (for example an
+            # incoherent INOUT/reversal) rather than manufacture an invalid
+            # lifecycle. Archive membership must follow the events actually
+            # accepted for upload, never the broader frozen deals snapshot.
+            archived_deal_tickets = _valid_native_ticket_set(
+                sorted(
+                    {
+                        str(event.get("native_deal_ticket"))
+                        for event in trade_events
+                        if re.fullmatch(
+                            r"[0-9]{1,32}",
+                            str(event.get("native_deal_ticket") or ""),
+                        )
+                    },
+                    key=lambda item: (len(item), item),
+                )
+            )
+            frozen_deal_tickets = (
+                {str(ticket) for ticket in frozen_snapshot.get("deals", {})}
+                if isinstance(frozen_snapshot, dict)
+                and isinstance(frozen_snapshot.get("deals"), dict)
+                else set()
+            )
+            frozen_order_tickets = (
+                {str(ticket) for ticket in frozen_snapshot.get("orders", {})}
+                if isinstance(frozen_snapshot, dict)
+                and isinstance(frozen_snapshot.get("orders"), dict)
+                else set()
+            )
+            # A prefix ack is an optimisation, not an entitlement. Require a
+            # closed proof that every callback-representable frozen deal/order
+            # is represented by the archive and that neither projector skipped
+            # a lifecycle. Otherwise the active membership still suppresses
+            # archived identities, while LiveSync drains the full prefix and
+            # delivers every unarchived source event exactly once.
+            prefix_ack_safe = (
+                v2_prefix_handoff
+                and aggregate_counts["skipped_deals"] == 0
+                and pending_counts["skipped_orders"] == 0
+                and frozen_deal_tickets.issubset(set(archived_deal_tickets))
+                and frozen_order_tickets.issubset(set(archived_order_tickets))
+            )
+            summary = {
                 "orders": len(raw_orders),
                 "deals": len(raw_deals),
                 "positions": aggregate_counts["positions"],
                 "events": len(events),
                 "pending_orders": pending_counts["pending_orders"],
                 "pending_events": pending_counts["pending_events"],
+                "skipped_deals": aggregate_counts["skipped_deals"],
+                "skipped_orders": pending_counts["skipped_orders"],
+            }
+            # A V2 activation uses a prefix acknowledgement.  That is safe
+            # only when the immutable archive contains the entire native
+            # lifecycle stream represented by that prefix.  A ``from_date``
+            # export intentionally omits positions opened before the requested
+            # window, so acknowledging its frozen sequence would delete their
+            # queued callbacks without ever delivering them.  Such bounded
+            # jobs retain the normal file stream and switch in place without
+            # a V2 prefix handoff; the supervisor/live sync will deliver the
+            # outstanding source records after the archive is accepted.
+            if v2_prefix_handoff:
+                # This must precede ``build_history_archive``.  A restart may
+                # then safely identify an orphaned local archive as
+                # pre-delivery and regenerate it, rather than coupling it to
+                # a later mutable live snapshot.
+                _prepare_v2_archive_precommit(root, job, expected_sequence)
+            archive = build_history_archive(
+                root,
+                job_id=str(job["job_id"]),
+                connection_id=str(job["connection_id"]),
+                account_number=login,
+                server=server,
+                history_mode=mode,
+                from_date=from_date,
+                events=events,
+            )
+            handoff_enabled = (
+                _persist_v2_history_handoff(
+                    adapter,
+                    root,
+                    job=job,
+                    archive=archive,
+                    archive_preexisting=archive_preexisting,
+                    summary=summary,
+                    frozen_snapshot=frozen_snapshot,
+                    frozen_checkpoint=frozen_checkpoint,
+                    expected_sequence=expected_sequence,
+                    archived_deal_tickets=archived_deal_tickets,
+                    archived_order_tickets=archived_order_tickets,
+                    acknowledge_prefix=prefix_ack_safe,
+                )
+                if v2_prefix_handoff
+                else False
+            )
+            if handoff_enabled:
+                _clear_v2_archive_precommit(root, job)
+
+        response = deliver_history_archive(
+            api,
+            job_id=str(job["job_id"]),
+            lease_id=str(job["lease_id"]),
+            archive=archive,
+            require_lease=lambda: _require_lease(api, job),
+            retain_archive=handoff_enabled,
+        )
+        if handoff_enabled:
+            # Only a control-plane acknowledgement authorizes the later
+            # baseline/ack activation. The caller first switches the already
+            # running EA in-place, then acknowledges *only* anchor_sequence;
+            # no event is ever blanket-acked in the archive→live race.
+            _record_v2_handoff_delivery(root, job, response)
+        atomic_json(
+            root / "state" / "history.json",
+            {
+                "through": now.isoformat(),
+                **summary,
+                "ledger_anchor": ledger_anchor,
             },
         )
     except LeaseLost:
@@ -2185,20 +2730,474 @@ def _run_control_plane_history_import(
     except Exception as exc:
         if str(exc) == "lease_lost":
             raise LeaseLost("lease_lost") from exc
+        if isinstance(exc, HistorySyncFailed):
+            raise
         raise HistorySyncFailed("history file delivery failed") from exc
 
     return {
-        "orders": len(raw_orders),
-        "deals": len(raw_deals),
-        "positions": aggregate_counts["positions"],
-        "events": len(events),
-        "pending_orders": pending_counts["pending_orders"],
-        "pending_events": pending_counts["pending_events"],
+        **summary,
         "delivered": int(response["inserted"]),
         "duplicates": int(response["duplicates"]),
-        "skipped_deals": aggregate_counts["skipped_deals"],
-        "skipped_orders": pending_counts["skipped_orders"],
     }
+
+
+def _v2_handoff_pending_path(root: Path) -> Path:
+    return root / "state" / "history-handoff-pending.json"
+
+
+def _v2_handoff_active_path(root: Path) -> Path:
+    return root / "state" / "history-live-handoff.json"
+
+
+def _v2_archive_precommit_path(root: Path) -> Path:
+    """Path for the short-lived journal between archive bytes and handoff state.
+
+    A compressed archive on its own is intentionally not a recovery commit: it
+    contains no frozen snapshot/sequence proving which live callbacks may be
+    acknowledged.  This journal lets a restart distinguish that harmless,
+    pre-delivery orphan from an unknown archive left by an older build.
+    """
+    return root / "state" / "history-archive-precommit.json"
+
+
+def _v2_archive_precommit_payload(
+    job: dict, expected_sequence: int | None
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "job_id": str(job["job_id"]),
+        "connection_id": str(job["connection_id"]),
+        "anchor_sequence": expected_sequence,
+    }
+
+
+def _v2_archive_precommit_matches(
+    value: object, job: dict, expected_sequence: int | None = None
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if (
+        value.get("schema_version") != 1
+        or value.get("job_id") != str(job["job_id"])
+        or value.get("connection_id") != str(job["connection_id"])
+    ):
+        return False
+    sequence = value.get("anchor_sequence")
+    if sequence is not None and (
+        not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0
+    ):
+        return False
+    return expected_sequence is None or sequence == expected_sequence
+
+
+def _prepare_v2_archive_precommit(
+    root: Path, job: dict, expected_sequence: int | None
+) -> None:
+    """Durably mark a V2 archive as not yet externally deliverable."""
+    path = _v2_archive_precommit_path(root)
+    existing = read_json(path, {})
+    if existing:
+        if not _v2_archive_precommit_matches(existing, job, expected_sequence):
+            raise HistorySyncFailed("unfinished history archive precommit conflicts with job")
+        return
+    atomic_json(path, _v2_archive_precommit_payload(job, expected_sequence))
+
+
+def _clear_v2_archive_precommit(root: Path, job: dict) -> None:
+    """Retire a matching precommit only after pending/active state is durable."""
+    path = _v2_archive_precommit_path(root)
+    if not path.exists():
+        return
+    existing = read_json(path, {})
+    if not _v2_archive_precommit_matches(existing, job):
+        raise HistorySyncFailed("history archive precommit mismatched")
+    path.unlink()
+
+
+def _retire_committed_v2_archive_precommit(root: Path) -> None:
+    """Discard a stale journal only when the active handoff proves it committed."""
+    path = _v2_archive_precommit_path(root)
+    if not path.exists():
+        return
+    precommit = read_json(path, {})
+    pending = read_json(_v2_handoff_pending_path(root), {})
+    active = read_json(_v2_handoff_active_path(root), {})
+    if (
+        isinstance(precommit, dict)
+        and precommit.get("schema_version") == 1
+        and isinstance(precommit.get("connection_id"), str)
+        and precommit.get("job_id") == pending.get("job_id")
+        and precommit.get("connection_id") == pending.get("connection_id")
+        and _v2_handoff_pending_is_committed(
+            pending,
+            active,
+            connection_id=precommit["connection_id"],
+        )
+    ):
+        path.unlink()
+
+
+def _discard_orphan_v2_archive(
+    root: Path, job: dict, archive_path: Path
+) -> None:
+    """Delete only a provably pre-delivery V2 archive so it can be rebuilt.
+
+    The precommit is written before archive creation and cleared after the
+    pending handoff artifact is durable.  Consequently this is safe after a
+    crash between those two writes.  An archive without that proof remains a
+    fail-closed error rather than being silently rebound to a new snapshot.
+    """
+    precommit = read_json(_v2_archive_precommit_path(root), {})
+    if not _v2_archive_precommit_matches(precommit, job):
+        raise HistorySyncFailed("history handoff artifact missing for archive")
+    archive_path.unlink()
+
+
+def _supports_v2_history_handoff(adapter: Any) -> bool:
+    """V2 needs an atomic full-ledger bundle, not merely a snapshot method."""
+    return all(
+        callable(getattr(adapter, name, None))
+        for name in (
+            "history_ledger_bundle",
+            "history_orders_bundle",
+            "snapshot",
+            "checkpoint",
+            "acknowledge_events",
+        )
+    )
+
+
+def _valid_native_ticket_set(value: object) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(ticket, str) or not re.fullmatch(r"[0-9]{1,32}", ticket)
+        for ticket in value
+    ):
+        raise HistorySyncFailed("history handoff native tickets invalid")
+    return list(value)
+
+
+def _v2_handoff_pending_is_committed(
+    pending: object,
+    active: object,
+    *,
+    connection_id: str,
+) -> bool:
+    """Prove an audit ``pending`` artifact is already the active boundary.
+
+    Pending is intentionally retained after activation. Matching only its
+    job/connection fields is not sufficient: a partially-written or stale
+    ACTIVE record could otherwise make a later ``new_only`` recovery skip the
+    original immutable archive. The active marker is a fixed projection of
+    pending, so require that exact projection and a verified delivery receipt.
+    Invalid state is simply not committed; callers keep the original archive
+    retry path or reject a new_only job before it reaches that importer.
+    """
+    if not isinstance(pending, dict) or not isinstance(active, dict):
+        return False
+    job_id = pending.get("job_id")
+    archive_sha256 = pending.get("archive_sha256")
+    anchor_sequence = pending.get("anchor_sequence")
+    acknowledge_prefix = pending.get("acknowledge_prefix")
+    delivery = pending.get("delivery")
+    if (
+        pending.get("schema_version") != 1
+        or not isinstance(job_id, str)
+        or not job_id
+        or pending.get("connection_id") != connection_id
+        or not isinstance(archive_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+        or not isinstance(anchor_sequence, int)
+        or isinstance(anchor_sequence, bool)
+        or anchor_sequence < 0
+        or not isinstance(acknowledge_prefix, bool)
+        or not isinstance(delivery, dict)
+        or set(delivery) != {"inserted", "duplicates"}
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in delivery.values()
+        )
+    ):
+        return False
+    try:
+        archived_deal_tickets = _valid_native_ticket_set(
+            pending.get("archived_deal_tickets")
+        )
+        archived_order_tickets = _valid_native_ticket_set(
+            pending.get("archived_order_tickets")
+        )
+    except HistorySyncFailed:
+        return False
+    return active == {
+        "schema_version": 1,
+        "job_id": job_id,
+        "connection_id": connection_id,
+        "archive_sha256": archive_sha256,
+        "anchor_sequence": anchor_sequence,
+        "archived_deal_tickets": archived_deal_tickets,
+        "archived_order_tickets": archived_order_tickets,
+        "acknowledge_prefix": acknowledge_prefix,
+    }
+
+
+def _persist_v2_history_handoff(
+    adapter: Any,
+    root: Path,
+    *,
+    job: dict,
+    archive: Any,
+    archive_preexisting: bool,
+    summary: dict[str, int],
+    frozen_snapshot: dict[str, Any] | None = None,
+    frozen_checkpoint: dict[str, Any] | None = None,
+    expected_sequence: int | None = None,
+    archived_deal_tickets: list[str] | None = None,
+    archived_order_tickets: list[str] | None = None,
+    acknowledge_prefix: bool | None = None,
+) -> bool:
+    """Persist the frozen V2 archive boundary before its signed delivery.
+
+    The artifact binds a native ledger snapshot, its event-sequence boundary and
+    the compressed archive digest. It is deliberately written *before* upload:
+    retries never recapture mutable MT5 state and a callback after the frozen
+    boundary is acknowledged only if its sequence is <= that boundary.
+    """
+    snapshot_reader = getattr(adapter, "snapshot", None)
+    checkpoint_reader = getattr(adapter, "checkpoint", None)
+    acknowledge = getattr(adapter, "acknowledge_events", None)
+    ledger_bundle_reader = getattr(adapter, "history_ledger_bundle", None)
+    orders_bundle_reader = getattr(adapter, "history_orders_bundle", None)
+    if not all(
+        callable(value)
+        for value in (
+            snapshot_reader,
+            checkpoint_reader,
+            acknowledge,
+            ledger_bundle_reader,
+            orders_bundle_reader,
+        )
+    ):
+        return False
+
+    pending_path = _v2_handoff_pending_path(root)
+    existing = read_json(pending_path, {})
+    job_id = str(job["job_id"])
+    connection_id = str(job["connection_id"])
+    archive_name = archive.path.name
+    if existing:
+        if (
+            existing.get("job_id") != job_id
+            or existing.get("connection_id") != connection_id
+        ):
+            # A completed previous handoff may be superseded by a new frozen
+            # full ledger. An unfinished artifact is deliberately a conflict:
+            # replacing it would lose the only durable archive/baseline pair.
+            active = read_json(_v2_handoff_active_path(root), {})
+            if _v2_handoff_pending_is_committed(
+                existing,
+                active,
+                connection_id=connection_id,
+            ):
+                existing = {}
+            else:
+                raise HistorySyncFailed("unfinished history handoff conflicts with new job")
+    if existing:
+        if (
+            existing.get("schema_version") != 1
+            or existing.get("job_id") != job_id
+            or existing.get("connection_id") != connection_id
+            or existing.get("archive_name") != archive_name
+            or existing.get("archive_sha256") != archive.compressed_sha256
+            or existing.get("summary") != summary
+        ):
+            raise HistorySyncFailed("history handoff artifact mismatched")
+        _valid_native_ticket_set(existing.get("archived_deal_tickets"))
+        _valid_native_ticket_set(existing.get("archived_order_tickets"))
+        if not isinstance(existing.get("acknowledge_prefix"), bool):
+            raise HistorySyncFailed("history handoff artifact mismatched")
+        if archived_deal_tickets is not None and (
+            _valid_native_ticket_set(existing.get("archived_deal_tickets"))
+            != _valid_native_ticket_set(archived_deal_tickets)
+        ):
+            raise HistorySyncFailed("history handoff artifact mismatched")
+        if archived_order_tickets is not None and (
+            _valid_native_ticket_set(existing.get("archived_order_tickets"))
+            != _valid_native_ticket_set(archived_order_tickets)
+        ):
+            raise HistorySyncFailed("history handoff artifact mismatched")
+        if acknowledge_prefix is not None and (
+            existing.get("acknowledge_prefix") is not acknowledge_prefix
+        ):
+            raise HistorySyncFailed("history handoff artifact mismatched")
+        return True
+    if archive_preexisting:
+        # A prior process may have built bytes without persisting the matching
+        # frozen baseline. Reusing those bytes with a newly captured snapshot
+        # would create exactly the archive/live gap this handoff prevents.
+        raise HistorySyncFailed("history handoff artifact missing for archive")
+
+    snapshot = frozen_snapshot if frozen_snapshot is not None else snapshot_reader()
+    checkpoint = frozen_checkpoint if frozen_checkpoint is not None else checkpoint_reader()
+    if not isinstance(snapshot, dict) or not isinstance(checkpoint, dict):
+        raise HistorySyncFailed("history handoff snapshot invalid")
+    sequence = checkpoint.get("sequence")
+    positions, orders, deals = (
+        snapshot.get("positions"),
+        snapshot.get("orders"),
+        snapshot.get("deals"),
+    )
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 0
+        or not all(isinstance(value, dict) for value in (positions, orders, deals))
+    ):
+        raise HistorySyncFailed("history handoff snapshot invalid")
+    if expected_sequence is not None and sequence != expected_sequence:
+        raise HistorySyncFailed("history handoff boundary changed")
+    tickets = _valid_native_ticket_set(
+        archived_deal_tickets
+        if archived_deal_tickets is not None
+        else sorted((str(ticket) for ticket in deals), key=lambda item: (len(item), item))
+    )
+    archived_orders = _valid_native_ticket_set(archived_order_tickets or [])
+    prefix_ack = True if acknowledge_prefix is None else acknowledge_prefix
+    atomic_json(
+        pending_path,
+        {
+            "schema_version": 1,
+            "job_id": job_id,
+            "connection_id": connection_id,
+            "archive_name": archive_name,
+            "archive_sha256": archive.compressed_sha256,
+            "anchor_sequence": sequence,
+            # Membership is the exact set represented by the uploaded archive,
+            # not every deal in the frozen snapshot. A malformed/reversal
+            # native row can be deliberately omitted by the projector; it
+            # must remain a live source callback rather than being suppressed
+            # merely because it shares this sequence bundle.
+            "archived_deal_tickets": tickets,
+            # Pending order lifecycle source ids are independent from the
+            # DEAL_ADD source ids. Keep their terminal archive membership so
+            # delayed HISTORY_ADD/HISTORY_FILLED cannot duplicate it live.
+            "archived_order_tickets": archived_orders,
+            # Prefix acknowledgement is permitted only when the caller has
+            # proven every callback-representable source in the frozen bundle
+            # belongs to archive membership. Otherwise LiveSync drains the
+            # complete prefix and skips only the archived identities.
+            "acknowledge_prefix": prefix_ack,
+            # Retain the frozen deal map in the baseline.  The archive owns
+            # its lifecycle, but without this map a later ``snapshot()``
+            # would rediscover every archived ticket as a fresh
+            # ``deal_recorded`` fallback before the normal live stream has a
+            # chance to establish its first N+1 baseline.  The file adapter
+            # additionally filters active archive membership on restart.
+            "snapshot": {"positions": positions, "orders": orders, "deals": deals},
+            "summary": summary,
+            "delivery": None,
+        },
+    )
+    return True
+
+
+def _record_v2_handoff_delivery(root: Path, job: dict, response: dict[str, Any]) -> None:
+    path = _v2_handoff_pending_path(root)
+    artifact = read_json(path, {})
+    if (
+        artifact.get("schema_version") != 1
+        or artifact.get("job_id") != str(job["job_id"])
+        or artifact.get("connection_id") != str(job["connection_id"])
+    ):
+        raise HistorySyncFailed("history handoff artifact missing after delivery")
+    delivery = {
+        field: int(response[field])
+        for field in ("inserted", "duplicates")
+        if isinstance(response.get(field), int) and not isinstance(response.get(field), bool)
+    }
+    if set(delivery) != {"inserted", "duplicates"}:
+        raise HistorySyncFailed("history delivery acknowledgement invalid")
+    artifact["delivery"] = delivery
+    atomic_json(path, artifact)
+
+
+def _activate_v2_history_handoff(adapter: Any, root: Path, job: dict) -> int | None:
+    """Commit the frozen baseline and acknowledge only its exact sequence."""
+    connection_state = getattr(adapter, "connection_state", None)
+    if callable(connection_state):
+        state = connection_state()
+        # The runtime must already have observed a post-switch heartbeat with
+        # this explicit capability bit clear.  Defend the commit itself too:
+        # an injected/stale adapter must not acknowledge the archive boundary
+        # or permit caller cleanup while source recovery remains unresolved.
+        if isinstance(state, dict) and state.get("source_recovery_required") is True:
+            raise SourceRecoveryRequired(SOURCE_RECOVERY_REQUIRED)
+        if (
+            not isinstance(state, dict)
+            or state.get("connected") is not True
+            or state.get("source_recovery_required") is not False
+        ):
+            raise HistorySyncFailed("history handoff source recovery required")
+    pending = read_json(_v2_handoff_pending_path(root), {})
+    if not pending:
+        return None
+    if (
+        pending.get("schema_version") != 1
+        or pending.get("job_id") != str(job["job_id"])
+        or pending.get("connection_id") != str(job["connection_id"])
+        or not isinstance(pending.get("anchor_sequence"), int)
+        or isinstance(pending.get("anchor_sequence"), bool)
+        or pending["anchor_sequence"] < 0
+        or not isinstance(pending.get("snapshot"), dict)
+        or not isinstance(pending.get("summary"), dict)
+        or not isinstance(pending.get("delivery"), dict)
+        or not isinstance(pending.get("acknowledge_prefix"), bool)
+    ):
+        raise HistorySyncFailed("history handoff artifact invalid")
+    tickets = _valid_native_ticket_set(pending.get("archived_deal_tickets"))
+    archived_orders = _valid_native_ticket_set(pending.get("archived_order_tickets"))
+    snapshot = pending["snapshot"]
+    if not all(isinstance(snapshot.get(field), dict) for field in ("positions", "orders", "deals")):
+        raise HistorySyncFailed("history handoff baseline invalid")
+    active_path = _v2_handoff_active_path(root)
+    active = read_json(active_path, {})
+    expected_active = {
+        "schema_version": 1,
+        "job_id": pending["job_id"],
+        "connection_id": pending["connection_id"],
+        "archive_sha256": pending.get("archive_sha256"),
+        "anchor_sequence": pending["anchor_sequence"],
+        "archived_deal_tickets": tickets,
+        "archived_order_tickets": archived_orders,
+        "acknowledge_prefix": pending["acknowledge_prefix"],
+    }
+    if active:
+        if active == expected_active:
+            return int(pending["anchor_sequence"])
+        if (
+            active.get("schema_version") != 1
+            or active.get("connection_id") != pending["connection_id"]
+        ):
+            raise HistorySyncFailed("active history handoff conflicts with archive")
+        previous_tickets = _valid_native_ticket_set(active.get("archived_deal_tickets"))
+        previous_orders = _valid_native_ticket_set(active.get("archived_order_tickets"))
+        # A new all-history frozen ledger must contain all old membership before
+        # it can replace the live filter; otherwise a delayed old callback
+        # could escape as fresh live data after this activation.
+        if not set(previous_tickets).issubset(set(tickets)):
+            raise HistorySyncFailed("history handoff membership regressed")
+        if not set(previous_orders).issubset(set(archived_orders)):
+            raise HistorySyncFailed("history handoff order membership regressed")
+
+    acknowledge = getattr(adapter, "acknowledge_events", None)
+    if not callable(acknowledge):
+        raise HistorySyncFailed("history handoff acknowledge unavailable")
+    # Save the frozen state first. If we crash before the acknowledgement, the
+    # activation marker is absent and this exact durable artifact is retried;
+    # it never samples a newer MT5 snapshot or acknowledges a fresh callback.
+    PersistentSnapshot(root / "state" / "live_snapshot.json").save(snapshot)
+    if pending["acknowledge_prefix"]:
+        acknowledge(int(pending["anchor_sequence"]))
+    atomic_json(active_path, expected_active)
+    return int(pending["anchor_sequence"])
 
 
 def _prime_live_state_after_initial_history(adapter: Any, root: Path) -> None:
@@ -2208,6 +3207,11 @@ def _prime_live_state_after_initial_history(adapter: Any, root: Path) -> None:
     by the just-imported deal history. Files created afterwards retain a higher sequence and are
     delivered by the normal live poll.
     """
+    # File-bridge handoff has already saved a frozen baseline and acknowledged
+    # only its anchor. Never fall back to this legacy blanket acknowledgement
+    # once its active commit exists.
+    if _v2_handoff_active_path(root).exists():
+        return
     pending_before = adapter.pending_events()
     current = adapter.snapshot()
     PersistentSnapshot(root / "state" / "live_snapshot.json").save(current)
@@ -2289,6 +3293,8 @@ def _start_file_bridge_and_sync(
             raise Mt5AuthorizationFailed(code) from exc
         if code == "terminal_start_failed":
             raise TerminalStartFailed(code) from exc
+        if code == SOURCE_RECOVERY_REQUIRED:
+            raise SourceRecoveryRequired(code) from exc
         raise Mt5InitializeFailed(code) from exc
     finally:
         investor_password = ""
@@ -2397,7 +3403,45 @@ def _start_file_bridge_and_sync(
                 str(login),
                 effective_server,
             )
-            _prime_live_state_after_initial_history(adapter, root)
+            if _v2_handoff_pending_path(root).exists():
+                # Do not stop/resume after the frozen archive: switch the same
+                # EA process first, wait for its newer new_only heartbeat, then
+                # acknowledge only the original anchor sequence. A fresh
+                # DEAL_ADD in this interval remains > anchor and is delivered
+                # by the ordinary live poll below.
+                runtime.switch_to_new_only()
+                adapter = Mql5FileMt5Adapter(
+                    status.files_path,
+                    cid,
+                    login,
+                    effective_server,
+                    root / "state",
+                )
+                _verify_investor_access(adapter)
+                _activate_v2_history_handoff(adapter, root, job)
+                archive_path = root / "data" / "history-imports" / f"{job['job_id']}.json.gz"
+                try:
+                    archive_path.unlink()
+                except FileNotFoundError:
+                    pass
+            elif mode == "from_date":
+                # A bounded archive deliberately has no V2 prefix handoff:
+                # some callbacks at or below its frozen sequence are outside
+                # the requested window.  Switch the same EA process in place
+                # but preserve every pending source file for ordinary live
+                # delivery; in particular, never call the legacy blanket ack.
+                runtime.switch_to_new_only()
+                adapter = Mql5FileMt5Adapter(
+                    status.files_path,
+                    cid,
+                    login,
+                    effective_server,
+                    root / "state",
+                )
+                _verify_investor_access(adapter)
+            else:
+                # Compatibility only for explicitly injected legacy adapters.
+                _prime_live_state_after_initial_history(adapter, root)
         _record_checkpoint(
             api,
             job,
@@ -2554,6 +3598,8 @@ def _authenticate_and_sync(
             _require_lease(api, job)
             try:
                 delivered = _run_live_sync_once(adapter, root, ingestion_sink)
+            except SourceRecoveryRequired:
+                raise
             except Exception as exc:
                 raise LiveSyncFailed("live sync check failed") from exc
             _record_checkpoint(
@@ -2591,6 +3637,12 @@ def _run_live_sync_once(adapter: Any, root: Path, sink: Callable[[dict], None] |
             sink or LocalEventSink(root / "data" / "live.jsonl"),
             outbox=EventOutbox(str(root / "state" / "live-outbox.json")),
         )
-        return live.poll_once()
+        try:
+            return live.poll_once()
+        except CertifiedHistoryRecoveryRequired as exc:
+            # The MQL5 bridge remains alive and has just been asked to replay
+            # its certified source ledger.  Preserve that exact control-plane
+            # signal instead of collapsing it into a generic live-sync error.
+            raise SourceRecoveryRequired(SOURCE_RECOVERY_REQUIRED) from exc
     finally:
         dedup.close()

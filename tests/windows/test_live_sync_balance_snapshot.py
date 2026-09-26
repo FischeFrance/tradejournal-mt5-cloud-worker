@@ -94,3 +94,7 @@ def test_live_event_carries_the_latest_account_balance():
     assert delivered[0]["equity"] == 9_770.12
     assert delivered[0]["currency"] == "USD"
     assert delivered[0]["leverage"] == 100
+    # The account snapshot is useful for live UI state but is not an
+    # event-time opening denominator: queued/replayed deals can observe a
+    # later balance. Only the history ledger is allowed to provide that field.
+    assert "balance_before_open" not in delivered[0]

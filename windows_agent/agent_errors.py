@@ -80,6 +80,18 @@ class HistorySyncFailed(AgentError):
     error_code = "history_sync_failed"
 
 
+class SourceRecoveryRequired(HistorySyncFailed):
+    """The authenticated bridge needs its certified source-history replay.
+
+    This remains a retryable history-sync family error, but it deliberately has
+    its own wire code.  The control plane must be able to retain an otherwise
+    healthy provisioned/live connection instead of treating a local continuity
+    replay as a terminal MT5 initialization failure.
+    """
+
+    error_code = "source_recovery_required"
+
+
 class LiveSyncFailed(AgentError):
     error_code = "live_sync_failed"
 

@@ -18,6 +18,7 @@ from windows_agent.provisioning.mt5_instance import (
 from windows_agent.provisioning.mt5_instance_rotation import (
     Mt5InstanceRotationError,
     Mt5InstanceRotator,
+    Mt5SourceRecoveryPending,
     Mt5TemplateRelease,
 )
 from windows_agent.state_store import read_json
@@ -91,8 +92,22 @@ def _healthy_status(root: Path) -> NativeMt5Status:
     return NativeMt5Status(
         123,
         {"login": "42", "server": "Broker-Demo", "trade_allowed": False},
-        {"terminal_connected": True, "account_trade_allowed": False},
+        {
+            "terminal_connected": True,
+            "account_trade_allowed": False,
+            "source_recovery_required": False,
+        },
         root / "terminal" / "MQL5" / "Files" / "TradeJournal",
+    )
+
+
+def _source_recovery_status(root: Path, _connection_id: str) -> NativeMt5Status:
+    status = _healthy_status(root)
+    return NativeMt5Status(
+        status.pid,
+        status.account,
+        {**status.heartbeat, "source_recovery_required": True},
+        status.files_path,
     )
 
 
@@ -230,6 +245,48 @@ def test_rotation_preserves_only_required_private_state_and_resumes_new_only(
     assert controller.callback_calls == [(verified_update_callback, True)]
     assert not (root / ".terminal-maintenance-backup").exists()
     assert not (root / "state" / "mt5-rotation.json").exists()
+
+
+def test_rotation_source_recovery_does_not_stop_or_rollback_the_resumed_ea(
+    tmp_path: Path,
+) -> None:
+    old_terminal, _ = _template(tmp_path / "old", b"terminal-v1")
+    new_terminal, expert = _template(tmp_path / "new", b"terminal-v2")
+    connection_id = str(uuid4())
+    root = _instance(tmp_path, old_terminal, connection_id)
+    controller = RuntimeController(resume_results=[_source_recovery_status])
+    rotator = _rotator(tmp_path, new_terminal, expert, controller)
+    target = Mt5TemplateRelease.from_template(
+        new_terminal,
+        InstanceProvisioner._sha256(new_terminal),
+    )
+
+    with pytest.raises(
+        Mt5SourceRecoveryPending, match="source recovery is pending"
+    ) as exc_info:
+        rotator.rotate_one(connection_id, target)
+
+    assert exc_info.value.error_code == "source_recovery_required"
+
+    # One stop was required to atomically replace the release. Once resume
+    # reported its live source recovery, no rollback stop or old-release resume
+    # is allowed to interrupt the EA's timer-based repair.
+    assert controller.stop_calls == 1
+    assert len(controller.resume_calls) == 1
+    assert FakeProcess.adopted == [root / "terminal" / "terminal64.exe"]
+    assert (root / "terminal" / "terminal64.exe").read_bytes() == b"terminal-v2"
+    journal = read_json(root / "state" / "mt5-rotation.json")
+    assert journal["phase"] == "committed"
+    assert (root / ".terminal-maintenance-backup").is_dir()
+
+
+def test_rotation_status_requires_explicitly_clear_source_recovery(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(Mt5InstanceRotationError, match="health check failed"):
+        Mt5InstanceRotator._validate_status(
+            _source_recovery_status(tmp_path, "unused")
+        )
 
 
 def test_rotation_expected_source_rejects_changed_release_before_mutation(

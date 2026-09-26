@@ -19,7 +19,12 @@ from ..mt5_lifecycle import Mt5LifecycleCoordinator
 from ..mt5_recovery_window import new_only_recovery_from
 from ..security import canonical_uuid, safe_child
 from ..state_store import atomic_json, read_json
-from ..worker.native_mt5_runtime import NativeMt5Runtime, NativeMt5Status
+from ..worker.native_mt5_runtime import (
+    SOURCE_RECOVERY_REQUIRED,
+    NativeMt5Error,
+    NativeMt5Runtime,
+    NativeMt5Status,
+)
 from .mt5_instance import InstanceProvisioner
 from .process_manager import ProcessManager
 from .secret_store import WindowsSecretStore
@@ -88,6 +93,12 @@ class Mt5InstanceRotationError(RuntimeError):
     def __init__(self, message: str, *, failed: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.failed = failed
+
+
+class Mt5SourceRecoveryPending(Mt5InstanceRotationError):
+    """The replacement EA is alive but has not certified source continuity."""
+
+    error_code = SOURCE_RECOVERY_REQUIRED
 
 
 @dataclass(frozen=True)
@@ -395,6 +406,7 @@ class Mt5InstanceRotator:
             status.pid <= 0
             or status.heartbeat.get("terminal_connected") is not True
             or status.heartbeat.get("account_trade_allowed") is not False
+            or status.heartbeat.get("source_recovery_required") is not False
         ):
             raise Mt5InstanceRotationError("rotated MT5 health check failed")
 
@@ -932,6 +944,12 @@ class Mt5InstanceRotator:
                     history_mode="new_only",
                     history_from=recovery_from,
                 )
+                if status.heartbeat.get("source_recovery_required") is True:
+                    # NativeMt5Runtime normally raises this before returning a
+                    # status. Preserve the same no-rollback behavior for an
+                    # injected/direct provider that reports the diagnostic in
+                    # its status instead.
+                    raise NativeMt5Error(SOURCE_RECOVERY_REQUIRED)
                 self._validate_status(status)
                 published_state = read_json(state_path)
                 if not self._matches_target(root, published_state, target):
@@ -949,6 +967,31 @@ class Mt5InstanceRotator:
                 )
                 committed = True
             except Exception as exc:
+                if (
+                    isinstance(exc, NativeMt5Error)
+                    and str(exc) == SOURCE_RECOVERY_REQUIRED
+                ):
+                    # The replacement release is already atomically published
+                    # and its terminal is alive. Keep that process and the
+                    # committed release journal intact: rolling it back would
+                    # stop the EA that is rebuilding its source continuity.
+                    # A later recovery pass may remove the committed journal,
+                    # while the independent heartbeat gate still prevents the
+                    # rollout from being declared healthy until the flag is
+                    # explicitly false.
+                    self._adopt(root)
+                    self._write_journal(
+                        journal_path,
+                        connection_id=connection_id,
+                        phase="committed",
+                        previous_state=previous_state,
+                        target=target,
+                        recovery_from=recovery_from,
+                    )
+                    committed = True
+                    raise Mt5SourceRecoveryPending(
+                        "MT5 rotation source recovery is pending"
+                    ) from exc
                 if committed:
                     raise
                 try:
@@ -1055,6 +1098,11 @@ class Mt5InstanceRotator:
                     verified_update_required=verified_update_required,
                 ):
                     migrated.append(connection_id)
+            except Mt5SourceRecoveryPending:
+                # The newly published EA remains alive to replay its source
+                # journal. Do not turn this into an aggregate fleet failure
+                # that loses the retryable control-plane code.
+                raise
             except Exception:
                 failed.append(connection_id)
                 logger.exception(

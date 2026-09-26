@@ -539,6 +539,14 @@ try {
     (Join-Path $SourceRoot 'tests\windows\test_contract.py') `
     (Join-Path $SourceRoot 'tests\windows\test_atomic_file_retry.py') `
     (Join-Path $SourceRoot 'tests\windows\test_historical_trade_import.py') `
+    (Join-Path $SourceRoot 'tests\test_history_balance.py') `
+    (Join-Path $SourceRoot 'tests\test_mql5_source_journal.py') `
+    (Join-Path $SourceRoot 'tests\test_event_outbox.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_mql5_file_adapter.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_live_sync_balance_snapshot.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_live_sync_outbox.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_history_outbox.py') `
+    (Join-Path $SourceRoot 'tests\windows\test_trading_ingestion_sink.py') `
     (Join-Path $SourceRoot 'tests\windows\test_agent_daemon.py') `
     (Join-Path $SourceRoot 'tests\windows\test_mt5_live_update.py') `
     (Join-Path $SourceRoot 'tests\windows\test_native_mt5_runtime.py') `
@@ -564,7 +572,8 @@ try {
     (Join-Path $SourceRoot 'tests\windows\test_release_manifest.py') `
     (Join-Path $SourceRoot 'tests\test_event_normalizer.py') `
     (Join-Path $SourceRoot 'tests\test_mql5_ea_no_trading.py') `
-    ((Join-Path $SourceRoot 'tests\windows\test_windows_smoke.py') + '::test_powershell_scripts_parse')
+    ((Join-Path $SourceRoot 'tests\windows\test_windows_smoke.py') + '::test_powershell_scripts_parse') `
+    ((Join-Path $SourceRoot 'tests\windows\test_windows_smoke.py') + '::test_mt5_compiler_selector')
   if ($LASTEXITCODE -ne 0) { throw 'Windows release tests failed.' }
 
   & (Join-Path $SourceRoot 'scripts\windows\compile-readonly-ea.ps1')

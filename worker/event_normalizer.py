@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -39,7 +40,12 @@ _FINGERPRINT_FIELDS = {
         "previous_stop_loss",
         "previous_take_profit",
     ),
-    "trade_closed": ("close_price", "profit", "commission", "swap", "close_time"),
+    "trade_closed": (
+        "close_price", "profit", "commission", "total_commission", "swap", "close_time"
+    ),
+    "trade_partial_closed": (
+        "close_price", "profit", "commission", "swap", "close_time"
+    ),
     "pending_order_created": (
         "symbol",
         "direction",
@@ -69,6 +75,47 @@ _FINGERPRINT_FIELDS = {
     ),
 }
 
+_NATIVE_DEAL_EVENTS = frozenset(
+    ("trade_opened", "trade_volume_changed", "trade_partial_closed", "trade_closed")
+)
+
+
+def validate_event_preflight(raw_event: Dict[str, Any]) -> None:
+    """Fail closed before a malformed opening can be acked or dead-lettered.
+
+    A temporary MT5 snapshot/cache race is recoverable only while its event
+    file remains pending.  The ingestion API correctly rejects an opening
+    without these lifecycle fields, but reaching it would turn that race into
+    a permanent loss of the predecessor for a later close.
+    """
+    if raw_event.get("event_type") != "trade_opened":
+        return
+
+    symbol = raw_event.get("symbol")
+    if (
+        not isinstance(symbol, str)
+        or not symbol
+        or symbol != symbol.strip()
+        or len(symbol) > 64
+        or any(ord(character) < 32 for character in symbol)
+    ):
+        raise ValueError("trade_opened symbol unavailable")
+    if raw_event.get("direction") not in ("buy", "sell"):
+        raise ValueError("trade_opened direction unavailable")
+
+    volume = raw_event.get("volume")
+    try:
+        numeric_volume = float(volume)
+    except (OverflowError, TypeError, ValueError):
+        numeric_volume = math.nan
+    if (
+        isinstance(volume, bool)
+        or not isinstance(volume, (int, float))
+        or not math.isfinite(numeric_volume)
+        or numeric_volume <= 0.0
+    ):
+        raise ValueError("trade_opened volume unavailable")
+
 
 def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
     """Genera un event_id deterministico e idempotente.
@@ -91,7 +138,13 @@ def build_event_id(account_number: Optional[str], event: Dict[str, Any]) -> str:
 
     event_type = event["event_type"]
     ticket = str(event.get("ticket", ""))
-    fields = _FINGERPRINT_FIELDS.get(event_type, ())
+    # Preserve source_event_id precedence above.  It is the authoritative
+    # overlap identity for current bridge files; native ticket identity adds
+    # stable per-fill ids only when that source identity is unavailable.
+    if event_type in _NATIVE_DEAL_EVENTS and event.get("native_deal_ticket") is not None:
+        fields = ("native_deal_ticket",)
+    else:
+        fields = _FINGERPRINT_FIELDS.get(event_type, ())
     fingerprint_payload = {name: event.get(name) for name in fields}
     fingerprint_json = json.dumps(
         fingerprint_payload, sort_keys=True, separators=(",", ":"), default=str
@@ -112,6 +165,7 @@ def normalize_event(
     account_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Converte un evento grezzo rilevato da event_detector nel payload dell'ingestion API."""
+    validate_event_preflight(raw_event)
     event_time = raw_event.get("event_time") or _now_iso()
     event = {**raw_event, "event_time": event_time}
 
@@ -141,7 +195,18 @@ def normalize_event(
         "close_time": event.get("close_time"),
         "event_time": event_time,
     }
-    if account_snapshot is not None:
+    # Prefer a per-fill account snapshot published by the EA.  The adapter
+    # snapshot is a valid fallback for old builds, but must never overwrite the
+    # balance captured alongside a live opening event.
+    event_snapshot = {
+        "balance": event.get("balance"),
+        "equity": event.get("equity"),
+        "currency": event.get("currency"),
+        "leverage": event.get("leverage"),
+    }
+    if all(value is not None for value in event_snapshot.values()):
+        payload.update(event_snapshot)
+    elif account_snapshot is not None:
         payload.update(
             {
                 "balance": account_snapshot["balance"],
@@ -150,4 +215,23 @@ def normalize_event(
                 "leverage": account_snapshot.get("leverage"),
             }
         )
+    # Extended MT5 economics/provenance are optional so old snapshot-only
+    # producers retain the exact contract tested above.  ``fee`` is audit-only;
+    # historical reconstruction has already folded it into commission and
+    # total_commission exactly once when those certified values are present.
+    for field in (
+        "total_commission",
+        "fee",
+        "balance_before_open",
+        "balance_before_open_source",
+        "balance_before_open_reason",
+        "native_deal_ticket",
+        "time_msc",
+        "time_basis",
+        "commission_complete",
+        "previous_volume",
+        "partial_close",
+    ):
+        if event.get(field) is not None:
+            payload[field] = event[field]
     return payload

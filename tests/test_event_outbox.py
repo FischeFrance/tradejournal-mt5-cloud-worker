@@ -34,6 +34,14 @@ class _Sender:
         return self.results.pop(0)
 
 
+def _assert_private_mode_when_supported(path):
+    # NTFS permissions are ACL-based and Python deliberately does not expose a
+    # POSIX 0600 contract there. The Windows service protects its state root by
+    # ACL; exact mode-bit enforcement is meaningful only on POSIX filesystems.
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_enqueue_is_atomic_and_deduplicated_by_event_id(tmp_path):
     path = tmp_path / "event_outbox.json"
     outbox = EventOutbox(str(path))
@@ -48,7 +56,7 @@ def test_enqueue_is_atomic_and_deduplicated_by_event_id(tmp_path):
     assert os.path.dirname(source) == str(tmp_path)
     assert destination == str(path)
     assert not list(tmp_path.glob("*.tmp"))
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    _assert_private_mode_when_supported(path)
 
     # Dopo un crash tra enqueue e snapshot lo stesso evento viene normalizzato di nuovo. Il
     # timestamp puo' cambiare, ma event_id e' autorevole e la prima versione resta persistita.
@@ -131,7 +139,7 @@ def test_v1_file_is_migrated_without_loss_and_recovers_order_from_event_time(tmp
         "z-event-opened",
         "a-event-closed",
     ]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    _assert_private_mode_when_supported(path)
 
 
 def test_transient_failure_stays_pending_and_is_delivered_after_restart(tmp_path):

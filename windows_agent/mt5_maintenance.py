@@ -18,6 +18,7 @@ from .provisioning.mt5_instance_rotation import (
     Mt5FleetRotationReport,
     Mt5InstanceRotationError,
     Mt5InstanceRotator,
+    Mt5SourceRecoveryPending,
     Mt5TemplateRelease,
 )
 from .provisioning.mt5_public_release import (
@@ -41,13 +42,24 @@ from .provisioning.mt5_update_store import (
 from .provisioning.process_manager import ProcessManager
 from .security import canonical_uuid
 from .state_store import read_json
-from .worker.native_mt5_runtime import NativeMt5Runtime, NativeMt5Status
+from .worker.native_mt5_runtime import (
+    SOURCE_RECOVERY_REQUIRED,
+    NativeMt5Error,
+    NativeMt5Runtime,
+    NativeMt5Status,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class Mt5MaintenanceError(RuntimeError):
     """A sanitized nightly maintenance failure."""
+
+
+class Mt5MaintenanceSourceRecoveryPending(Mt5MaintenanceError):
+    """A live EA needs source replay; retry after its heartbeat certifies it."""
+
+    error_code = SOURCE_RECOVERY_REQUIRED
 
 
 @dataclass(frozen=True)
@@ -258,6 +270,7 @@ class Mt5MaintenanceCoordinator:
             status.pid <= 0
             or status.heartbeat.get("terminal_connected") is not True
             or status.heartbeat.get("account_trade_allowed") is not False
+            or status.heartbeat.get("source_recovery_required") is not False
         ):
             raise Mt5MaintenanceError("MT5 canary health check failed")
 
@@ -459,9 +472,26 @@ class Mt5MaintenanceCoordinator:
                     history_mode="new_only",
                     history_from=recovery_from,
                 )
+                if status.heartbeat.get("source_recovery_required") is True:
+                    # NativeMt5Runtime normally raises this before returning a
+                    # status. Keep injected/direct status providers equally
+                    # fail-closed without treating the alive EA as a failed
+                    # canary that must be stopped and restored.
+                    raise NativeMt5Error(SOURCE_RECOVERY_REQUIRED)
                 self._validate_status(status)
                 self._adopt(canary)
             except Exception as exc:
+                if (
+                    isinstance(exc, NativeMt5Error)
+                    and str(exc) == SOURCE_RECOVERY_REQUIRED
+                ):
+                    # resume() intentionally leaves the authenticated terminal
+                    # running while its EA retries source recovery. A second stop
+                    # here would recreate the continuity gap we are protecting.
+                    self._adopt(canary)
+                    raise Mt5MaintenanceSourceRecoveryPending(
+                        "MT5 canary source recovery is pending"
+                    ) from exc
                 try:
                     self._restore_canary(
                         canary,
@@ -1257,6 +1287,10 @@ class Mt5MaintenanceCoordinator:
                     verified_update_callback=capture,
                     verified_update_required=self.pending_update_store is not None,
                 )
+            except Mt5SourceRecoveryPending as exc:
+                raise Mt5MaintenanceSourceRecoveryPending(
+                    "MT5 public fleet source recovery is pending"
+                ) from exc
             except Mt5InstanceRotationError as exc:
                 raise Mt5MaintenanceError("MT5 public fleet rotation failed") from exc
             if not self.rotator.matches_target(record.connection_id, target):
@@ -1548,6 +1582,10 @@ class Mt5MaintenanceCoordinator:
                     verified_update_callback=self._capture_callback(stop_event),
                     verified_update_required=self.pending_update_store is not None,
                 )
+            except Mt5SourceRecoveryPending as exc:
+                raise Mt5MaintenanceSourceRecoveryPending(
+                    "MT5 fleet source recovery is pending"
+                ) from exc
             except Mt5InstanceRotationError as exc:
                 raise Mt5MaintenanceError("MT5 fleet rotation failed") from exc
             self._require_fleet_release(current)

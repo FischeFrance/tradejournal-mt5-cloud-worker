@@ -31,7 +31,15 @@ class HistorySync:
         counts = {"orders": 0, "deals": 0}
         cursor = start
         while cursor < now:
-            end = min(cursor + timedelta(days=max(1, min(chunk_days, 31))), now)
+            # The file bridge exposes one immutable, complete historical
+            # ledger. Re-reading it once per seven-day cursor is quadratic on
+            # long-lived accounts and can make MT5 appear hung. Direct/non-file
+            # adapters retain the bounded chunked reads they need.
+            end = (
+                now
+                if bool(getattr(self.adapter, "history_snapshot_atomic", False))
+                else min(cursor + timedelta(days=max(1, min(chunk_days, 31))), now)
+            )
             for kind, records in (
                 ("orders", self.adapter.history_orders(cursor, end)),
                 ("deals", self.adapter.history_deals(cursor, end)),
