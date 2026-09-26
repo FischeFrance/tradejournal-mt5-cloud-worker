@@ -143,12 +143,13 @@ class EventOutbox:
 
         Un evento successivo puo' dipendere dal precedente (open -> modify -> close). Continuare
         dopo un errore transitorio potrebbe quindi trasformare un problema temporaneo in un 4xx
-        permanente e perdere causalita'.
+        permanente e perdere causalita', quindi un fallimento transitorio interrompe ancora il
+        drain. Un rifiuto permanente e' diverso: e' gia' stato messo in quarantena in modo
+        durevole (dead_letter) per l'audit, non richiede piu' alcun intervento manuale per
+        sbloccare il resto dell'account, e il drain prosegue automaticamente con l'evento
+        successivo -- un solo evento non elaborabile non deve piu' congelare per sempre la
+        sincronizzazione di ogni trade reale che arriva dopo di lui.
         """
-        if self.dead_letter_count():
-            # Recovery of a rejected predecessor is an explicit operator action.  Until then,
-            # its successors stay durable and must not overtake it on a later process restart.
-            return DrainResult(pending=self.pending_count())
         sent = dry_run = dead_lettered = transient_failures = 0
         index = 0
 
@@ -183,14 +184,16 @@ class EventOutbox:
                 self._replace_state(new_state)
                 dead_lettered += 1
                 logger.error(
-                    "Evento spostato in dead-letter dopo un rifiuto permanente "
-                    "(http_status=%s).",
+                    "Evento scartato in dead-letter dopo un rifiuto permanente "
+                    "(http_status=%s); la sincronizzazione prosegue automaticamente con "
+                    "l'evento successivo.",
                     result.http_status,
                 )
-                # The rejected event remains a causal barrier even after being moved out of
-                # ``pending``.  Sending a later close/modify here could make the remote state
-                # advance past its missing predecessor.  Recovery is deliberately explicit.
-                break
+                # Quarantined for audit only. No longer treated as a causal barrier: automatic
+                # recovery (no operator action) is a deliberate product choice for a read-only
+                # reporting pipeline, where losing one unprocessable event is far cheaper than
+                # silently losing every real trade reported after it.
+                continue
 
             # Include risultati legacy senza failure_type: conservarli e fermare il drain e' la
             # scelta fail-safe che preserva sia l'evento sia l'ordine dei successivi.

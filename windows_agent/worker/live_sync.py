@@ -496,17 +496,16 @@ class LiveSync:
         )
 
     def _drain_outbox(self) -> int:
-        # A historical dead-letter is an explicit causal barrier, not a reason to kill the
-        # local supervisor loop.  Do not retry or delete it here, and do not deliver successors.
-        if self.outbox.dead_letter_count():
-            return 0
+        # A permanent rejection is durably quarantined by EventOutbox.drain() and is no longer
+        # treated as a barrier: automatic recovery (no operator action) is a deliberate choice
+        # for this read-only reporting pipeline, so a single unprocessable event never freezes
+        # every real trade reported for this account after it. Only genuinely pending (still
+        # retriable) work or an explicit dry-run means delivery is incomplete.
         result = self.outbox.drain(_CallableSender(self.sink))
-        dead_lettered = self.outbox.dead_letter_count()
-        if result.pending or result.dead_lettered or result.dry_run:
+        if result.pending or result.dry_run:
             raise LiveSyncDeliveryError(
                 "event delivery incomplete: "
-                f"pending={result.pending}, dead_lettered={dead_lettered}, "
-                f"dry_run={result.dry_run}"
+                f"pending={result.pending}, dry_run={result.dry_run}"
             )
         return result.sent
 
@@ -514,10 +513,6 @@ class LiveSync:
         # Finish a previously persisted causal prefix before reading newer source events. This
         # makes crash recovery and transient delivery failures preserve open -> modify -> close.
         delivered = self._drain_outbox()
-        if self.outbox.dead_letter_count():
-            # Keep the supervisor cycle healthy, but do not even read/acknowledge a successor
-            # while its rejected predecessor still requires explicit operator recovery.
-            return delivered
         account = self.adapter.verify_identity()
         current = self.adapter.snapshot()
         previous = self.snapshot_store.get()

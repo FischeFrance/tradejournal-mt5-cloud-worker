@@ -218,13 +218,13 @@ def test_permanent_failure_moves_event_to_persistent_dead_letter_once(tmp_path):
     assert restarted.enqueue_many([payload]) == 0
 
 
-def test_permanent_failure_is_a_causal_barrier_for_later_events(tmp_path):
+def test_permanent_failure_is_quarantined_but_does_not_block_later_events(tmp_path):
     path = tmp_path / "event_outbox.json"
     opened = _payload("event-opened")
     closed = _payload("event-closed", "2026-01-01T00:05:00Z")
     outbox = EventOutbox(str(path))
     outbox.enqueue_many([opened, closed])
-    first_sender = _Sender(
+    sender = _Sender(
         [
             SendResult(
                 status="failed",
@@ -232,26 +232,61 @@ def test_permanent_failure_is_a_causal_barrier_for_later_events(tmp_path):
                 error="rejected_by_api",
                 attempts=1,
                 failure_type="permanent",
-            )
+            ),
+            SendResult(status="sent", http_status=200),
         ]
     )
 
-    result = outbox.drain(first_sender)
+    result = outbox.drain(sender)
 
+    # The rejected event is durably quarantined for audit, but automatic recovery (no operator
+    # action) means the drain keeps going and its successor is delivered in the same pass.
     assert result.dead_lettered == 1
-    assert result.pending == 1
-    assert first_sender.payloads == [opened]
-    assert list(outbox.pending_payloads()) == ["event-closed"]
+    assert result.sent == 1
+    assert result.pending == 0
+    assert sender.payloads == [opened, closed]
+    assert list(outbox.pending_payloads()) == []
     assert outbox.dead_letter_count() == 1
 
-    # A restart does not erase the barrier or let the close overtake its rejected open.
+    # A restart preserves the quarantined record, but does not re-block anything: there is
+    # nothing left pending to send.
     restarted = EventOutbox(str(path))
+    assert restarted.pending_count() == 0
+    assert restarted.dead_letter_count() == 1
+
+
+def test_permanent_failure_does_not_block_a_later_batch_after_restart(tmp_path):
+    path = tmp_path / "event_outbox.json"
+    opened = _payload("event-opened")
+    outbox = EventOutbox(str(path))
+    outbox.enqueue_many([opened])
+    outbox.drain(
+        _Sender(
+            [
+                SendResult(
+                    status="failed",
+                    http_status=422,
+                    error="rejected_by_api",
+                    attempts=1,
+                    failure_type="permanent",
+                )
+            ]
+        )
+    )
+    assert outbox.dead_letter_count() == 1
+
+    # A new event for the SAME (or any other) trade, enqueued after a restart, must still be
+    # delivered normally -- one rejected predecessor from an earlier process lifetime must never
+    # permanently freeze this account's reporting.
+    restarted = EventOutbox(str(path))
+    closed = _payload("event-closed", "2026-01-01T00:05:00Z")
+    restarted.enqueue_many([closed])
     successor_sender = _Sender([SendResult(status="sent", http_status=200)])
-    blocked = restarted.drain(successor_sender)
-    assert blocked.sent == 0
-    assert blocked.pending == 1
-    assert successor_sender.payloads == []
-    assert list(restarted.pending_payloads()) == ["event-closed"]
+    result = restarted.drain(successor_sender)
+
+    assert result.sent == 1
+    assert result.pending == 0
+    assert successor_sender.payloads == [closed]
     assert restarted.dead_letter_count() == 1
 
 

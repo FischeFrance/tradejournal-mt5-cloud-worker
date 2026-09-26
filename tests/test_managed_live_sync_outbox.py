@@ -143,34 +143,55 @@ def test_transient_delivery_survives_snapshot_advance_and_restart(tmp_path: Path
     assert len(second.payloads) == 1
 
 
-def test_permanent_rejection_is_visible_and_preserved_in_dead_letter(tmp_path: Path) -> None:
+def test_permanent_rejection_is_quarantined_but_does_not_block_the_next_poll(tmp_path: Path) -> None:
     sender = Sender(
         [SendResult(status="failed", failure_type="permanent", http_status=422)]
     )
-    with pytest.raises(LiveSyncDeliveryError, match="dead_lettered=1"):
-        _live(tmp_path, sender).poll_once()
+    adapter = StreamAdapter(_snapshot(), (_open_record(sequence=18),))
+    live = LiveSync(
+        adapter,
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+    # A permanent rejection is durably quarantined for audit, but no longer raises: automatic
+    # recovery (no operator action) means the poll completes and acknowledges normally.
+    live.poll_once()
 
     persisted = EventOutbox(str(tmp_path / "outbox.json"))
     assert persisted.pending_count() == 0
     assert persisted.dead_letter_count() == 1
+    assert adapter.acknowledged == 18
 
-    # A historical dead-letter is a non-fatal causal barrier: the supervisor remains healthy,
-    # but it must not even read or acknowledge a successor from the file bridge.
-    retry_sender = Sender([])
-    retry_adapter = StreamAdapter(_snapshot(), (_open_record(sequence=19),))
-    retry_live = LiveSync(
-        retry_adapter,
+    # A later, genuinely new event must still be read, delivered and acknowledged -- one
+    # rejected predecessor from an earlier poll must never freeze this account's reporting.
+    next_sender = Sender([SendResult(status="sent", http_status=200)])
+    next_adapter = StreamAdapter(
+        _snapshot(),
+        (
+            _open_record(
+                sequence=19,
+                ticket="901",
+                deal_id="901",
+                order_id="701",
+                position_id="101",
+            ),
+        ),
+    )
+    next_live = LiveSync(
+        next_adapter,
         PersistentSnapshot(tmp_path / "snapshot.json"),
         PersistentDedup(tmp_path / "retry-dedup.sqlite"),
-        retry_sender,
+        next_sender,
         outbox=EventOutbox(str(tmp_path / "outbox.json")),
     )
-    assert retry_live.poll_once() == 0
-    assert retry_sender.payloads == []
-    assert retry_adapter.identity_checks == 0
-    assert retry_adapter.snapshot_reads == 0
-    assert retry_adapter.pending_reads == 0
-    assert retry_adapter.acknowledged is None
+    assert next_live.poll_once() == 1
+    assert len(next_sender.payloads) == 1
+    assert next_adapter.identity_checks == 1
+    assert next_adapter.snapshot_reads == 1
+    assert next_adapter.pending_reads == 1
+    assert next_adapter.acknowledged == 19
     assert EventOutbox(str(tmp_path / "outbox.json")).dead_letter_count() == 1
 
 
