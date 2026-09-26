@@ -1894,6 +1894,7 @@ def _run_history_sync(
                 history_events.append(event)
 
     try:
+<<<<<<< HEAD
         counts = HistorySync(
             adapter,
             root / "state" / "history.json",
@@ -1935,6 +1936,19 @@ def _run_history_sync(
                     history_mode=mode,
                     from_date=from_date,
                     events=history_events,
+=======
+        counts = HistorySync(adapter, root / "state" / "history.json", sink).run(mode, from_date)
+        if ingestion_sink is not None:
+            result = outbox.drain(ingestion_sink)
+            # EventOutbox has already durably quarantined permanent rejections. A historical
+            # dead-letter is not pending delivery work and must not make unrelated later
+            # history batches fail forever. Pending/transient delivery and dry-runs remain
+            # fail-closed so their causal prefix is never skipped.
+            if result.pending or result.dry_run:
+                raise HistorySyncFailed(
+                    "history delivery incomplete: "
+                    f"pending={result.pending}, dry_run={result.dry_run}"
+>>>>>>> 098d500 (fix: prevent dead letters from blocking MT5 closes)
                 )
                 _persist_history_handoff_artifact(
                     adapter,

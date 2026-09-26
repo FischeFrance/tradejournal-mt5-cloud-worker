@@ -501,12 +501,19 @@ class LiveSync:
         if self.outbox.dead_letter_count():
             return 0
         result = self.outbox.drain(_CallableSender(self.sink))
+<<<<<<< HEAD
         dead_lettered = self.outbox.dead_letter_count()
         if result.pending or result.dead_lettered or result.dry_run:
+=======
+        # A permanent rejection has already been durably isolated by EventOutbox. It is no
+        # longer part of the causal pending prefix, so a historical dead-letter must not poison
+        # every later MT5 event (for example, a DEAL_ADD OUT closing a position). Only work that
+        # remains pending, or an explicit dry-run, prevents safely advancing the live stream.
+        if result.pending or result.dry_run:
+>>>>>>> 098d500 (fix: prevent dead letters from blocking MT5 closes)
             raise LiveSyncDeliveryError(
                 "event delivery incomplete: "
-                f"pending={result.pending}, dead_lettered={dead_lettered}, "
-                f"dry_run={result.dry_run}"
+                f"pending={result.pending}, dry_run={result.dry_run}"
             )
         return result.sent
 
