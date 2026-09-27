@@ -111,6 +111,57 @@ def test_trade_closed_detected_and_enriched_with_deal_data():
     assert event["swap"] == -0.1
 
 
+def test_trade_closed_falls_back_to_position_id_and_picks_the_latest_exit_deal():
+    # The MQL5 file bridge writes each deal's own position as "position_id", never
+    # "position_ticket" -- before the fix, this meant _find_closing_deal never matched anything
+    # for a real bridge-produced deals.json, and every trade_closed shipped with no economics.
+    previous = _empty()
+    previous["positions"]["1"] = {
+        "ticket": "1", "symbol": "EURUSD", "direction": "buy", "volume": 0.2,
+        "open_price": 1.1000, "stop_loss": 1.0950, "take_profit": 1.1100,
+    }
+    current = _empty()
+    # An earlier partial close of the same position must not be picked over the true final leg.
+    current["deals"]["500"] = {
+        "position_id": "1",
+        "entry": "OUT",
+        "close_price": 1.1080,
+        "profit": 8.0,
+        "commission": -0.3,
+        "swap": 0.0,
+        "close_time": "2026-01-01T00:30:00+00:00",
+    }
+    current["deals"]["501"] = {
+        "position_id": "1",
+        "entry": "OUT",
+        "close_price": 1.1120,
+        "profit": 12.0,
+        "commission": -0.5,
+        "swap": -0.1,
+        "close_time": "2026-01-01T01:00:00+00:00",
+    }
+    # An opening (IN) deal for the same position must never be mistaken for the close.
+    current["deals"]["499"] = {
+        "position_id": "1",
+        "entry": "IN",
+        "close_price": 1.1000,
+        "profit": 0.0,
+        "commission": -0.2,
+        "swap": 0.0,
+        "close_time": "2026-01-01T00:00:00+00:00",
+    }
+
+    events = detect_events(previous, current)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["event_type"] == "trade_closed"
+    assert event["close_price"] == 1.1120
+    assert event["profit"] == 12.0
+    assert event["commission"] == -0.5
+    assert event["swap"] == -0.1
+
+
 def test_pending_order_created_detected():
     previous = _empty()
     current = _empty()

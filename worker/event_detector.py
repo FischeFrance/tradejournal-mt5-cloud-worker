@@ -74,10 +74,20 @@ def _detect_trade_opened_and_modified(previous: Dict[str, Any], current: Dict[st
 
 
 def _find_closing_deal(deals: Dict[str, Any], ticket: str) -> Dict[str, Any]:
-    for deal in deals.values():
-        if str(deal.get("position_ticket")) == str(ticket):
-            return deal
-    return {}
+    # The MQL5 file bridge writes each deal's own position as "position_id", never
+    # "position_ticket" -- matching only the latter meant this never found anything, so every
+    # trade_closed detected by this (fallback/reconciliation) path always shipped with no close
+    # price, profit, commission or swap. Also: several deals can share the same position (a
+    # partial close followed by the true final close); only a genuine exit deal qualifies, and
+    # when more than one exists the latest by close_time is the real final leg.
+    matching = [
+        deal for deal in deals.values()
+        if str(deal.get("position_ticket", deal.get("position_id"))) == str(ticket)
+        and str(deal.get("entry", "OUT")).upper() in {"1", "2", "3", "OUT", "INOUT", "OUT_BY"}
+    ]
+    if not matching:
+        return {}
+    return max(matching, key=lambda deal: str(deal.get("close_time", deal.get("time", ""))))
 
 
 def _detect_trade_closed(previous: Dict[str, Any], current: Dict[str, Any]) -> List[RawEvent]:
