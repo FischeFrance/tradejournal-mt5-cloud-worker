@@ -49,18 +49,24 @@ class WindowsSecretStore:
         # interactive desktop) that prompt is invisible and unreachable, and the call blocks
         # forever instead of failing. Forbidding UI makes an unexpected DPAPI requirement fail
         # fast and loud, never hang silently.
-        return win32crypt.CryptProtectData(
-            data, "TradeJournal", None, None, None, win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN
-        )
+        #
+        # CRYPTPROTECT_LOCAL_MACHINE: secrets here are provisioned by whichever identity runs
+        # this tool (interactively, over SSH, as an administrator) but must be readable by the
+        # Windows Service, which runs as LocalSystem -- a different Windows identity with its
+        # own separate per-user DPAPI key. Per-user protection (the default) ties the blob to
+        # the encrypting identity only, so a service running as a different identity can never
+        # decrypt it. Machine-scoped protection ties the blob to this machine instead, so any
+        # identity on it can decrypt -- NTFS ACLs (restrict_acl) remain the access boundary.
+        flags = win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN | win32cryptcon.CRYPTPROTECT_LOCAL_MACHINE
+        return win32crypt.CryptProtectData(data, "TradeJournal", None, None, None, flags)
 
     @staticmethod
     def _crypt_unprotect(data: bytes) -> bytes:
         import win32crypt
         import win32cryptcon
 
-        return win32crypt.CryptUnprotectData(
-            data, None, None, None, win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN
-        )[1]
+        flags = win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN | win32cryptcon.CRYPTPROTECT_LOCAL_MACHINE
+        return win32crypt.CryptUnprotectData(data, None, None, None, flags)[1]
 
     def write(self, connection_id: str, name: str, value: str) -> Path:
         if not value or "\n" in value or "\r" in value:
