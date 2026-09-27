@@ -9,3 +9,9 @@ a real customer connection with this id."""
 AGENT_SCOPE_ID = "00000000-0000-0000-0000-000000000000"
 AGENT_TOKEN_SECRET_NAME = "agent_token"
 PROVISIONING_KEY_SECRET_NAME = "mt5_provisioning_key"
+# Grafana Cloud Loki push endpoint credentials (observability, Phase 1 of the VPS
+# infrastructure hardening). Basic Auth, per Grafana Cloud's standard Loki integration:
+# username is the numeric stack/instance id, password is the API token.
+GRAFANA_LOKI_URL_SECRET_NAME = "grafana_loki_url"
+GRAFANA_LOKI_USER_SECRET_NAME = "grafana_loki_user"
+GRAFANA_LOKI_TOKEN_SECRET_NAME = "grafana_loki_token"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import threading
 import logging
+import threading
 from pathlib import Path
 
 import servicemanager
@@ -10,6 +10,7 @@ import win32service
 import win32serviceutil
 
 from windows_agent.agent_daemon import build_runner, run_forever
+from windows_agent.observability.log_shipper import install_loki_handler
 from windows_agent.runtime_config import load_runtime_config
 from windows_agent.security import RedactionFilter
 
@@ -52,6 +53,15 @@ class TradeJournalAgentService(win32serviceutil.ServiceFramework):
         self.ReportServiceStatus(win32service.SERVICE_RUNNING)
         try:
             config = load_runtime_config()
+            try:
+                # Observability is additive and must never block or fail agent startup: a
+                # Grafana Cloud misconfiguration is a missed log, never a reason the read-only
+                # agent (and the real accounts it serves) stays down.
+                install_loki_handler(config.secrets_root)
+            except Exception:
+                servicemanager.LogWarningMsg(
+                    "Grafana Cloud log shipping failed to initialize; continuing without it"
+                )
             runner = build_runner(config)
         except Exception:
             # Do not leave a process that SCM considers healthy but that can

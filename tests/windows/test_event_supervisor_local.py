@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from uuid import uuid4
@@ -86,6 +87,70 @@ def test_run_stops_without_network_or_recurring_remote_heartbeat(tmp_path):
     assert not thread.is_alive()
     assert len(calls) >= 2
     assert set(calls) == {connection_id}
+
+
+def test_poll_once_logs_a_heartbeat_on_success_tagged_with_connection_id(tmp_path, caplog):
+    instances_root = tmp_path / "instances"
+    secrets_root = tmp_path / "secrets"
+    connection_id = str(uuid4())
+    _managed_instance(instances_root, secrets_root, connection_id)
+    supervisor = Mt5EventSupervisor(
+        instances_root,
+        secrets_root,
+        "https://example.invalid",
+        processor=lambda value: 0,
+    )
+
+    with caplog.at_level(logging.INFO, logger="windows_agent.event_supervisor"):
+        supervisor.poll_once()
+
+    heartbeats = [r for r in caplog.records if "healthy" in r.message]
+    assert len(heartbeats) == 1
+    assert heartbeats[0].connection_id == connection_id
+
+
+def test_poll_once_throttles_repeated_heartbeats_within_the_interval(tmp_path, caplog):
+    instances_root = tmp_path / "instances"
+    secrets_root = tmp_path / "secrets"
+    connection_id = str(uuid4())
+    _managed_instance(instances_root, secrets_root, connection_id)
+    supervisor = Mt5EventSupervisor(
+        instances_root,
+        secrets_root,
+        "https://example.invalid",
+        processor=lambda value: 0,
+    )
+
+    with caplog.at_level(logging.INFO, logger="windows_agent.event_supervisor"):
+        supervisor.poll_once()
+        supervisor.poll_once()
+        supervisor.poll_once()
+
+    heartbeats = [r for r in caplog.records if "healthy" in r.message]
+    assert len(heartbeats) == 1
+
+
+def test_poll_once_does_not_log_a_heartbeat_when_processing_fails(tmp_path, caplog):
+    instances_root = tmp_path / "instances"
+    secrets_root = tmp_path / "secrets"
+    connection_id = str(uuid4())
+    _managed_instance(instances_root, secrets_root, connection_id)
+
+    def failing_processor(value):
+        raise RuntimeError("boom")
+
+    supervisor = Mt5EventSupervisor(
+        instances_root,
+        secrets_root,
+        "https://example.invalid",
+        processor=failing_processor,
+    )
+
+    with caplog.at_level(logging.INFO, logger="windows_agent.event_supervisor"):
+        supervisor.poll_once()
+
+    heartbeats = [r for r in caplog.records if "healthy" in r.message]
+    assert heartbeats == []
 
 
 def test_run_keeps_polling_after_a_connection_processing_error(tmp_path):

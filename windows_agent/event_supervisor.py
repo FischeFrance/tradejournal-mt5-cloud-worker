@@ -57,6 +57,8 @@ class Mt5EventSupervisor:
     contains no new event; MAE/MFE samples remain in ``position-excursions.json`` until close.
     """
 
+    _HEARTBEAT_LOG_INTERVAL_SECONDS = 60.0
+
     def __init__(
         self,
         instances_root: Path,
@@ -74,6 +76,7 @@ class Mt5EventSupervisor:
         self.poll_seconds = float(poll_seconds)
         self._processor = processor or self._process_connection
         self._last_error: dict[str, tuple[type[BaseException], float]] = {}
+        self._last_heartbeat_log: dict[str, float] = {}
 
     def _connection_ids(self) -> tuple[str, ...]:
         if not self.instances_root.exists():
@@ -159,7 +162,22 @@ class Mt5EventSupervisor:
                     self._last_error[connection_id] = (type(exc), now)
             else:
                 self._last_error.pop(connection_id, None)
+                self._log_heartbeat(connection_id)
         return delivered
+
+    def _log_heartbeat(self, connection_id: str) -> None:
+        # One low-noise confirmation per connection per interval, not one every 2-second tick --
+        # its only purpose is to let an external monitor (Grafana "no data" alert) detect a
+        # connection that has stopped being processed at all, not to double as a debug trace.
+        now = time.monotonic()
+        last = self._last_heartbeat_log.get(connection_id)
+        if last is not None and now - last < self._HEARTBEAT_LOG_INTERVAL_SECONDS:
+            return
+        self._last_heartbeat_log[connection_id] = now
+        logger.info(
+            "local MT5 event processing healthy",
+            extra={"connection_id": connection_id},
+        )
 
     def run(self, stop_event: threading.Event) -> None:
         if not self.ingestion_url:

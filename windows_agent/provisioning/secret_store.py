@@ -21,6 +21,9 @@ ALLOWED = frozenset(
         "worker_token",
         "mt5_provisioning_key",
         "bridge_token",
+        "grafana_loki_url",
+        "grafana_loki_user",
+        "grafana_loki_token",
     )
 )
 
