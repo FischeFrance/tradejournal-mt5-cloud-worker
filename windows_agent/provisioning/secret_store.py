@@ -113,15 +113,29 @@ class WindowsSecretStore:
 
         # Services running as LocalSystem do not have a SAM-compatible user name that can be
         # resolved with LookupAccountName.  The access token always contains the effective SID,
-        # so use it directly and keep the DPAPI blob readable only by the identity that wrote it.
+        # so use it directly and keep the file readable by the identity that wrote it.
+        #
+        # Also always grant LocalSystem (the Windows Service's own identity) and Administrators
+        # (whoever provisions secrets interactively over SSH): a secret is commonly written by
+        # one of these identities and read by the other (e.g. an administrator provisions a
+        # Grafana Cloud credential, and the service -- running as LocalSystem -- is the one that
+        # reads it to ship logs). Locking the file to only the single writing identity's SID
+        # silently denies the other side: not a decrypt failure (the DPAPI blob itself is
+        # already machine-scoped, see _crypt_protect), but an NTFS access-denied on the file
+        # itself, which callers here treat identically to "secret not provisioned".
         token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
         try:
             sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
         finally:
             token.Close()  # type: ignore[attr-defined]  # pywin32 stub types the handle as int; PyHANDLE has Close() at runtime
+        system_sid = win32security.ConvertStringSidToSid("S-1-5-18")
+        administrators_sid = win32security.ConvertStringSidToSid("S-1-5-32-544")
         descriptor = win32security.SECURITY_DESCRIPTOR()
         acl = win32security.ACL()
-        acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, sid)
+        # Not deduplicated against `sid`: pywin32 SID objects compare by identity, not value,
+        # and a redundant Allow ACE for the same principal is harmless.
+        for grantee in (sid, system_sid, administrators_sid):
+            acl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, grantee)
         descriptor.SetSecurityDescriptorDacl(1, acl, 0)
         win32security.SetFileSecurity(
             str(path), win32security.DACL_SECURITY_INFORMATION, descriptor
