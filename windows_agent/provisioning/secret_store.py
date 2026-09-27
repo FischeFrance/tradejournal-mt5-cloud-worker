@@ -42,14 +42,25 @@ class WindowsSecretStore:
     @staticmethod
     def _crypt_protect(data: bytes) -> bytes:
         import win32crypt
+        import win32cryptcon
 
-        return win32crypt.CryptProtectData(data, "TradeJournal", None, None, None, 0)
+        # CRYPTPROTECT_UI_FORBIDDEN: without it, DPAPI can attempt to show a Windows UI prompt
+        # in some certificate/policy configurations. Over a headless SSH session (no attached
+        # interactive desktop) that prompt is invisible and unreachable, and the call blocks
+        # forever instead of failing. Forbidding UI makes an unexpected DPAPI requirement fail
+        # fast and loud, never hang silently.
+        return win32crypt.CryptProtectData(
+            data, "TradeJournal", None, None, None, win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN
+        )
 
     @staticmethod
     def _crypt_unprotect(data: bytes) -> bytes:
         import win32crypt
+        import win32cryptcon
 
-        return win32crypt.CryptUnprotectData(data, None, None, None, 0)[1]
+        return win32crypt.CryptUnprotectData(
+            data, None, None, None, win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN
+        )[1]
 
     def write(self, connection_id: str, name: str, value: str) -> Path:
         if not value or "\n" in value or "\r" in value:
