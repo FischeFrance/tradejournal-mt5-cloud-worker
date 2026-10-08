@@ -39,6 +39,21 @@ class InterruptingCoordinator(Coordinator):
         raise RuntimeError("fixture service stop")
 
 
+def test_native_recovery_preflight_failure_keeps_daemon_running_and_records_reason(tmp_path):
+    from windows_agent.maintenance_recovery import MaintenanceRecoveryUnavailable
+    class UnsupportedRecovery:
+        def run_once(self, _stop_event):
+            raise MaintenanceRecoveryUnavailable("native_maintenance_recovery_unavailable")
+    clock = Clock(datetime(2026, 10, 8, 21, 30, tzinfo=timezone.utc))
+    scheduler = Mt5MaintenanceScheduler(UnsupportedRecovery(), tmp_path / "maintenance.json", clock=clock)
+    stop = threading.Event()
+    assert scheduler.run_if_due(stop) is True
+    assert not stop.is_set()
+    journal = read_json(tmp_path / "maintenance.json")
+    assert journal["status"] == "failed"
+    assert journal["error_code"] == "native_maintenance_recovery_unavailable"
+
+
 def _scheduler(
     tmp_path: Path,
     clock: Clock,

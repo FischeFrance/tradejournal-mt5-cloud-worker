@@ -83,7 +83,8 @@ def evaluate_maintenance_health(
         if status == "running" and run_date > expected_date:
             return {**result, "status": "running"}
         if status == "failed":
-            return {**result, "status": "failed", "error_code": "mt5_maintenance_failed"}
+            code = "native_maintenance_recovery_unavailable" if state.get("error_code") == "native_maintenance_recovery_unavailable" else "mt5_maintenance_failed"
+            return {**result, "status": "failed", "error_code": code}
         if status == "running":
             return {**result, "status": "overdue", "error_code": "mt5_maintenance_stuck"}
         raise ValueError("invalid maintenance status")

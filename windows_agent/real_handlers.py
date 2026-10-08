@@ -1484,16 +1484,24 @@ def build_real_handlers(
             # therefore not read, decrypt or retain the investor password at all.
             _require_lease(api, job)
             with connection_sync_lock(cid):
-                _ensure_current_managed_expert(
-                    job,
-                    cid,
-                    root,
-                    login,
-                    server,
-                    history_terminal_sha256,
-                    history_mode=mode,
-                )
+                cleanup_required = False
                 try:
+                    try:
+                        _ensure_current_managed_expert(
+                            job,
+                            cid,
+                            root,
+                            login,
+                            server,
+                            history_terminal_sha256,
+                            history_mode=mode,
+                        )
+                    except (Mt5InitializeFailed, LeaseLost):
+                        # These failures occur after the managed asset checks. A
+                        # failed integrity check must never mutate the producer.
+                        cleanup_required = True
+                        raise
+                    cleanup_required = True
                     _progress(root, status="importing_history")
                     adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
                     _verify_investor_access(adapter)
@@ -1513,14 +1521,17 @@ def build_real_handlers(
                     if mode != "new_only":
                         _prepare_history_to_live_handoff(adapter, root)
                 finally:
-                    if mode != "new_only":
+                    if cleanup_required and mode != "new_only":
                         runtime = runtime_factory(root, cid)
                         set_cancel_check = getattr(runtime, "set_cancel_check", None)
                         if callable(set_cancel_check):
-                            set_cancel_check(job.get("_lease_guard"))
-                        _require_lease(api, job)
+                            # Restore the local read-only producer even if the remote
+                            # job lease was lost. This cleanup performs no API writes.
+                            set_cancel_check(None)
                         try:
                             runtime.switch_to_new_only()
+                            live_adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
+                            _verify_investor_access(live_adapter)
                             # A failed import still leaves a verified live bridge available
                             # to the event supervisor. The server keeps the history error.
                             _progress(root, status="connected")

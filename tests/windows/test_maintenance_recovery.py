@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from windows_agent.maintenance_recovery import MaintenanceRecovery
+from windows_agent.maintenance_recovery import MaintenanceRecovery, MaintenanceRecoveryUnavailable
 from windows_agent.state_store import atomic_json, read_json
 from windows_agent.worker.maintenance_mt5_runtime import NativeMt5Runtime
 
@@ -45,3 +45,12 @@ def test_only_published_active_accounts_queue_a_bounded_recovery(tmp_path, monke
         assert queued[0][2]['from_date'] == cutoff.isoformat()
         assert queued[0][2]['release_id'] == 'a' * 64
         assert read_json(root / 'state/job_progress.json')['maintenance_recovery_job_id'] == api.job_id
+
+
+def test_rotation_fails_before_restart_when_native_gap_delivery_is_unavailable(tmp_path):
+    connection_id = str(uuid4())
+    api = Api(connection_id)
+    recovery = MaintenanceRecovery(api, tmp_path / 'instances')
+    with pytest.raises(MaintenanceRecoveryUnavailable, match='native_maintenance_recovery_unavailable'):
+        recovery.refresh_for_rotation()
+    assert [call[2]['operation'] for call in api.calls] == ['inventory']

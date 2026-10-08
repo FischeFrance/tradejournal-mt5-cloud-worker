@@ -147,7 +147,7 @@ def build_runner(
                 template_lock=template_lock,
                 instance_pool=instance_pool,
                 runtime_factory=recovery.runtime,
-                scope_refresh=recovery.refresh,
+                scope_refresh=recovery.refresh_for_rotation,
                 connection_allowed=recovery.allows,
                 pending_update_store=pending_update_store,
                 public_release_probe=Mt5PublicReleaseProbe(

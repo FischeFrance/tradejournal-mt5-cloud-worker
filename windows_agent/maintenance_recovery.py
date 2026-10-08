@@ -8,6 +8,11 @@ from .security import canonical_uuid
 from .state_store import atomic_json, read_json
 from .mt5_recovery_window import new_only_recovery_from
 from .worker.maintenance_mt5_runtime import NativeMt5Runtime
+from .worker.mql5_file_adapter import Mql5FileMt5Adapter
+
+
+class MaintenanceRecoveryUnavailable(RuntimeError):
+    error_code = "native_maintenance_recovery_unavailable"
 
 
 class MaintenanceRecovery:
@@ -26,6 +31,14 @@ class MaintenanceRecovery:
 
     def allows(self, connection_id: str) -> bool:
         return connection_id in self.connection_ids
+
+    def refresh_for_rotation(self) -> None:
+        self.refresh()
+        # A durable queue receipt cannot prove that the native adapter can deliver
+        # the requested gap. Fail before stopping any account when it rejects UTC
+        # from_date windows, instead of discovering this after the fleet restart.
+        if self.connection_ids and Mql5FileMt5Adapter.history_time_basis == "broker_server_unresolved":
+            raise MaintenanceRecoveryUnavailable("native_maintenance_recovery_unavailable")
 
     def runtime(self, root: Path, connection_id: str) -> NativeMt5Runtime:
         owner = self

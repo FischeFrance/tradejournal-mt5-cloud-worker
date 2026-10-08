@@ -74,7 +74,7 @@ def native_history(env, monkeypatch):
         )
         return handlers["historical_sync"](_job("historical_sync", cid, history_mode="all_available"))
 
-    return SimpleNamespace(root=root, provisioner=provisioner, cid=cid, calls=calls, run=run)
+    return SimpleNamespace(root=root, provisioner=provisioner, cid=cid, calls=calls, run=run, runtime=Runtime)
 
 
 def test_vendor_tool_updates_do_not_block_native_history(native_history):
@@ -128,3 +128,18 @@ def test_failed_import_restores_connected_live_marker(native_history, monkeypatc
         native_history.run()
     assert native_history.calls == ["new_only"]
     assert read_json(native_history.root / "state/job_progress.json")["status"] == "connected"
+
+
+def test_failed_mode_switch_restores_verified_live_marker(native_history, monkeypatch):
+    from windows_agent.state_store import read_json
+    from windows_agent.worker.native_mt5_runtime import NativeMt5Error
+    case = native_history
+    (case.root / "terminal/MQL5/Files/TradeJournal/history_mode").write_text("new_only")
+    def fail(*_args):
+        raise NativeMt5Error("history_mode_change_requires_expert_update")
+    monkeypatch.setattr(case.runtime, "switch_to_history_mode", fail)
+    with pytest.raises(Exception) as exc:
+        case.run()
+    assert exc.value.error_code == "mt5_initialize_failed"
+    assert case.calls == ["new_only"]
+    assert read_json(case.root / "state/job_progress.json")["status"] == "connected"

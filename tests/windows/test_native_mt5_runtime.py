@@ -1353,8 +1353,17 @@ def test_stop_waits_after_forced_kill_before_final_rescan(tmp_path: Path, monkey
 
 def test_running_bridge_switches_to_history_without_restarting(tmp_path):
     runtime = _runtime(tmp_path)
-    live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True}))
+    live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True, "history_mode_switch_supported": True}))
     history = {**live, "sequence": live["sequence"] + 1, "payload": {"history_mode": "history", "terminal_connected": True}}
     with patch.object(runtime, "_read_json", side_effect=[live, history]), patch.object(runtime, "stop", side_effect=AssertionError("restart forbidden")):
         runtime.switch_to_history_mode("all_available", timeout=1)
     assert (runtime.files / "history_mode").read_text() == "all_available"
+
+
+def test_legacy_live_bridge_rejects_reverse_switch_without_publishing(tmp_path):
+    runtime = _runtime(tmp_path)
+    live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True}))
+    with patch.object(runtime, "_read_json", return_value=live), patch.object(runtime, "_publish_history_mode") as publish:
+        with pytest.raises(NativeMt5Error, match="history_mode_change_requires_expert_update"):
+            runtime.switch_to_history_mode("all_available")
+    publish.assert_not_called()

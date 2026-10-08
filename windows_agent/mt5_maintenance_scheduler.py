@@ -330,7 +330,7 @@ class Mt5MaintenanceScheduler:
             self.coordinator.run_once(window_stop)
             if window_stop.is_set():
                 raise Mt5MaintenanceScheduleError("MT5 maintenance window ended or service stopped")
-        except Exception:
+        except Exception as exc:
             failed_at = self._now()
             interrupted = window_stop.is_set()
             failed = {
@@ -341,6 +341,8 @@ class Mt5MaintenanceScheduler:
                     failed_at + self.retry_delay
                 ),
             }
+            if getattr(exc, "error_code", None) == "native_maintenance_recovery_unavailable":
+                failed["error_code"] = "native_maintenance_recovery_unavailable"
             if interrupted:
                 # A graceful service stop can happen after part of the pool or
                 # fleet has already moved to the new release. Record it for

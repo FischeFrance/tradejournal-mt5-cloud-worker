@@ -165,6 +165,16 @@ class NativeMt5Runtime:
         if timeout <= 0:
             raise NativeMt5Error("history_mode_switch_timeout")
         previous = self._read_json(self.files / "heartbeat.json") or {}
+        previous_payload = self._payload(previous, "heartbeat") if previous else None
+        if (
+            history_mode != "new_only"
+            and previous_payload is not None
+            and previous_payload.get("history_mode") == "new_only"
+            and previous_payload.get("history_mode_switch_supported") is not True
+        ):
+            # The installed legacy EA only supports history -> live. Never publish
+            # a reverse request that it cannot acknowledge or restart a live account.
+            raise NativeMt5Error("history_mode_change_requires_expert_update")
         previous_sequence = previous.get("sequence", -1)
         if not isinstance(previous_sequence, int):
             previous_sequence = -1

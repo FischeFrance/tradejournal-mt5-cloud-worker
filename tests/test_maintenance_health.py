@@ -78,3 +78,15 @@ def test_future_or_corrupt_completion_cannot_look_healthy(tmp_path):
     root = capable_release(tmp_path / "release")
     state(tmp_path, "2099-10-07", finished="2099-10-07T21:50:00Z")
     assert evaluate_maintenance_health(root, environment(tmp_path))["status"] == "invalid_state"
+
+
+def test_native_gap_delivery_failure_is_visible_in_health(tmp_path):
+    root = capable_release(tmp_path / "release")
+    state(tmp_path, status="failed")
+    path = tmp_path / "mt5-maintenance.json"
+    journal = json.loads(path.read_text())
+    journal["error_code"] = "native_maintenance_recovery_unavailable"
+    path.write_text(json.dumps(journal))
+    health = evaluate_maintenance_health(root, environment(tmp_path), now=datetime(2026, 10, 8, 21, 50, tzinfo=timezone.utc))
+    assert health["status"] == "failed"
+    assert health["error_code"] == "native_maintenance_recovery_unavailable"
