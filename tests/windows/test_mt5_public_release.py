@@ -590,7 +590,7 @@ def test_inventory_accepts_only_exact_signed_public_auxiliary_partial(
     inventory = Mt5ProvisionedReleaseInventory(
         instances,
         build_reader=_build_reader,
-        signature_verifier=lambda _path: IDENTITY,
+        signature_verifier=lambda path: (_ for _ in ()).throw(ValueError("invalid signature")) if path.read_bytes().startswith(b"evil") else IDENTITY,
         trusted_template_root=trusted,
     )
 
@@ -627,3 +627,24 @@ def test_inventory_rejects_reparse_instances_root(tmp_path: Path) -> None:
             build_reader=_build_reader,
             signature_verifier=lambda _path: IDENTITY,
         ).scan(baseline)
+
+
+def test_signed_coherent_distribution_may_be_newer_than_bootstrapper(tmp_path):
+    probe = _probe(tmp_path, runner=_runner(terminal_build=6141))
+    release = probe.refresh()
+    assert release.build == 6141
+    assert probe.load_current().release_id == release.release_id
+    metadata = json.loads((release.root / "release.json").read_text())
+    assert metadata["installer_build"] == 6140
+
+
+def test_split_distribution_tools_never_publish(tmp_path):
+    run = _runner(terminal_build=6141)
+    def split(installer, destination, timeout):
+        result = run(installer, destination, timeout)
+        (destination / "metatester64.exe").write_bytes(b"tester;build=6140")
+        return result
+    probe = _probe(tmp_path, runner=split)
+    with pytest.raises(Mt5PublicReleaseError, match="tools builds differ"):
+        probe.refresh()
+    assert not probe.current_path.exists()

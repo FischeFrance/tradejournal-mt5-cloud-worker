@@ -833,15 +833,22 @@ class Mt5PublicReleaseProbe:
             terminal_signer = self.signature_verifier(terminal)
             _validate_signer(terminal_signer)
             terminal_build = _validate_positive_build(self.build_reader(terminal))
-            if terminal_build != installer_build:
+            if terminal_build < installer_build:
                 raise Mt5PublicReleaseError("MT5 installer and terminal builds differ")
 
+            # The signed bootstrapper can precede the distribution it downloads.
+            # Publish the coherent installed release, never an older terminal.
+            for name in ("MetaEditor64.exe", "metatester64.exe"):
+                auxiliary = terminal_root / name
+                _validate_signer(self.signature_verifier(auxiliary))
+                if _validate_positive_build(self.build_reader(auxiliary)) != terminal_build:
+                    raise Mt5PublicReleaseError("MT5 distribution tools builds differ")
             installer_sha256 = _sha256(installer)
             terminal_sha256 = _sha256(terminal)
             code_manifest_sha256 = InstanceProvisioner._code_manifest(terminal_root)
             distribution_manifest_sha256 = InstanceProvisioner._tree_manifest(terminal_root)
             release_id = _release_id(
-                installer_build,
+                terminal_build,
                 installer_sha256,
                 terminal_sha256,
                 code_manifest_sha256,
@@ -855,7 +862,8 @@ class Mt5PublicReleaseProbe:
                 "release_id": release_id,
                 "source_url": MT5_STABLE_INSTALLER_URL,
                 "published_at_unix_ms": published_at,
-                "build": installer_build,
+                "build": terminal_build,
+                "installer_build": installer_build,
                 "installer_sha256": installer_sha256,
                 "terminal_sha256": terminal_sha256,
                 "code_manifest_sha256": code_manifest_sha256,
@@ -927,9 +935,12 @@ class Mt5PublicReleaseProbe:
             "installer_exit_code",
             "postconditions",
         }
-        if not isinstance(raw, dict) or set(raw) != required:
+        if not isinstance(raw, dict) or set(raw) not in (required, required | {"installer_build"}):
             raise Mt5PublicReleaseError("MT5 public release metadata is invalid")
         build = _validate_positive_build(raw.get("build"))
+        installer_build = _validate_positive_build(raw.get("installer_build", build))
+        if installer_build > build:
+            raise Mt5PublicReleaseError("MT5 installer and terminal builds differ")
         published_at = raw.get("published_at_unix_ms")
         postconditions = raw.get("postconditions")
         if (
@@ -994,10 +1005,16 @@ class Mt5PublicReleaseProbe:
         if (
             installer_signer != _identity_from_dict(raw["installer_signer"])
             or terminal_signer != _identity_from_dict(raw["terminal_signer"])
-            or _validate_positive_build(self.build_reader(installer)) != build
+            or _validate_positive_build(self.build_reader(installer)) != installer_build
             or _validate_positive_build(self.build_reader(terminal)) != build
         ):
             raise Mt5PublicReleaseError("MT5 public release verification changed")
+        if "installer_build" in raw:
+            for name in ("MetaEditor64.exe", "metatester64.exe"):
+                auxiliary = terminal_root / name
+                _validate_signer(self.signature_verifier(auxiliary))
+                if _validate_positive_build(self.build_reader(auxiliary)) != build:
+                    raise Mt5PublicReleaseError("MT5 distribution tools builds differ")
         expected_id = _release_id(build, *digests)
         if expected_id != root.name:
             raise Mt5PublicReleaseError("MT5 public release identity is invalid")
@@ -1301,10 +1318,10 @@ class Mt5ProvisionedReleaseInventory:
         MetaQuotes can replace ``metaeditor64.exe`` and ``metatester64.exe``
         before ``terminal64.exe``.  That leaves the terminal pin intact but
         makes the aggregate executable manifest stale.  It is recoverable
-        only when the instance otherwise equals the current trusted template
-        and the changed auxiliary files are byte-for-byte the freshly
-        downloaded public baseline, with valid MetaQuotes signatures and the
-        same public build.  No EX5, DLL, missing file or arbitrary PE drift is
+        only when unchanged vendor code reconstructs the exact recorded manifest,
+        managed assets match their own pin, and changed tools have valid
+        MetaQuotes signatures matching the public vendor identity and builds
+        between the trusted source and current public release.  No EX5, DLL, missing file or arbitrary PE drift is
         accepted.
         """
 
@@ -1377,9 +1394,7 @@ class Mt5ProvisionedReleaseInventory:
                 if (
                     not public.is_file()
                     or InstanceProvisioner._is_reparse_point(public)
-                    or actual_item[1] != public_item[1]
-                    or _validate_positive_build(self.build_reader(actual))
-                    != baseline.build
+                    or not self.build_reader(trusted / Path(trusted_index[relative][0])) <= _validate_positive_build(self.build_reader(actual)) <= baseline.build
                     or _validate_positive_build(self.build_reader(public))
                     != baseline.build
                 ):
