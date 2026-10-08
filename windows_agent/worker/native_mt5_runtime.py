@@ -172,13 +172,28 @@ class NativeMt5Runtime:
             and previous_payload.get("history_mode") == "new_only"
             and previous_payload.get("history_mode_switch_supported") is not True
         ):
-            # The installed legacy EA only supports history -> live. Never publish
-            # a reverse request that it cannot acknowledge or restart a live account.
-            raise NativeMt5Error("history_mode_change_requires_expert_update")
+            needs_chart_refresh = True
+        else:
+            needs_chart_refresh = False
         previous_sequence = previous.get("sequence", -1)
         if not isinstance(previous_sequence, int):
             previous_sequence = -1
+        if needs_chart_refresh:
+            pids = self._running_terminal_pids()
+            if len(pids) != 1:
+                raise NativeMt5Error("history_mode_switch_process_identity_unavailable")
         self._publish_history_mode(history_mode)
+        if needs_chart_refresh:
+            self._check_cancelled()
+            self.refresh_history_chart(pids[0], timeout=min(timeout, 20))
+        # Historical producers deliberately keep the frozen sequence unchanged.
+        if (
+            history_mode != "new_only"
+            and previous_payload
+            and previous_payload.get("history_mode") == "history"
+            and previous_payload.get("terminal_connected") is True
+        ):
+            return
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._check_cancelled()
@@ -1101,14 +1116,20 @@ class NativeMt5Runtime:
             raise NativeMt5Error("terminal_window_identity_failed")
         return executable, creation_time_unix_ms
 
-    def set_terminal_window_visibility(
-        self,
-        pid: int,
-        *,
-        visible: bool,
-        timeout: float = 15.0,
-    ) -> dict[str, Any]:
-        """Change only this terminal's windows in its dedicated interactive session."""
+    def set_terminal_window_visibility(self, pid: int, *, visible: bool, timeout: float = 15.0) -> dict[str, Any]:
+        return self._run_terminal_ui_action(pid, "show" if visible else "hide", timeout)
+
+    def refresh_history_chart(self, pid: int, *, timeout: float = 20.0) -> dict[str, Any]:
+        from ..interactive_identity import verify_interactive_process_identity
+        verify_interactive_process_identity(self._interactive_user(), pid)
+        return self._run_terminal_ui_action(pid, "refresh_history", timeout)
+
+    def _run_terminal_ui_action(self, pid: int, action: str, timeout: float) -> dict[str, Any]:
+        """Dispatch only reviewed window/managed-chart operations to the verified actor."""
+        if action not in ("show", "hide", "refresh_history"):
+            raise NativeMt5Error("terminal_ui_action_invalid")
+        refresh = action == "refresh_history"
+        stem = "history-chart-refresh" if refresh else "window-visibility"
         interactive_user = self._interactive_user()
         if not interactive_user:
             raise NativeMt5Error("dedicated_interactive_user_required")
@@ -1117,22 +1138,21 @@ class NativeMt5Runtime:
             Path(__file__).resolve().parents[2]
             / "scripts"
             / "windows"
-            / "Set-Mt5WindowVisibility.ps1"
+            / ("Refresh-Mt5HistoryChart.ps1" if refresh else "Set-Mt5WindowVisibility.ps1")
         )
         if not source.is_file():
             raise NativeMt5Error("terminal_window_helper_missing")
 
         self.state.mkdir(parents=True, exist_ok=True)
         self.files.mkdir(parents=True, exist_ok=True)
-        helper = self.state / "set-mt5-window-visibility.ps1"
+        helper = self.state / (stem + ".ps1")
         helper_temporary = helper.with_suffix(".ps1.tmp")
-        request = self.state / "window-visibility-request.json"
+        request = self.state / (stem + "-request.json")
         request_temporary = request.with_suffix(".json.tmp")
-        result = self.files / "window-visibility-result.json"
+        result = self.files / (stem + "-result.json")
         result_temporary = result.with_suffix(".json.tmp")
-        launcher = self.state / "set-window-visibility.cmd"
-        task = f"TradeJournalMT5-Window-{self.connection_id}"
-        action = "show" if visible else "hide"
+        launcher = self.state / ("set-window-visibility.cmd" if not refresh else stem + ".cmd")
+        task = f"TradeJournalMT5-{'HistoryChart' if refresh else 'Window'}-{self.connection_id}"
         task_created = False
         cleanup_failed = False
         try:
@@ -1219,9 +1239,11 @@ class NativeMt5Runtime:
                 != creation_time_unix_ms
                 or not isinstance(record.get("windows_matched"), int)
                 or record["windows_matched"] < 1
-                or not isinstance(record.get("visible_after"), int)
-                or (visible and record["visible_after"] < 1)
-                or (not visible and record["visible_after"] != 0)
+                or (not refresh and (
+                    not isinstance(record.get("visible_after"), int)
+                    or (action == "show" and record["visible_after"] < 1)
+                    or (action == "hide" and record["visible_after"] != 0)
+                ))
             ):
                 raise NativeMt5Error("terminal_window_visibility_failed")
             return record

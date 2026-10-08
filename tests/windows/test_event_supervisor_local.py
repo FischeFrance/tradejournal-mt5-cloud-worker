@@ -3,10 +3,25 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from unittest.mock import Mock, patch
 from uuid import uuid4
+
+import pytest
 
 from windows_agent.event_supervisor import Mt5EventSupervisor
 from windows_agent.state_store import atomic_json
+
+
+@pytest.mark.parametrize("mode", ["history", None])
+def test_live_consumer_refuses_frozen_history_even_with_connected_marker(tmp_path, mode):
+    connection_id = str(uuid4())
+    supervisor = Mt5EventSupervisor(tmp_path / "instances", tmp_path / "secrets", "https://example.invalid")
+    adapter = Mock()
+    adapter._heartbeat.return_value = {"history_mode": mode}
+    with patch.object(supervisor.secrets, "read", side_effect=["42", "Demo", "token"]), patch("windows_agent.event_supervisor.Mql5FileMt5Adapter", return_value=adapter), patch("windows_agent.event_supervisor.TradingIngestionSink") as sink:
+        with pytest.raises(RuntimeError, match="live_history_handoff_pending"):
+            supervisor._process_connection(connection_id)
+    sink.assert_not_called()
 
 
 def _managed_instance(instances_root, secrets_root, connection_id, *, active=True):

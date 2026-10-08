@@ -124,6 +124,12 @@ class Mt5EventSupervisor:
             server,
             root / "state",
         )
+        # A connected marker from an earlier release cannot authorize consumption
+        # of a frozen historical bundle. Validate account identity and freshness
+        # through the adapter before constructing any live delivery machinery.
+        heartbeat = adapter._heartbeat()
+        if heartbeat.get("history_mode") != "new_only":
+            raise RuntimeError("live_history_handoff_pending")
         sink = TradingIngestionSink(root, self.ingestion_url, bridge_token)
         dedup = PersistentDedup(root / "state" / "live-dedup.sqlite")
         try:

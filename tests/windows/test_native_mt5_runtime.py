@@ -1360,10 +1360,28 @@ def test_running_bridge_switches_to_history_without_restarting(tmp_path):
     assert (runtime.files / "history_mode").read_text() == "all_available"
 
 
-def test_legacy_live_bridge_rejects_reverse_switch_without_publishing(tmp_path):
+def test_legacy_live_bridge_requires_one_owned_process_before_publishing(tmp_path):
     runtime = _runtime(tmp_path)
     live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True}))
-    with patch.object(runtime, "_read_json", return_value=live), patch.object(runtime, "_publish_history_mode") as publish:
-        with pytest.raises(NativeMt5Error, match="history_mode_change_requires_expert_update"):
+    with patch.object(runtime, "_read_json", return_value=live), patch.object(runtime, "_running_terminal_pids", return_value=[]), patch.object(runtime, "_publish_history_mode") as publish:
+        with pytest.raises(NativeMt5Error, match="history_mode_switch_process_identity_unavailable"):
             runtime.switch_to_history_mode("all_available")
     publish.assert_not_called()
+
+
+def test_legacy_live_bridge_refreshes_chart_and_awaits_history_ack(tmp_path):
+    runtime = _runtime(tmp_path)
+    live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True}))
+    history = {**live, "sequence": live["sequence"] + 1, "payload": {"history_mode": "history", "terminal_connected": True}}
+    with patch.object(runtime, "_read_json", side_effect=[live, history]), patch.object(runtime, "_running_terminal_pids", return_value=[123]), patch.object(runtime, "refresh_history_chart") as refresh, patch.object(runtime, "stop", side_effect=AssertionError("restart forbidden")):
+        runtime.switch_to_history_mode("all_available", timeout=1)
+    refresh.assert_called_once_with(123, timeout=1)
+    assert (runtime.files / "history_mode").read_text() == "all_available"
+
+
+def test_existing_frozen_history_does_not_require_sequence_advance(tmp_path):
+    runtime = _runtime(tmp_path)
+    history = json.loads(_envelope({"history_mode": "history", "terminal_connected": True}))
+    with patch.object(runtime, "_read_json", return_value=history), patch.object(runtime, "refresh_history_chart", side_effect=AssertionError("already frozen")):
+        runtime.switch_to_history_mode("all_available", timeout=1)
+    assert (runtime.files / "history_mode").read_text() == "all_available"
