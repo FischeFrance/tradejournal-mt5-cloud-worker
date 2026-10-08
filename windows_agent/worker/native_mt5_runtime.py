@@ -155,18 +155,20 @@ class NativeMt5Runtime:
         durable_replace(mode_tmp, self.files / "history_mode")
 
     def switch_to_new_only(self, timeout: float = 30.0) -> None:
-        """Switch a running bridge to live mode without interrupting trade events.
+        self.switch_to_history_mode("new_only", timeout)
 
-        The EA acknowledges the one-way handoff in a newly committed heartbeat.  Waiting for a
-        greater envelope sequence prevents an old/stale heartbeat from completing the switch.
-        """
+    def switch_to_history_mode(self, history_mode: str, timeout: float = 30.0) -> None:
+        """Change a running bridge mode and await a fresh committed heartbeat."""
+        if history_mode not in ("new_only", "from_date", "all_available"):
+            raise NativeMt5Error("invalid_history_mode")
+        acknowledged_mode = "new_only" if history_mode == "new_only" else "history"
         if timeout <= 0:
             raise NativeMt5Error("history_mode_switch_timeout")
         previous = self._read_json(self.files / "heartbeat.json") or {}
         previous_sequence = previous.get("sequence", -1)
         if not isinstance(previous_sequence, int):
             previous_sequence = -1
-        self._publish_history_mode("new_only")
+        self._publish_history_mode(history_mode)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._check_cancelled()
@@ -175,7 +177,7 @@ class NativeMt5Runtime:
             sequence = record.get("sequence") if record else None
             if (
                 payload is not None
-                and payload.get("history_mode") == "new_only"
+                and payload.get("history_mode") == acknowledged_mode
                 and payload.get("terminal_connected") is True
                 and isinstance(sequence, int)
                 and sequence > previous_sequence

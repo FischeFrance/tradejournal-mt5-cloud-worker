@@ -1349,3 +1349,12 @@ def test_stop_waits_after_forced_kill_before_final_rescan(tmp_path: Path, monkey
 
     assert runtime.stop(timeout=0.1) is True
     assert calls == [[process], [process]]
+
+
+def test_running_bridge_switches_to_history_without_restarting(tmp_path):
+    runtime = _runtime(tmp_path)
+    live = json.loads(_envelope({"history_mode": "new_only", "terminal_connected": True}))
+    history = {**live, "sequence": live["sequence"] + 1, "payload": {"history_mode": "history", "terminal_connected": True}}
+    with patch.object(runtime, "_read_json", side_effect=[live, history]), patch.object(runtime, "stop", side_effect=AssertionError("restart forbidden")):
+        runtime.switch_to_history_mode("all_available", timeout=1)
+    assert (runtime.files / "history_mode").read_text() == "all_available"

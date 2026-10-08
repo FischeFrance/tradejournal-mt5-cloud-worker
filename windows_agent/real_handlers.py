@@ -666,6 +666,18 @@ def build_real_handlers(
             active_history_mode = history_mode_path.read_text(encoding="utf-8").strip()
         except OSError:
             active_history_mode = ""
+        # A mode-only history request does not require a terminal restart. Keeping
+        # the authenticated process avoids opening the vendor updater during import.
+        if terminal_is_running and not expert_needs_rotation and active_history_mode != history_mode:
+            runtime = runtime_factory(root, cid)
+            switch = getattr(runtime, "switch_to_history_mode", None)
+            if callable(switch):
+                runtime.set_cancel_check(job.get("_lease_guard"))
+                try:
+                    switch(history_mode)
+                except NativeMt5Error as exc:
+                    raise Mt5InitializeFailed(str(exc)) from exc
+                active_history_mode = history_mode
         restart_required = expert_needs_rotation or active_history_mode != history_mode
         if restart_required:
             try:
@@ -1509,6 +1521,9 @@ def build_real_handlers(
                         _require_lease(api, job)
                         try:
                             runtime.switch_to_new_only()
+                            # A failed import still leaves a verified live bridge available
+                            # to the event supervisor. The server keeps the history error.
+                            _progress(root, status="connected")
                         except NativeMt5Error as exc:
                             raise Mt5InitializeFailed(str(exc)) from exc
         else:

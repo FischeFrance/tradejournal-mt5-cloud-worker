@@ -46,6 +46,10 @@ def native_history(env, monkeypatch):
         def set_cancel_check(self, _check):
             pass
 
+        def switch_to_history_mode(self, mode):
+            calls.append(("switch", mode))
+            (files / "history_mode").write_text(mode)
+
         def switch_to_new_only(self):
             calls.append("new_only")
 
@@ -104,3 +108,23 @@ def test_terminal_and_managed_assets_still_fail_before_history_is_read(native_hi
         case.run()
     assert exc.value.error_code == error_code
     assert case.calls == []
+
+
+def test_running_history_mode_switch_never_stops_the_terminal(native_history, monkeypatch):
+    case = native_history
+    (case.root / "terminal/MQL5/Files/TradeJournal/history_mode").write_text("new_only")
+    monkeypatch.setattr(ProcessManager, "stop", lambda *_a: pytest.fail("mode-only request stopped MT5"))
+    assert case.run()["imported_deals"] == 44
+    assert case.calls == [("switch", "all_available"), "history", "new_only"]
+
+
+def test_failed_import_restores_connected_live_marker(native_history, monkeypatch):
+    from windows_agent.state_store import read_json
+    from windows_agent.agent_errors import HistorySyncFailed
+    def fail(*_args):
+        raise HistorySyncFailed("test history failure")
+    monkeypatch.setattr(real_handlers, "_run_history_sync", fail)
+    with pytest.raises(HistorySyncFailed):
+        native_history.run()
+    assert native_history.calls == ["new_only"]
+    assert read_json(native_history.root / "state/job_progress.json")["status"] == "connected"
