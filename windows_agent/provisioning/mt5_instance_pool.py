@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Prebuilt, credential-free MT5 instance pool.
 
 Pool entries are complete filesystem copies, never running processes.  A slot
@@ -7,19 +5,22 @@ is built and verified outside the user request path, then claimed with an
 atomic directory move.  Claimed or failed slots are never returned to READY.
 """
 
+from __future__ import annotations
+
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
-from threading import Event
+from threading import Event, RLock
 from uuid import UUID, uuid4
 
 from worker.atomic_file import durable_replace, fsync_directory
 
 from ..state_store import atomic_json, read_json
 from ..security import canonical_uuid
-from .instance_layout import SUBDIRS, InstanceLayout
+from .instance_layout import InstanceLayout
 from .mt5_instance import InstanceProvisioner
 
 
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 POOL_SCHEMA_VERSION = 1
 DEFAULT_REPLENISH_INTERVAL_SECONDS = 5.0
+_WINDOWS_TRANSIENT_MOVE_ERRORS = frozenset((5, 32, 33))
+_POOL_MOVE_ATTEMPTS = 5
+_POOL_MOVE_BASE_DELAY_SECONDS = 0.1
 
 _PRIVATE_DIRECTORIES = (
     Path("terminal/Bases"),
@@ -40,6 +44,7 @@ _PRIVATE_CONFIG_NAMES = frozenset(
     {
         "accounts.dat",
         "accounts.ini",
+        "certificates",
         "community.ini",
         "signals.ini",
     }
@@ -61,6 +66,7 @@ class Mt5InstancePool:
         expected_terminal_sha256: str | None,
         target_size: int = 2,
         max_size: int = 3,
+        template_lock: RLock | None = None,
     ) -> None:
         if (
             not isinstance(target_size, int)
@@ -78,6 +84,7 @@ class Mt5InstancePool:
         self.expected_terminal_sha256 = expected_terminal_sha256
         self.target_size = target_size
         self.max_size = max_size
+        self._template_lock = template_lock or RLock()
         self.building_root = self.pool_root / "building"
         self.ready_root = self.pool_root / "ready"
         self.claimed_root = self.pool_root / "claimed"
@@ -313,6 +320,11 @@ class Mt5InstancePool:
     def build_one(self) -> Path:
         """Build, sanitize and atomically publish one independent READY slot."""
 
+        with self._template_lock:
+            return self._build_one_locked()
+
+    def _build_one_locked(self) -> Path:
+
         self._ensure_roots()
         if self.ready_count() >= self.max_size:
             raise InstancePoolError("MT5 instance pool is already full")
@@ -406,11 +418,15 @@ class Mt5InstancePool:
     def maintain_once(self, stop_event: Event | None = None) -> int:
         """Replenish sequentially up to target_size and return READY count."""
 
-        self._discard_incompatible_ready_slots()
+        with self._template_lock:
+            self._discard_incompatible_ready_slots()
         while self.ready_count() < self.target_size:
-            if stop_event is not None and stop_event.is_set():
-                break
-            self.build_one()
+            with self._template_lock:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if self.ready_count() >= self.target_size:
+                    break
+                self._build_one_locked()
         return self.ready_count()
 
     def replenish_forever(
@@ -450,6 +466,40 @@ class Mt5InstancePool:
         fsync_directory(self.reservations_root)
         return reservation
 
+    @staticmethod
+    def _move_ready_slot(source: Path, destination: Path) -> bool:
+        """Move one READY slot, tolerating bounded Windows scanner locks.
+
+        Antivirus and indexing services can briefly hold a newly published
+        directory and make ``os.rename`` report access/sharing violations.
+        Such a slot must not make the whole connection fail: retry briefly,
+        then leave it in READY so the caller can try another slot or use the
+        direct-copy fallback.
+        """
+
+        for attempt in range(_POOL_MOVE_ATTEMPTS):
+            try:
+                durable_replace(source, destination)
+                return True
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                if not source.exists():
+                    return False
+                winerror = getattr(exc, "winerror", None)
+                if (
+                    winerror not in _WINDOWS_TRANSIENT_MOVE_ERRORS
+                    or attempt + 1 >= _POOL_MOVE_ATTEMPTS
+                ):
+                    logger.warning(
+                        "MT5 pool slot temporarily unavailable during claim"
+                    )
+                    return False
+                time.sleep(
+                    _POOL_MOVE_BASE_DELAY_SECONDS * (2**attempt)
+                )
+        return False
+
     def claim(self, connection_id: str) -> Path | None:
         """Atomically consume one READY slot for a canonical connection UUID.
 
@@ -463,6 +513,10 @@ class Mt5InstancePool:
         unusable partial state.
         """
 
+        with self._template_lock:
+            return self._claim_locked(connection_id)
+
+    def _claim_locked(self, connection_id: str) -> Path | None:
         try:
             connection_id = canonical_uuid(connection_id)
         except (AttributeError, TypeError, ValueError) as exc:
@@ -514,17 +568,13 @@ class Mt5InstancePool:
             for slot in self.ready_slots():
                 candidate = self.claimed_root / connection_id
                 try:
-                    durable_replace(slot, candidate)
+                    moved = self._move_ready_slot(slot, candidate)
                 except FileExistsError:
                     raise InstancePoolError(
                         "connection claim target already exists"
                     )
-                except OSError as exc:
-                    if not slot.exists():
-                        continue
-                    raise InstancePoolError(
-                        "pool slot claim failed"
-                    ) from exc
+                if not moved:
+                    continue
                 claimed = candidate
                 try:
                     instance = self._validate_slot(claimed)
@@ -574,3 +624,41 @@ class Mt5InstancePool:
                 self._remove_tree(claimed)
             reservation.unlink(missing_ok=True)
             fsync_directory(self.reservations_root)
+
+    def accept_template_rotation(
+        self,
+        terminal_sha256: str,
+        *,
+        replenish: bool = False,
+        stop_event: Event | None = None,
+    ) -> int:
+        """Switch future slots to a verified template and replace stale READY slots.
+
+        The maintenance path keeps the shared template lock through discard and
+        refill, so no concurrent claim can publish a slot from the prior release.
+        Normal user-triggered fallback promotion leaves refill to the background
+        worker by keeping ``replenish`` false.
+        """
+
+        digest = terminal_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise InstancePoolError("rotated MT5 template digest is invalid")
+        with self._template_lock:
+            try:
+                actual = InstanceProvisioner._sha256(self.source_terminal)
+            except OSError as exc:
+                raise InstancePoolError("rotated MT5 template is unavailable") from exc
+            if actual != digest:
+                raise InstancePoolError("rotated MT5 template digest mismatch")
+            self.expected_terminal_sha256 = digest
+            discarded = self._discard_incompatible_ready_slots()
+            if replenish:
+                while self.ready_count() < self.target_size:
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    self._build_one_locked()
+                if self.ready_count() < self.target_size:
+                    raise InstancePoolError(
+                        "MT5 instance pool rotation was interrupted"
+                    )
+            return discarded

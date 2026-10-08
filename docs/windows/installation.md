@@ -66,6 +66,54 @@ server/broker avviene soltanto dopo il successivo login read-only verificato.
 Il percorso corrente usa il file bridge MQL5 e non installa né importa il
 wheel Python `MetaTrader5`.
 
+## Compatibilità della manutenzione notturna
+
+La manutenzione della flotta è una funzionalità del worker, non un task
+dell'Utilità di pianificazione di Windows. Il solo valore
+`TRADEJOURNAL_MT5_MAINTENANCE_ENABLED=1` non prova che il servizio la esegua.
+
+Per una VPS con manutenzione abilitata, preparare la release con:
+
+```powershell
+python -B scripts\windows\package-agent-release.py `
+  --output-root C:\TradeJournal\releases --require-maintenance
+```
+
+Il controllo richiede i moduli di manutenzione, il probe della release pubblica,
+la lettura della configurazione e il collegamento al ciclo del worker.
+`install-agent-service.ps1` ripete il controllo sulla configurazione effettiva
+del servizio prima di modificare ACL, registrazione Python o registro Windows.
+Una release integra nei byte ma priva di una funzione abilitata viene rifiutata.
+
+Il monitor indipendente scrive `mt5-maintenance-health.json` accanto al journal
+originale e invia tramite il logger del servizio un evento ogni minuto. Gli
+stati `unsupported`, `overdue`, `failed` e `invalid_state` sono errori, anche se
+gli account continuano a ricevere eventi. Non modifica né azzera
+`mt5-maintenance.json`; il controllo usa `Europe/Rome` e la finestra configurata,
+anche quando l'orologio Windows è impostato su un altro fuso.
+
+In Grafana/Loki filtrare gli eventi con:
+
+```logql
+{service="tradejournal-mt5-agent", logger="windows_agent.observability.maintenance_health"}
+```
+
+Per le regole di alert includere gli eventi di livello `error` e l'assenza di
+eventi del monitor. La sola presenza dell'heartbeat degli account non è una
+verifica della manutenzione. L'invio dei log non crea automaticamente una
+regola di alert Grafana.
+
+Le protezioni verificano e osservano la funzione esistente: il ripristino della
+pipeline deve includere scheduler, coordinatore e dipendenze, conservando le
+correzioni del worker in uso. Una copia WIP o un ritorno indiscriminato alla
+vecchia release non sono una release di ripristino verificata.
+
+La sincronizzazione storico nativa usa il pin del terminale pubblicato per
+l'account e il pin dei file TradeJournal, come la sincronizzazione live. Non
+confronta MetaEditor e MetaTester con il template globale: MT5 può aggiornare
+questi strumenti separatamente. Il manifest completo resta obbligatorio per
+la pubblicazione di nuove istanze e per il percorso adapter non nativo.
+
 ## Pin obbligatori del runtime
 
 Il servizio rifiuta l'avvio se i due binari eseguibili non sono vincolati a un

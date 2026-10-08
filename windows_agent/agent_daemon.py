@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 from pathlib import Path
+from datetime import timedelta
 from typing import Callable
 
 from .broker_endpoint_resolver import resolve_verified_broker_endpoint
@@ -20,6 +22,15 @@ from .mtapi_search import MtApiSearchClient
 from .job_runner import JobRunner
 from .event_supervisor import Mt5EventSupervisor
 from .provisioning.mt5_instance_pool import Mt5InstancePool
+from .observability.maintenance_health import Mt5MaintenanceHealthMonitor
+from .mt5_lifecycle import Mt5LifecycleCoordinator
+from .maintenance_recovery import MaintenanceRecovery
+from .mt5_maintenance import Mt5MaintenanceCoordinator
+from .mt5_maintenance_scheduler import Mt5MaintenanceScheduler
+from .provisioning.mt5_instance_rotation import Mt5InstanceRotator
+from .provisioning.mt5_public_release import Mt5PublicReleaseProbe, Mt5ProvisionedReleaseInventory
+from .provisioning.mt5_template import Mt5TemplateManager
+from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .real_handlers import build_real_handlers, reconcile_startup_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
 from .security import RedactionFilter
@@ -62,10 +73,18 @@ def build_runner(
     api = build_api_client(config)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     instance_pool: Mt5InstancePool | None = None
+    template_manager: Mt5TemplateManager | None = None
+    scheduled_maintenance: Mt5MaintenanceScheduler | None = None
+    template_lock = threading.RLock()
     background_workers: tuple[
         Callable[[threading.Event], None], ...
     ] = ()
     if handlers is None:
+        if config.mt5_maintenance_enabled:
+            template_manager = Mt5TemplateManager(
+                config.source_terminal, config.terminal_sha256, lock=template_lock,
+            )
+            template_manager.recover_interrupted_rotation()
         reconciliation = reconcile_startup_instances(
             config.instances_root,
             config.secrets_root,
@@ -96,12 +115,57 @@ def build_runner(
                 instances_root=config.instances_root,
                 secrets_root=config.secrets_root,
                 source_terminal=config.source_terminal,
-                expected_terminal_sha256=config.terminal_sha256,
+                expected_terminal_sha256=(template_manager.current_sha256 if template_manager else config.terminal_sha256),
                 target_size=config.instance_pool_target_size,
                 max_size=config.instance_pool_max_size,
+                template_lock=template_lock,
             )
             instance_pool.recover_incomplete()
             background_workers = (instance_pool.replenish_forever,)
+        if config.mt5_maintenance_enabled:
+            recovery = MaintenanceRecovery(api, config.instances_root)
+            pending_update_store = Mt5PendingUpdateStore(
+                config.mt5_maintenance_state_path.parent / "mt5-update-pending",
+            )
+            rotator = Mt5InstanceRotator(
+                instances_root=config.instances_root,
+                secrets_root=config.secrets_root,
+                source_terminal=config.source_terminal,
+                expert_binary=config.expert_binary,
+                expert_sha256=config.expert_sha256,
+                lifecycle=Mt5LifecycleCoordinator(),
+                template_lock=template_lock,
+                runtime_factory=recovery.runtime,
+                connection_allowed=recovery.allows,
+            )
+            maintenance_coordinator = Mt5MaintenanceCoordinator(
+                instances_root=config.instances_root,
+                expert_binary=config.expert_binary,
+                template_manager=template_manager,
+                rotator=rotator,
+                lifecycle=rotator.lifecycle,
+                template_lock=template_lock,
+                instance_pool=instance_pool,
+                runtime_factory=recovery.runtime,
+                scope_refresh=recovery.refresh,
+                connection_allowed=recovery.allows,
+                pending_update_store=pending_update_store,
+                public_release_probe=Mt5PublicReleaseProbe(
+                    config.mt5_maintenance_state_path.parent / "mt5-public-releases",
+                ),
+                public_release_inventory=Mt5ProvisionedReleaseInventory(
+                    config.instances_root, trusted_template_root=config.source_terminal.parent,
+                    connection_allowed=recovery.allows,
+                ),
+            )
+            scheduled_maintenance = Mt5MaintenanceScheduler(
+                maintenance_coordinator,
+                config.mt5_maintenance_state_path,
+                timezone_name=config.mt5_maintenance_timezone,
+                scheduled_time=config.mt5_maintenance_local_time,
+                grace_window=timedelta(minutes=config.mt5_maintenance_grace_minutes),
+            )
+            scheduled_maintenance.recover_interrupted()
     identity_resolver: CachedBrokerIdentityResolver | None = None
     endpoint_publisher = BrokerEndpointRegistryPublisher(
         config.broker_registry_path,
@@ -150,6 +214,7 @@ def build_runner(
         broker_wizard=broker_wizard,
         mtapi_search=mtapi_search,
         instance_pool=instance_pool,
+        template_manager=template_manager,
     )
     if handlers is None:
         event_supervisor = Mt5EventSupervisor(
@@ -158,11 +223,15 @@ def build_runner(
             config.trading_ingestion_url,
         )
         background_workers = (*background_workers, event_supervisor.run)
+        if os.environ.get("TRADEJOURNAL_MT5_MAINTENANCE_ENABLED"):
+            maintenance_health = Mt5MaintenanceHealthMonitor(Path(__file__).resolve().parent.parent)
+            background_workers = (*background_workers, maintenance_health.run)
     return JobRunner(
         state_path,
         api,
         real_handlers,
         background_workers=background_workers,
+        scheduled_maintenance=scheduled_maintenance,
     )
 
 
@@ -194,6 +263,8 @@ def run_forever(runner: JobRunner, poll_seconds: float, stop_event: threading.Ev
     try:
         while not stop_event.is_set():
             try:
+                if runner.scheduled_maintenance is not None and runner.scheduled_maintenance.run_if_due(stop_event):
+                    continue
                 claimed = runner.run_once()
             except Exception:
                 logger.exception("run_once failed unexpectedly")

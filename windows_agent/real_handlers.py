@@ -577,6 +577,7 @@ def build_real_handlers(
     broker_wizard: BrokerWizard | None = None,
     mtapi_search: MtApiSearch | None = None,
     instance_pool: Mt5InstancePool | None = None,
+    template_manager: Any | None = None,
 ) -> dict[str, JobHandler]:
     """Real provision/historical_sync/deprovision handlers.
 
@@ -586,6 +587,9 @@ def build_real_handlers(
     """
 
     store = WindowsSecretStore(secrets_root)
+
+    def _current_template_sha256() -> str | None:
+        return template_manager.current_sha256 if template_manager is not None else terminal_sha256
 
     def _provision_instance(connection_id: str) -> Path:
         if instance_pool is not None:
@@ -598,7 +602,7 @@ def build_real_handlers(
         ).provision(
             connection_id,
             source_terminal,
-            terminal_sha256,
+            _current_template_sha256(),
         )
 
     def _ensure_current_managed_expert(
@@ -723,7 +727,7 @@ def build_real_handlers(
         cid = canonical_uuid(str(job["connection_id"]))
         payload = job.get("payload") or {}
         _require_lease(api, job)
-        _verify_binary_pin(source_terminal, terminal_sha256)
+        _verify_binary_pin(source_terminal, _current_template_sha256())
         _verify_binary_pin(expert_binary, expert_sha256)
         login, server, broker_label = _expected_identity(payload)
         payload_broker_label = broker_label
@@ -1429,7 +1433,9 @@ def build_real_handlers(
         mode, from_date = _history_window(job)
         try:
             root = InstanceProvisioner(instances_root, secrets_root).validate(
-                cid, terminal_sha256
+                cid,
+                terminal_sha256 if adapter_factory is not None else None,
+                verify_code=adapter_factory is not None,
             )
         except Exception as exc:
             raise InstanceProvisionFailed(
@@ -1442,7 +1448,15 @@ def build_real_handlers(
             raise SecretStoreFailed("stored identity unavailable") from exc
 
         terminal = root / "terminal" / "terminal64.exe"
-        _verify_binary_pin(terminal, terminal_sha256)
+        # Native history follows the same per-instance integrity policy as live sync.
+        # MT5 owns MetaEditor/MetaTester and can update them independently of the terminal.
+        # The terminal remains digest-pinned and _ensure_current_managed_expert verifies
+        # the sealed TradeJournal assets before restarting or reading any history.
+        history_terminal_sha256 = (
+            _recorded_instance_terminal_sha256(root)
+            if adapter_factory is None else terminal_sha256
+        )
+        _verify_binary_pin(terminal, history_terminal_sha256)
         state_path = root / "state" / "terminal-process.json"
         _record_checkpoint(
             api,
@@ -1464,7 +1478,7 @@ def build_real_handlers(
                     root,
                     login,
                     server,
-                    terminal_sha256,
+                    history_terminal_sha256,
                     history_mode=mode,
                 )
                 try:

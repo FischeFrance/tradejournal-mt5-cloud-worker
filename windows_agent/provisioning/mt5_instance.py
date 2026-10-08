@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from worker.atomic_file import (
@@ -38,6 +39,9 @@ _MANAGED_RUNTIME_ASSETS = (
     Path("MQL5/Scripts/TradeJournal/TradeJournalDiscovery.ex5"),
     Path("MQL5/Scripts/TradeJournal/TradeJournalLoader.ex5"),
 )
+
+
+MT5_GENERATED_EXAMPLE_DIRS = _MT5_GENERATED_EXAMPLE_DIRS
 
 
 class InstanceProvisioner:
@@ -330,6 +334,136 @@ class InstanceProvisioner:
         fsync_directory(target.parent)
         return sealed
 
+    @classmethod
+    def record_verified_managed_asset_update(
+        cls,
+        root: Path,
+        connection_id: str,
+        expected_expert_sha256: str,
+    ) -> str:
+        """Atomically re-pin an Agent-installed bridge after a trusted rotation."""
+        root = Path(root).resolve()
+        state_path = root / "state" / "instance.json"
+        terminal_root = root / "terminal"
+        expert = (
+            terminal_root
+            / "MQL5"
+            / "Experts"
+            / "TradeJournal"
+            / "TradeJournalBridge.ex5"
+        )
+        state = read_json(state_path, {})
+        expected = expected_expert_sha256.strip().lower()
+        if (
+            cls._is_reparse_point(root)
+            or cls._is_reparse_point(state_path)
+            or cls._is_reparse_point(expert)
+            or not expert.is_file()
+            or not isinstance(state, dict)
+            or state.get("connection_id") != connection_id
+            or state.get("status") != "provisioned"
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+            or cls._sha256(expert) != expected
+        ):
+            raise ValueError("managed runtime update is invalid")
+
+        runtime_digest = cls._managed_runtime_assets_manifest(terminal_root)
+        code_digest = cls._code_manifest(terminal_root)
+        state["runtime_assets_manifest_sha256"] = runtime_digest
+        state["runtime_assets_manifest_version"] = 1
+        state["template_code_manifest_sha256"] = code_digest
+        state["managed_runtime_update"] = {
+            "schema_version": 1,
+            "verified_at_unix_ms": int(time.time() * 1000),
+            "expert_sha256": expected,
+            "runtime_assets_manifest_sha256": runtime_digest,
+            "code_manifest_sha256": code_digest,
+        }
+        atomic_json(state_path, state)
+        return runtime_digest
+
+
+    @classmethod
+    def record_verified_vendor_update(
+        cls,
+        root: Path,
+        connection_id: str,
+        signer_subject: str,
+        *,
+        expected_terminal_sha256: str | None = None,
+        expected_code_manifest_sha256: str | None = None,
+    ) -> str:
+        """Seal executable changes produced by a verified MetaQuotes LiveUpdate.
+
+        The updater is allowed to replace vendor-owned executable content, but
+        it must not replace TradeJournal's bridge assets.  The caller verifies
+        Authenticode before and after the update; this method atomically records
+        the resulting terminal/code digests so later reconnect validation can
+        distinguish an accepted vendor rotation from arbitrary tampering.
+        """
+
+        root = Path(root).resolve()
+        state_path = root / "state" / "instance.json"
+        terminal_root = root / "terminal"
+        terminal = terminal_root / "terminal64.exe"
+        if (
+            cls._is_reparse_point(root)
+            or cls._is_reparse_point(state_path)
+            or cls._is_reparse_point(terminal)
+            or not terminal.is_file()
+        ):
+            raise ValueError("vendor-updated instance is unsafe")
+        state = read_json(state_path, {})
+        if (
+            state.get("connection_id") != connection_id
+            or state.get("status") != "provisioned"
+        ):
+            raise ValueError("vendor-updated instance state is invalid")
+        if (
+            not isinstance(signer_subject, str)
+            or "CN=MetaQuotes Ltd." not in signer_subject
+            or "O=MetaQuotes Ltd." not in signer_subject
+        ):
+            raise ValueError("vendor update signer is invalid")
+
+        recorded_assets = state.get("runtime_assets_manifest_sha256")
+        if recorded_assets is not None:
+            actual_assets = cls._managed_runtime_assets_manifest(terminal_root)
+            if recorded_assets != actual_assets:
+                raise ValueError("vendor update changed managed runtime assets")
+
+        terminal_sha256 = cls._sha256(terminal)
+        code_manifest_sha256 = cls._code_manifest(terminal_root)
+        for expected, actual in (
+            (expected_terminal_sha256, terminal_sha256),
+            (expected_code_manifest_sha256, code_manifest_sha256),
+        ):
+            if expected is None:
+                continue
+            normalized = expected.strip().lower()
+            if (
+                len(normalized) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in normalized
+                )
+                or normalized != actual
+            ):
+                raise ValueError("vendor update binding changed")
+        state["terminal_sha256"] = terminal_sha256
+        state["template_code_manifest_sha256"] = code_manifest_sha256
+        state["vendor_update"] = {
+            "schema_version": 1,
+            "verified_at_unix_ms": int(time.time() * 1000),
+            "signer_subject": signer_subject,
+            "terminal_sha256": terminal_sha256,
+            "code_manifest_sha256": code_manifest_sha256,
+        }
+        atomic_json(state_path, state)
+        return terminal_sha256
+
+
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()
@@ -377,7 +511,19 @@ class InstanceProvisioner:
             ):
                 raise ValueError("expected terminal digest invalid")
             if recorded_terminal != expected:
-                raise ValueError("published terminal digest mismatch")
+                vendor_update = state.get("vendor_update")
+                if (
+                    not isinstance(vendor_update, dict)
+                    or vendor_update.get("schema_version") != 1
+                    or vendor_update.get("terminal_sha256") != recorded_terminal
+                    or vendor_update.get("code_manifest_sha256")
+                    != recorded_code_manifest
+                    or not isinstance(vendor_update.get("verified_at_unix_ms"), int)
+                    or vendor_update["verified_at_unix_ms"] <= 0
+                    or "MetaQuotes Ltd."
+                    not in str(vendor_update.get("signer_subject", ""))
+                ):
+                    raise ValueError("published terminal digest mismatch")
         if recorded_terminal is not None and verify_code:
             if not terminal.is_file() or cls._sha256(terminal) != recorded_terminal:
                 raise ValueError("published terminal digest mismatch")

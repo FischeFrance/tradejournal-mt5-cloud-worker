@@ -15,6 +15,10 @@ from windows_agent.release_manifest import (  # noqa: E402
     ReleaseManifestError,
     build_release,
 )
+from windows_agent.maintenance_capability import (  # noqa: E402
+    MaintenanceCapabilityError,
+    verify_maintenance_capability,
+)
 
 
 def _git(*arguments: str) -> str:
@@ -33,10 +37,13 @@ def _git(*arguments: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--require-maintenance", action="store_true")
     arguments = parser.parse_args()
     if _git("status", "--porcelain=v1", "--untracked-files=all"):
         raise ReleaseManifestError("refusing to package a dirty working tree")
     revision = _git("rev-parse", "--verify", "HEAD")
+    if arguments.require_maintenance:
+        verify_maintenance_capability(ROOT)
     print(build_release(ROOT, arguments.output_root, revision=revision))
     return 0
 
@@ -44,6 +51,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except ReleaseManifestError as exc:
+    except (ReleaseManifestError, MaintenanceCapabilityError) as exc:
         print(f"release package failed: {exc}", file=sys.stderr)
         raise SystemExit(1)

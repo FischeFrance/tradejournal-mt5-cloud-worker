@@ -22,6 +22,14 @@ try {
     throw "Release manifest verification failed (exit $LASTEXITCODE)."
   }
 
+  # Preserve enabled production capabilities before changing ACLs, PythonClass,
+  # registry or the existing service. Keeping the maintenance ENV flag alone is
+  # insufficient when the candidate no longer contains its scheduler.
+  & $python -B -m windows_agent.maintenance_capability --release-root $repo --windows-service
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate cannot preserve enabled MT5 maintenance. Existing service was not changed.'
+  }
+
   # A Python service may still materialise bytecode even when started through
   # pythonservice.exe. Keep any such cache outside the manifest-bound release
   # and deny write access to the release itself for both service and admins.

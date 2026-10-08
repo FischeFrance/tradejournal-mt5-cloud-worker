@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .agent_secrets import AGENT_SCOPE_ID, AGENT_TOKEN_SECRET_NAME
 from .api_client import AgentApiClient
@@ -30,6 +33,12 @@ DEFAULT_BROKER_IDENTITY_MODEL = "gpt-5.6-terra"
 DEFAULT_BROKER_WIZARD_ENABLED = False
 DEFAULT_MTAPI_SEARCH_ENABLED = True
 DEFAULT_POLL_SECONDS = 5.0
+DEFAULT_MT5_MAINTENANCE_ENABLED = False
+DEFAULT_MT5_MAINTENANCE_LOCAL_TIME = time(23, 30)
+DEFAULT_MT5_MAINTENANCE_TIMEZONE = "Europe/Rome"
+DEFAULT_MT5_MAINTENANCE_GRACE_MINUTES = 120
+DEFAULT_MT5_MAINTENANCE_STATE_PATH = Path(r"C:\TradeJournal\state\mt5-maintenance.json")
+DEDICATED_MT5_INTERACTIVE_USER = "TradeJournalMT5"
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,11 @@ class AgentRuntimeConfig:
     broker_wizard_enabled: bool = DEFAULT_BROKER_WIZARD_ENABLED
     mtapi_search_enabled: bool = DEFAULT_MTAPI_SEARCH_ENABLED
     mt5_interactive_user: str = ""
+    mt5_maintenance_enabled: bool = DEFAULT_MT5_MAINTENANCE_ENABLED
+    mt5_maintenance_local_time: time = DEFAULT_MT5_MAINTENANCE_LOCAL_TIME
+    mt5_maintenance_timezone: str = DEFAULT_MT5_MAINTENANCE_TIMEZONE
+    mt5_maintenance_grace_minutes: int = DEFAULT_MT5_MAINTENANCE_GRACE_MINUTES
+    mt5_maintenance_state_path: Path = DEFAULT_MT5_MAINTENANCE_STATE_PATH
 
 
 def _required_sha256(source: Mapping[str, str], name: str) -> str:
@@ -221,6 +235,78 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
     trading_ingestion_url = _required_endpoint(
         source, "TRADEJOURNAL_TRADING_INGESTION_URL"
     )
+    maintenance_enabled_raw = source.get(
+        "TRADEJOURNAL_MT5_MAINTENANCE_ENABLED", ""
+    ).strip()
+    if maintenance_enabled_raw not in ("", "0", "1"):
+        raise ValueError("TRADEJOURNAL_MT5_MAINTENANCE_ENABLED must be 0 or 1")
+    mt5_maintenance_enabled = (
+        DEFAULT_MT5_MAINTENANCE_ENABLED
+        if not maintenance_enabled_raw
+        else maintenance_enabled_raw == "1"
+    )
+    if mt5_maintenance_enabled and mt5_interactive_user.casefold() != "tradejournalmt5":
+        raise ValueError(
+            "TRADEJOURNAL_MT5_INTERACTIVE_USER must be a dedicated local user"
+        )
+    maintenance_time_raw = source.get(
+        "TRADEJOURNAL_MT5_MAINTENANCE_LOCAL_TIME", ""
+    ).strip()
+    if maintenance_time_raw:
+        match = re.fullmatch(
+            r"([01][0-9]|2[0-3]):([0-5][0-9])", maintenance_time_raw
+        )
+        if match is None:
+            raise ValueError(
+                "TRADEJOURNAL_MT5_MAINTENANCE_LOCAL_TIME must be HH:MM"
+            )
+        mt5_maintenance_local_time = time(
+            int(match.group(1)), int(match.group(2))
+        )
+    else:
+        mt5_maintenance_local_time = DEFAULT_MT5_MAINTENANCE_LOCAL_TIME
+    mt5_maintenance_timezone = source.get(
+        "TRADEJOURNAL_MT5_MAINTENANCE_TIMEZONE", ""
+    ).strip() or DEFAULT_MT5_MAINTENANCE_TIMEZONE
+    try:
+        ZoneInfo(mt5_maintenance_timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(
+            "TRADEJOURNAL_MT5_MAINTENANCE_TIMEZONE is invalid"
+        ) from exc
+    maintenance_grace_raw = source.get(
+        "TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES", ""
+    ).strip()
+    try:
+        mt5_maintenance_grace_minutes = (
+            int(maintenance_grace_raw)
+            if maintenance_grace_raw
+            else DEFAULT_MT5_MAINTENANCE_GRACE_MINUTES
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES is invalid"
+        ) from exc
+    if not 5 <= mt5_maintenance_grace_minutes <= 12 * 60:
+        raise ValueError(
+            "TRADEJOURNAL_MT5_MAINTENANCE_GRACE_MINUTES is invalid"
+        )
+    mt5_maintenance_state_path = Path(
+        source.get("TRADEJOURNAL_MT5_MAINTENANCE_STATE_PATH", "").strip()
+        or DEFAULT_MT5_MAINTENANCE_STATE_PATH
+    )
+    terminal_sha256 = _required_sha256(
+        source, "TRADEJOURNAL_MT5_TEMPLATE_SHA256"
+    )
+    expert_sha256 = _required_sha256(
+        source, "TRADEJOURNAL_MT5_EXPERT_SHA256"
+    )
+    # Distinct from base_url (the trading-agent control plane): live_sync is scheduled
+    # automatically after provisioning, so accepting a daemon without its ingestion endpoint
+    # would create a connection that looks provisioned but can never publish events.
+    trading_ingestion_url = _required_endpoint(
+        source, "TRADEJOURNAL_TRADING_INGESTION_URL"
+    )
     return AgentRuntimeConfig(
         base_url=base_url,
         poll_seconds=poll_seconds,
@@ -243,6 +329,11 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         broker_wizard_enabled=broker_wizard_enabled,
         mtapi_search_enabled=mtapi_search_enabled,
         mt5_interactive_user=mt5_interactive_user,
+        mt5_maintenance_enabled=mt5_maintenance_enabled,
+        mt5_maintenance_local_time=mt5_maintenance_local_time,
+        mt5_maintenance_timezone=mt5_maintenance_timezone,
+        mt5_maintenance_grace_minutes=mt5_maintenance_grace_minutes,
+        mt5_maintenance_state_path=mt5_maintenance_state_path,
     )
 
 

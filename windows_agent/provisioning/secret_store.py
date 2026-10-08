@@ -29,7 +29,7 @@ ALLOWED = frozenset(
 
 
 class WindowsSecretStore:
-    """Current-user DPAPI blobs. Only the same Windows identity can decrypt them."""
+    """Machine-scoped DPAPI blobs protected by SYSTEM/Administrator NTFS ACLs."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -140,3 +140,48 @@ class WindowsSecretStore:
         win32security.SetFileSecurity(
             str(path), win32security.DACL_SECURITY_INFORMATION, descriptor
         )
+
+    @staticmethod
+    def restrict_shared_service_acl(path: Path) -> None:
+        """Protect shared runtime state without locking out the Agent service.
+
+        Unlike DPAPI blobs, broker/runtime caches are shared between operator maintenance
+        commands and the LocalSystem service.  Binding their DACL to whichever identity wrote
+        last lets an elevated Administrator run exclude LocalSystem (or vice versa).  Keep the
+        shared state private to the two stable Windows principals that manage the Agent instead.
+        """
+        if os.name != "nt":
+            return
+
+        import win32con
+        import win32security
+
+        system_sid = win32security.CreateWellKnownSid(
+            win32security.WinLocalSystemSid, None
+        )
+        administrators_sid = win32security.CreateWellKnownSid(
+            win32security.WinBuiltinAdministratorsSid, None
+        )
+        descriptor = win32security.SECURITY_DESCRIPTOR()
+        acl = win32security.ACL()
+        inheritance = (
+            win32security.OBJECT_INHERIT_ACE
+            | win32security.CONTAINER_INHERIT_ACE
+            if path.is_dir()
+            else 0
+        )
+        for sid in (system_sid, administrators_sid):
+            acl.AddAccessAllowedAceEx(
+                win32security.ACL_REVISION_DS,
+                inheritance,
+                win32con.GENERIC_ALL,
+                sid,
+            )
+        descriptor.SetSecurityDescriptorDacl(1, acl, 0)
+        win32security.SetFileSecurity(
+            str(path),
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+
