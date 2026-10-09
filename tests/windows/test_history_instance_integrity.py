@@ -63,7 +63,7 @@ def native_history(env, monkeypatch):
 
     monkeypatch.setattr(real_handlers, "_run_history_sync", import_history)
 
-    def run(*, template_digest=None):
+    def run(*, template_digest=None, payload=None, mode="all_available", from_date=None):
         handlers = real_handlers.build_real_handlers(
             api,
             instances_root=env.instances_root,
@@ -72,9 +72,36 @@ def native_history(env, monkeypatch):
             terminal_sha256=template_digest,
             runtime_factory=Runtime,
         )
-        return handlers["historical_sync"](_job("historical_sync", cid, history_mode="all_available"))
+        return handlers["historical_sync"](_job("historical_sync", cid, history_mode=mode, payload=payload, from_date=from_date))
 
     return SimpleNamespace(root=root, provisioner=provisioner, cid=cid, calls=calls, run=run, runtime=Runtime)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_ticket_recovery_clears_cursor_only_after_delivery_and_live_restore(native_history, monkeypatch, fails):
+    from datetime import datetime, timezone
+    from windows_agent.state_store import atomic_json
+    from windows_agent.agent_errors import HistorySyncFailed
+    case = native_history
+    captured = datetime.now(timezone.utc).isoformat()
+    sha = "b" * 64
+    pointer = case.root / "state/maintenance-recovery.json"
+    atomic_json(pointer, {"baseline_sha256": sha, "status": "queued"})
+    monkeypatch.setattr("windows_agent.maintenance_ticket_recovery.load_baseline", lambda *_args: {"captured_at": captured})
+    monkeypatch.setattr("windows_agent.maintenance_ticket_recovery.TicketDeltaAdapter", lambda adapter, _baseline: adapter)
+    if fails:
+        def unavailable(*_args):
+            raise HistorySyncFailed("delivery not acknowledged")
+        monkeypatch.setattr(real_handlers, "_run_history_sync", unavailable)
+    request = dict(payload={"maintenance_recovery": True, "baseline_sha256": sha}, mode="from_date", from_date=captured)
+    if fails:
+        with pytest.raises(HistorySyncFailed):
+            case.run(**request)
+        assert pointer.exists()
+    else:
+        assert case.run(**request)["imported_deals"] == 44
+        assert not pointer.exists()
+    assert case.calls[-1] == "new_only"
 
 
 def test_vendor_tool_updates_do_not_block_native_history(native_history):

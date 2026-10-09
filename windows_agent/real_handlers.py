@@ -1485,6 +1485,8 @@ def build_real_handlers(
             _require_lease(api, job)
             with connection_sync_lock(cid):
                 cleanup_required = False
+                recovery_completed = False
+                recovery_sha = None
                 try:
                     try:
                         _ensure_current_managed_expert(
@@ -1505,6 +1507,16 @@ def build_real_handlers(
                     _progress(root, status="importing_history")
                     adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
                     _verify_investor_access(adapter)
+                    if (job.get("payload") or {}).get("maintenance_recovery") is True:
+                        from .maintenance_ticket_recovery import TicketDeltaAdapter, load_baseline
+                        recovery_sha = (job.get("payload") or {}).get("baseline_sha256")
+                        if mode != "from_date" or not isinstance(recovery_sha, str):
+                            raise HistorySyncFailed("maintenance_ticket_recovery_request_invalid")
+                        baseline = load_baseline(root, cid, login, server, recovery_sha)
+                        baseline_time = datetime.fromisoformat(baseline["captured_at"])
+                        if from_date is None or abs((from_date - baseline_time).total_seconds()) > 0.001:
+                            raise HistorySyncFailed("maintenance_ticket_recovery_window_mismatch")
+                        adapter = TicketDeltaAdapter(adapter, baseline)
                     # Full history is delivered only through the current job's lease-bound
                     # archive route. The live supervisor stays outside this locked window.
                     counts = _run_history_sync(
@@ -1520,6 +1532,7 @@ def build_real_handlers(
                     )
                     if mode != "new_only":
                         _prepare_history_to_live_handoff(adapter, root)
+                    recovery_completed = recovery_sha is not None
                 finally:
                     if cleanup_required and mode != "new_only":
                         runtime = runtime_factory(root, cid)
@@ -1532,6 +1545,12 @@ def build_real_handlers(
                             runtime.switch_to_new_only()
                             live_adapter = Mql5FileMt5Adapter(root / "terminal" / "MQL5" / "Files" / "TradeJournal", cid, login, server, root / "state")
                             _verify_investor_access(live_adapter)
+                            if recovery_completed:
+                                from .maintenance_ticket_recovery import POINTER
+                                pointer_path = root / "state" / POINTER
+                                pointer = read_json(pointer_path, {})
+                                if pointer.get("baseline_sha256") == recovery_sha:
+                                    pointer_path.unlink(missing_ok=True)
                             # A failed import still leaves a verified live bridge available
                             # to the event supervisor. The server keeps the history error.
                             _progress(root, status="connected")

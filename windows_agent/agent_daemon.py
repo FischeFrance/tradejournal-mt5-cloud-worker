@@ -123,7 +123,7 @@ def build_runner(
             instance_pool.recover_incomplete()
             background_workers = (instance_pool.replenish_forever,)
         if config.mt5_maintenance_enabled:
-            recovery = MaintenanceRecovery(api, config.instances_root)
+            recovery = MaintenanceRecovery(api, config.instances_root, secrets_root=config.secrets_root)
             pending_update_store = Mt5PendingUpdateStore(
                 config.mt5_maintenance_state_path.parent / "mt5-update-pending",
             )

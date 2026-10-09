@@ -63,8 +63,9 @@ richiede la presenza esatta del server atteso e chiude il terminale di
 censimento prima che l'agente decifri la password investor. La promozione
 server/broker avviene soltanto dopo il successivo login read-only verificato.
 
-Il percorso corrente usa il file bridge MQL5 e non installa né importa il
-wheel Python `MetaTrader5`.
+Il flusso ordinario usa il file bridge MQL5. La manutenzione utilizza un reader
+Python isolato per acquisire i soli ticket dal terminale già aperto, prima di
+arrestarlo; non sostituisce il bridge e non esegue operazioni di trading.
 
 ## Compatibilità della manutenzione notturna
 
@@ -84,6 +85,23 @@ la lettura della configurazione e il collegamento al ciclo del worker.
 `install-agent-service.ps1` ripete il controllo sulla configurazione effettiva
 del servizio prima di modificare ACL, registrazione Python o registro Windows.
 Una release integra nei byte ma priva di una funzione abilitata viene rifiutata.
+
+Il reader richiede un ambiente separato con `MetaTrader5` e `psutil`, accessibile
+in sola lettura all'utente MT5 dedicato e modificabile solo da SYSTEM e
+Administrators. Un manifest SHA-256 elenca tutti i suoi file `.py`, `.pyd`,
+`.dll` e `.exe`. Configurare `TRADEJOURNAL_MT5_HISTORY_READER_PYTHON`,
+`TRADEJOURNAL_MT5_HISTORY_READER_MANIFEST` e il relativo
+`TRADEJOURNAL_MT5_HISTORY_READER_MANIFEST_SHA256`. Abilitare
+`TRADEJOURNAL_MT5_TICKET_RECOVERY_ENABLED=1` solo dopo la verifica reale delle
+acquisizioni e della consegna di un job con lease.
+
+Il preflight acquisisce una base verificata per ogni account attivo assegnato
+prima di fermare il primo canary. Dopo il riavvio il producer pubblica uno
+snapshot storico immutabile; il job recupera i ticket nuovi e il contesto delle
+relative posizioni. I timestamp del broker non vengono reinterpretati come
+UTC. Il supervisore live attende il completamento dell'handoff. Un cursore
+incompleto o una consegna non confermata impediscono un'ulteriore rotazione;
+un errore del control plane ripristina il producer investitore live.
 
 Il monitor indipendente scrive `mt5-maintenance-health.json` accanto al journal
 originale e invia tramite il logger del servizio un evento ogni minuto. Gli

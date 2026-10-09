@@ -3405,3 +3405,4 @@ class NativeMt5Runtime:
 # Preserve the current durable bridge publication and terminal-window fixes.
 NativeMt5Runtime._publish_history_mode = CurrentNativeMt5Runtime._publish_history_mode
 NativeMt5Runtime.set_terminal_window_visibility = CurrentNativeMt5Runtime.set_terminal_window_visibility
+NativeMt5Runtime._run_terminal_ui_action = CurrentNativeMt5Runtime._run_terminal_ui_action

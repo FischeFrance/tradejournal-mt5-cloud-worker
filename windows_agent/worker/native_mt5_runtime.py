@@ -1124,12 +1124,21 @@ class NativeMt5Runtime:
         verify_interactive_process_identity(self._interactive_user(), pid)
         return self._run_terminal_ui_action(pid, "refresh_history", timeout)
 
+    def capture_history_tickets(self, pid: int, *, timeout: float = 30.0) -> dict[str, Any]:
+        from ..interactive_identity import verify_interactive_process_identity
+        verify_interactive_process_identity(self._interactive_user(), pid)
+        return self._run_terminal_ui_action(pid, "capture_tickets", timeout)
+
     def _run_terminal_ui_action(self, pid: int, action: str, timeout: float) -> dict[str, Any]:
         """Dispatch only reviewed window/managed-chart operations to the verified actor."""
-        if action not in ("show", "hide", "refresh_history"):
+        if action not in ("show", "hide", "refresh_history", "capture_tickets"):
             raise NativeMt5Error("terminal_ui_action_invalid")
         refresh = action == "refresh_history"
-        stem = "history-chart-refresh" if refresh else "window-visibility"
+        capture = action == "capture_tickets"
+        stem = "history-ticket-baseline" if capture else ("history-chart-refresh" if refresh else "window-visibility")
+        reader = self._setting("TRADEJOURNAL_MT5_HISTORY_READER_PYTHON")
+        if capture and (not reader or not Path(reader).is_file()):
+            raise NativeMt5Error("history_ticket_reader_unavailable")
         interactive_user = self._interactive_user()
         if not interactive_user:
             raise NativeMt5Error("dedicated_interactive_user_required")
@@ -1138,21 +1147,21 @@ class NativeMt5Runtime:
             Path(__file__).resolve().parents[2]
             / "scripts"
             / "windows"
-            / ("Refresh-Mt5HistoryChart.ps1" if refresh else "Set-Mt5WindowVisibility.ps1")
+            / ("Capture-Mt5TicketBaseline.py" if capture else ("Refresh-Mt5HistoryChart.ps1" if refresh else "Set-Mt5WindowVisibility.ps1"))
         )
         if not source.is_file():
             raise NativeMt5Error("terminal_window_helper_missing")
 
         self.state.mkdir(parents=True, exist_ok=True)
         self.files.mkdir(parents=True, exist_ok=True)
-        helper = self.state / (stem + ".ps1")
-        helper_temporary = helper.with_suffix(".ps1.tmp")
+        helper = self.state / (stem + (".py" if capture else ".ps1"))
+        helper_temporary = helper.with_suffix(helper.suffix + ".tmp")
         request = self.state / (stem + "-request.json")
         request_temporary = request.with_suffix(".json.tmp")
         result = self.files / (stem + "-result.json")
         result_temporary = result.with_suffix(".json.tmp")
-        launcher = self.state / ("set-window-visibility.cmd" if not refresh else stem + ".cmd")
-        task = f"TradeJournalMT5-{'HistoryChart' if refresh else 'Window'}-{self.connection_id}"
+        launcher = self.state / ("set-window-visibility.cmd" if not refresh and not capture else stem + ".cmd")
+        task = f"TradeJournalMT5-{'HistoryTickets' if capture else ('HistoryChart' if refresh else 'Window')}-{self.connection_id}"
         task_created = False
         cleanup_failed = False
         try:
@@ -1182,10 +1191,15 @@ class NativeMt5Runtime:
             result.unlink(missing_ok=True)
             result_temporary.unlink(missing_ok=True)
 
-            launcher_content = (
-                "@echo off\r\n"
+            invocation = (
+                f'"{reader}" -B "{helper}" "{request}" "{result}"\r\n'
+                if capture else
                 "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
                 f'-File "{helper}" -RequestPath "{request}" -ResultPath "{result}"\r\n'
+            )
+            launcher_content = (
+                "@echo off\r\n"
+                + invocation +
                 "exit /b %ERRORLEVEL%\r\n"
             )
             self._write_text_durable(launcher, launcher_content, "utf-8")
@@ -1237,9 +1251,11 @@ class NativeMt5Runtime:
                 or record.get("process_id") != pid
                 or record.get("creation_time_unix_ms")
                 != creation_time_unix_ms
-                or not isinstance(record.get("windows_matched"), int)
-                or record["windows_matched"] < 1
-                or (not refresh and (
+                or (not capture and (
+                    not isinstance(record.get("windows_matched"), int)
+                    or record["windows_matched"] < 1
+                ))
+                or (not refresh and not capture and (
                     not isinstance(record.get("visible_after"), int)
                     or (action == "show" and record["visible_after"] < 1)
                     or (action == "hide" and record["visible_after"] != 0)

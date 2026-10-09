@@ -20,6 +20,8 @@ MAINTENANCE_FILES = (
     "mt5_maintenance_scheduler.py",
     "mt5_lifecycle.py",
     "mt5_recovery_window.py",
+    "maintenance_recovery.py",
+    "maintenance_ticket_recovery.py",
     "provisioning/mt5_instance_rotation.py",
     "provisioning/mt5_template.py",
     "provisioning/mt5_update_store.py",
@@ -33,7 +35,11 @@ MAINTENANCE_TYPES = {
     "provisioning/mt5_template.py": "Mt5TemplateManager",
     "provisioning/mt5_update_store.py": "Mt5PendingUpdateStore",
     "provisioning/mt5_public_release.py": "Mt5PublicReleaseProbe",
+    "maintenance_recovery.py": "MaintenanceRecovery",
+    "maintenance_ticket_recovery.py": "TicketDeltaAdapter",
 }
+
+MAINTENANCE_HELPERS = ("Capture-Mt5TicketBaseline.py", "Refresh-Mt5HistoryChart.ps1")
 
 
 class MaintenanceCapabilityError(RuntimeError):
@@ -79,13 +85,17 @@ def verify_maintenance_capability(release_root: Path | str) -> None:
             for node in tree.body
         ):
             raise MaintenanceCapabilityError("mt5_maintenance_implementation_missing")
+    for name in MAINTENANCE_HELPERS:
+        path = root / "scripts" / "windows" / name
+        if path.is_symlink() or not path.is_file():
+            raise MaintenanceCapabilityError("mt5_maintenance_helper_missing")
     daemon = _source(root, "agent_daemon.py")
     builder = _function(daemon, "build_runner")
     loop = _function(daemon, "run_forever")
     config = _source(root, "runtime_config.py")
     loader = _function(config, "load_runtime_config")
     required_calls = (
-        "Mt5MaintenanceScheduler", "Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe",
+        "Mt5MaintenanceScheduler", "Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "MaintenanceRecovery",
     )
     wired = any(
         isinstance(node, ast.Call)

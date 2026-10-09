@@ -6,6 +6,7 @@ from windows_agent.maintenance_capability import (
     MAINTENANCE_ENV,
     MAINTENANCE_FILES,
     MAINTENANCE_TYPES,
+    MAINTENANCE_HELPERS,
     MaintenanceCapabilityError,
     assert_service_compatibility,
     parse_service_environment,
@@ -14,6 +15,10 @@ from windows_agent.maintenance_capability import (
 
 
 def capable_release(root: Path) -> Path:
+    for name in MAINTENANCE_HELPERS:
+        path = root / "scripts" / "windows" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# reviewed helper fixture\n")
     for relative in MAINTENANCE_FILES:
         path = root / "windows_agent" / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,6 +26,7 @@ def capable_release(root: Path) -> Path:
         path.write_text(f"class {class_name}:\n    pass\n" if class_name else "def new_only_recovery_from():\n    pass\n")
     (root / "windows_agent" / "agent_daemon.py").write_text(
         "def build_runner(config):\n"
+        "    recovery = MaintenanceRecovery()\n"
         "    coordinator = Mt5MaintenanceCoordinator(Mt5PublicReleaseProbe())\n"
         "    maintenance = Mt5MaintenanceScheduler(coordinator)\n"
         "    return JobRunner(scheduled_maintenance=maintenance)\n"
@@ -35,8 +41,16 @@ def capable_release(root: Path) -> Path:
 
 
 def test_rejects_the_observed_regression_even_with_a_preserved_enabled_flag(tmp_path):
-    with pytest.raises(MaintenanceCapabilityError, match="module_missing"):
+    with pytest.raises(MaintenanceCapabilityError, match="(module|helper)_missing"):
         assert_service_compatibility(tmp_path, {MAINTENANCE_ENV: "1"})
+
+
+@pytest.mark.parametrize("name", MAINTENANCE_HELPERS)
+def test_recovery_helpers_cannot_disappear_from_a_release(tmp_path, name):
+    root = capable_release(tmp_path)
+    (root / "scripts/windows" / name).unlink()
+    with pytest.raises(MaintenanceCapabilityError, match="helper_missing"):
+        verify_maintenance_capability(root)
 
 
 @pytest.mark.parametrize("file", MAINTENANCE_FILES)
@@ -47,7 +61,7 @@ def test_rejects_a_partially_packaged_scheduler(tmp_path, file):
         verify_maintenance_capability(root)
 
 
-@pytest.mark.parametrize("removed", ["Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "Mt5MaintenanceScheduler", "run_if_due", "scheduled_maintenance="])
+@pytest.mark.parametrize("removed", ["Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "Mt5MaintenanceScheduler", "MaintenanceRecovery", "run_if_due", "scheduled_maintenance="])
 def test_files_alone_do_not_prove_the_worker_runs_maintenance(tmp_path, removed):
     root = capable_release(tmp_path)
     path = root / "windows_agent" / "agent_daemon.py"
