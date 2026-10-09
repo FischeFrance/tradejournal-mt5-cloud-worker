@@ -2624,6 +2624,8 @@ def _start_file_bridge_and_sync_locked(
         )
     except NativeMt5Error as exc:
         code = str(exc)
+        if code == "authorization_failed":
+            raise Mt5AuthorizationFailed(code) from exc
         if code == "terminal_stop_failed":
             raise InstanceCleanupFailed(code) from exc
         if code == "investor_readonly_not_verified":
