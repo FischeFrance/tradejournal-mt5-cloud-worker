@@ -69,6 +69,7 @@ class AgentRuntimeConfig:
     mt5_maintenance_timezone: str = DEFAULT_MT5_MAINTENANCE_TIMEZONE
     mt5_maintenance_grace_minutes: int = DEFAULT_MT5_MAINTENANCE_GRACE_MINUTES
     mt5_maintenance_state_path: Path = DEFAULT_MT5_MAINTENANCE_STATE_PATH
+    mt5_single_start_enabled: bool = False
 
 
 def _required_sha256(source: Mapping[str, str], name: str) -> str:
@@ -238,6 +239,10 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
     maintenance_enabled_raw = source.get(
         "TRADEJOURNAL_MT5_MAINTENANCE_ENABLED", ""
     ).strip()
+    single_start_raw = source.get("TRADEJOURNAL_MT5_SINGLE_START_ENABLED", "").strip()
+    if single_start_raw not in ("", "0", "1"):
+        raise ValueError("TRADEJOURNAL_MT5_SINGLE_START_ENABLED must be 0 or 1")
+    mt5_single_start_enabled = single_start_raw == "1"
     if maintenance_enabled_raw not in ("", "0", "1"):
         raise ValueError("TRADEJOURNAL_MT5_MAINTENANCE_ENABLED must be 0 or 1")
     mt5_maintenance_enabled = (
@@ -334,6 +339,7 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         mt5_maintenance_timezone=mt5_maintenance_timezone,
         mt5_maintenance_grace_minutes=mt5_maintenance_grace_minutes,
         mt5_maintenance_state_path=mt5_maintenance_state_path,
+        mt5_single_start_enabled=mt5_single_start_enabled,
     )
 
 

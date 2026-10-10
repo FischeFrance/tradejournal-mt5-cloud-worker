@@ -21,7 +21,9 @@ from worker.atomic_file import (
     unlink_readonly_file,
 )
 
+from ..provisioning.mt5_public_release import Mt5PublicReleaseError, read_windows_pe_build
 from ..provisioning.secret_store import WindowsSecretStore
+from .broker_bootstrap_symbol_cache import BrokerBootstrapSymbolCache
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,10 @@ class NativeMt5Runtime:
     """
 
     _MANAGED_CHART_PROFILE = "TradeJournal"
+    _SINGLE_START_BUILDS = frozenset((6249,))
+    _SINGLE_START_RETRYABLE = frozenset(
+        ("authorization_timeout", "investor_sync_timeout", "broker_symbol_probe_failed", "terminal_not_ready")
+    )
     _CACHED_SYMBOL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}")
     _BOOTSTRAP_BASE_SYMBOLS = (
         "EURUSD",
@@ -71,7 +77,10 @@ class NativeMt5Runtime:
         Path("MQL5/Scripts/Examples"),
     )
 
-    def __init__(self, instance_root: Path, connection_id: str) -> None:
+    def __init__(
+        self, instance_root: Path, connection_id: str, *, single_start_enabled: bool = False,
+        bootstrap_symbol_cache: Path | None = None,
+    ) -> None:
         self.root = instance_root.resolve()
         self.connection_id = connection_id
         self.terminal_root = self.root / "terminal"
@@ -82,6 +91,11 @@ class NativeMt5Runtime:
         self._interactive_task: str | None = None
         self._last_symbol: str | None = None
         self._cancel_check: Callable[[], None] | None = None
+        self._single_start_enabled = single_start_enabled
+        self._bootstrap_symbol_cache = (
+            BrokerBootstrapSymbolCache(bootstrap_symbol_cache)
+            if bootstrap_symbol_cache is not None else None
+        )
 
     def set_cancel_check(self, check: Callable[[], None] | None) -> None:
         self._cancel_check = check
@@ -437,6 +451,27 @@ class NativeMt5Runtime:
         if not candidates:
             return None
         return min(candidates)[-1]
+
+    def _remember_broker_symbol(
+        self, server: str, preferred: str, resolved: str, terminal_build: int | None,
+    ) -> None:
+        """Learn a public chart hint only after Discovery and producer proof succeeded."""
+        if self._bootstrap_symbol_cache is None:
+            return
+        try:
+            build = terminal_build if terminal_build is not None else read_windows_pe_build(self.terminal)
+        except Mt5PublicReleaseError:
+            return
+        discovered = self._read_json(self.files / "discovered-symbol.json")
+        if (
+            discovered is None or type(discovered.get("terminal_build")) is not int
+            or discovered.get("terminal_build") != build or discovered.get("symbol") != resolved
+        ):
+            return
+        self._bootstrap_symbol_cache.store_verified(
+            canonical_server=server, terminal_build=build,
+            preferred_base=preferred, verified_symbol=resolved,
+        )
 
     def _publish_bridge_handoff(self) -> Path:
         template = self.files / "TradeJournalBridge.tpl"
@@ -1388,6 +1423,119 @@ class NativeMt5Runtime:
                 continue
         return result
 
+    def _start_single_with_warm_retry(
+        self,
+        *,
+        login: int,
+        server: str,
+        connection_endpoint: str | None,
+        investor_password: str,
+        symbol: str,
+        timeout: float,
+        terminal_build: int,
+        bootstrap_symbol: str,
+    ) -> NativeMt5Status:
+        """Try one cold Discovery launch, then at most one launch of its warmed account.
+
+        This opt-in route retains the same authorization/investor/producer boundaries as the
+        legacy bootstrap. A timeout can warm a broker cache; a credential, identity, integrity,
+        process or lease failure cannot authorize another attempt. No third bootstrap is run.
+        """
+        deadline = time.monotonic() + timeout
+
+        def remaining(cap: float) -> float:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise NativeMt5Error("cold_start_timeout")
+            return min(cap, budget)
+
+        effective_server = server
+        startup_server = connection_endpoint or server
+        config: Path | None = None
+        try:
+            for attempt in range(2):
+                self._check_cancelled()
+                remaining(timeout)
+                self._reset_managed_chart_profile()
+                self._remove_generated_example_code()
+                self._remove_readiness_files()
+                if any((self.files / name).exists() for name in (
+                    "bridge-ready", "discovered-symbol.json", "account.json", "heartbeat.json"
+                )):
+                    raise NativeMt5Error("cold_start_cleanup_failed")
+                self._write_symbol_preference(symbol)
+                chart_symbol = (
+                    bootstrap_symbol if attempt == 0
+                    else self._cached_broker_symbol(login, effective_server, symbol) or bootstrap_symbol
+                )
+                self._last_symbol = chart_symbol
+                try:
+                    config = self._write_startup_config(
+                        login,
+                        startup_server,
+                        investor_password,
+                        chart_symbol,
+                        keep_private=True,
+                        start_expert=False,
+                        script_name="TradeJournal\\TradeJournalDiscovery",
+                        filename="single-start.ini",
+                    )
+                    checkpoint = self._journal_checkpoint()
+                    self._check_cancelled()
+                    remaining(timeout)
+                    self._start_process(config)
+                    observed_server = self._wait_for_authorization(
+                        checkpoint, login, effective_server, remaining(120.0), startup_server
+                    )
+                    if isinstance(observed_server, str) and observed_server.strip():
+                        effective_server = observed_server.strip()
+                    self._wait_for_account_database(remaining(15.0))
+                    self._wait_for_investor_sync(checkpoint, login, remaining(120.0))
+                    resolved_symbol = self._probe_broker_symbol(
+                        symbol, login, effective_server, remaining(120.0)
+                    )
+                    # A vendor update must not silently extend an experimentally gated build.
+                    discovered = self._read_json(self.files / "discovered-symbol.json")
+                    if discovered is None or discovered.get("terminal_build") != terminal_build:
+                        raise NativeMt5Error("terminal_build_mismatch")
+                    self._last_symbol = resolved_symbol
+                    self._install_bridge_template(resolved_symbol)
+                    self._check_cancelled()
+                    remaining(timeout)
+                    self._publish_bridge_handoff()
+                    status = self._wait_for_heartbeat(remaining(90.0), login, effective_server)
+                    self._remember_broker_symbol(effective_server, symbol, resolved_symbol, terminal_build)
+                    if effective_server.casefold() == server.casefold():
+                        return status
+                    return replace(status, requested_server=server, effective_server=effective_server)
+                except NativeMt5Error as exc:
+                    if attempt or str(exc) not in self._SINGLE_START_RETRYABLE:
+                        raise
+                    self._check_cancelled()
+                    remaining(timeout)
+                    self._secure_delete_config(config)
+                    config = None
+                    if not self.stop(timeout=remaining(15.0)):
+                        raise NativeMt5Error("terminal_stop_failed") from exc
+                    self._check_cancelled()
+                    remaining(timeout)
+                    startup_server = effective_server if effective_server != server else startup_server
+                    logger.info(
+                        "native MT5 cold start: one warm retry (connection_id=%s, reason=%s)",
+                        self.connection_id, str(exc),
+                    )
+                finally:
+                    self._secure_delete_config(config)
+                    config = None
+            raise NativeMt5Error("cold_start_timeout")
+        except Exception:
+            self.stop()
+            raise
+        finally:
+            investor_password = ""
+            gc.collect()
+            self._secure_delete_config(config)
+
     def start(
         self,
         *,
@@ -1405,9 +1553,29 @@ class NativeMt5Runtime:
     ) -> NativeMt5Status:
         if not self.terminal.is_file():
             raise NativeMt5Error("terminal_start_failed")
+        terminal_build: int | None = None
+        if self._single_start_enabled:
+            try:
+                terminal_build = read_windows_pe_build(self.terminal)
+            except Mt5PublicReleaseError:
+                # Build gating is an optimization; an uninspectable PE retains legacy startup.
+                pass
         symbol = self._startup_symbol(symbol)
         self._last_symbol = symbol
         self.install_expert(expert_binary, history_mode)
+        bootstrap_hint = (
+            self._bootstrap_symbol_cache.lookup(
+                canonical_server=server, terminal_build=terminal_build, preferred_base=symbol,
+            )
+            if self._bootstrap_symbol_cache is not None
+            and terminal_build is not None and terminal_build in self._SINGLE_START_BUILDS else None
+        )
+        if bootstrap_hint is not None and terminal_build is not None:
+            return self._start_single_with_warm_retry(
+                login=login, server=server, connection_endpoint=connection_endpoint,
+                investor_password=investor_password, symbol=symbol, timeout=timeout,
+                terminal_build=terminal_build, bootstrap_symbol=bootstrap_hint,
+            )
         bootstrap: Path | None = None
         startup: Path | None = None
         try:
@@ -1495,6 +1663,7 @@ class NativeMt5Runtime:
                 login,
                 effective_server,
             )
+            self._remember_broker_symbol(effective_server, symbol, resolved_symbol, terminal_build)
             if effective_server.casefold() == server.casefold():
                 return status
             return replace(
