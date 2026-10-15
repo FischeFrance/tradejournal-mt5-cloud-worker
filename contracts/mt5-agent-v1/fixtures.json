@@ -1,5 +1,5 @@
 {
-  "$comment": "Fixture payloads validated against schema.json by contract tests in both tradejournal-drp and tradejournal-mt5-cloud-worker. No real secrets: all ids/tokens here are fabricated.",
+  "$comment": "Fixture payloads validated against schema.json by contract tests in both trademove and tradejournal-mt5-cloud-worker. No real secrets: all ids/tokens here are fabricated.",
   "claimRequest": { "api_version": "1" },
   "claimResponseJob_provision": {
     "api_version": "1",
@@ -145,5 +145,6 @@
     "expires_at": "2026-08-06T12:00:00.000Z",
     "topics": ["mt5-agent:any", "mt5-agent:3f6a3b8e-2f0e-4b1a-8b8f-6a2b6b6a9c44"]
   },
-  "errorResponse_unauthorized": { "error_code": "unauthorized" }
+  "errorResponse_unauthorized": { "error_code": "unauthorized" },
+  "errorResponse_heartbeatFailed": { "error_code": "heartbeat_failed" }
 }

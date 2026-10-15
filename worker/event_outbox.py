@@ -3,7 +3,8 @@
 Il formato v2 conserva esplicitamente i pending in una lista ordinata. Ogni mutazione usa un
 file temporaneo 0600, ``fsync`` e ``os.replace`` nella stessa directory. I file v1 vengono
 migrati senza perdere eventi; quando possibile ``event_time`` ricostruisce l'ordine causale che
-la serializzazione ordinata per chiave del vecchio formato poteva avere alterato.
+la serializzazione ordinata per chiave del vecchio formato poteva avere alterato. Il campo
+opzionale ``retry`` conserva il backpressure 429 dell'account anche dopo un riavvio.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import logging
 import os
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -21,9 +23,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 try:
     from .atomic_file import durable_replace
     from .event_sender import EventSender
+    from .retry_schedule import RetrySchedule, validate_retry_record
 except ImportError:  # pragma: no cover - direct worker/main.py execution
     from atomic_file import durable_replace
     from event_sender import EventSender
+    from retry_schedule import RetrySchedule, validate_retry_record
 
 logger = logging.getLogger("mt5_worker.event_outbox")
 
@@ -80,20 +84,33 @@ class DrainResult:
     dead_lettered: int = 0
     transient_failures: int = 0
     pending: int = 0
+    rate_limited: bool = False
+    retry_after_seconds: int = 0
 
 
 class EventOutbox:
     """Outbox JSON FIFO, persistente quando ``file_path`` e' valorizzato."""
 
-    def __init__(self, file_path: Optional[str] = None) -> None:
+    def __init__(
+        self, file_path: Optional[str] = None, *,
+        clock_fn=time.time, monotonic_fn=time.monotonic,
+    ) -> None:
         self.file_path = file_path
         if not file_path:
             self._state = self._empty_state()
-            return
+        else:
+            self._state, migration_required = self._load()
+            if migration_required:
+                self._persist(self._state)
+        self._retry = RetrySchedule(self._state.get("retry"), clock_fn, monotonic_fn)
 
-        self._state, migration_required = self._load()
-        if migration_required:
-            self._persist(self._state)
+    @property
+    def retry_at(self) -> Optional[float]:
+        return self._retry.retry_at
+
+    @property
+    def retry_after_seconds(self) -> int:
+        return self._retry.remaining_seconds
 
     @staticmethod
     def _empty_state() -> Dict[str, Any]:
@@ -114,6 +131,19 @@ class EventOutbox:
 
     def dead_letters(self) -> Dict[str, Dict[str, Any]]:
         return copy.deepcopy(self._state["dead_letter"])
+
+    def coalesce_heartbeat(self, payload: Dict[str, Any]) -> None:
+        """Keep the latest presence sample in a separate bounded outbox, retaining its delay."""
+        self._validate_payload(payload)
+        if payload.get("event_type") != "heartbeat" or any(
+            item.get("event_type") != "heartbeat" for item in self._state["pending"]
+        ):
+            raise OutboxError("Heartbeat coalescing cannot replace trading events.")
+        new_state = copy.deepcopy(self._state)
+        new_state["pending"] = [copy.deepcopy(payload)]
+        # A rejected presence sample is obsolete once a fresh validated sample arrives.
+        new_state["dead_letter"] = {}
+        self._replace_state(new_state)
 
     def enqueue_many(self, payloads: Iterable[Dict[str, Any]]) -> int:
         """Accoda atomicamente un batch, in ordine, deduplicandolo per ``event_id``."""
@@ -151,7 +181,14 @@ class EventOutbox:
         sincronizzazione di ogni trade reale che arriva dopo di lui.
         """
         sent = dry_run = dead_lettered = transient_failures = 0
+        rate_limited = False
         index = 0
+
+        if self.pending_count() and self.retry_after_seconds:
+            return DrainResult(
+                pending=self.pending_count(), rate_limited=True,
+                retry_after_seconds=self.retry_after_seconds,
+            )
 
         while index < len(self._state["pending"]):
             payload = copy.deepcopy(self._state["pending"][index])
@@ -161,6 +198,7 @@ class EventOutbox:
             if result.status == "sent":
                 new_state = copy.deepcopy(self._state)
                 new_state["pending"].pop(index)
+                new_state.pop("retry", None)
                 self._replace_state(new_state)
                 sent += 1
                 continue
@@ -174,6 +212,7 @@ class EventOutbox:
             if result.failure_type == "permanent":
                 new_state = copy.deepcopy(self._state)
                 stored_payload = new_state["pending"].pop(index)
+                new_state.pop("retry", None)
                 new_state["dead_letter"][event_id] = {
                     "payload": stored_payload,
                     "failure_type": "permanent",
@@ -198,6 +237,11 @@ class EventOutbox:
             # Include risultati legacy senza failure_type: conservarli e fermare il drain e' la
             # scelta fail-safe che preserva sia l'evento sia l'ordine dei successivi.
             transient_failures += 1
+            if result.http_status == 429:
+                new_state = copy.deepcopy(self._state)
+                new_state["retry"] = self._retry.after(result.retry_after_seconds)
+                self._replace_state(new_state)
+                rate_limited = True
             break
 
         return DrainResult(
@@ -206,6 +250,8 @@ class EventOutbox:
             dead_lettered=dead_lettered,
             transient_failures=transient_failures,
             pending=self.pending_count(),
+            rate_limited=rate_limited,
+            retry_after_seconds=self.retry_after_seconds if rate_limited else 0,
         )
 
     def _load(self) -> Tuple[Dict[str, Any], bool]:
@@ -236,8 +282,7 @@ class EventOutbox:
                 "dead_letter": dead_letter,
             }
         elif version == _FORMAT_VERSION:
-            pending = state.get("pending")
-            if not isinstance(pending, list):
+            if not isinstance(state.get("pending"), list):
                 raise OutboxError("Formato outbox non valido: pending deve essere un array.")
         else:
             raise OutboxError("Versione del formato outbox non supportata.")
@@ -279,6 +324,10 @@ class EventOutbox:
 
     @classmethod
     def _validate_state(cls, state: Dict[str, Any]) -> None:
+        try:
+            validate_retry_record(state.get("retry"))
+        except ValueError as exc:
+            raise OutboxError("Formato retry outbox non valido.") from exc
         pending = state["pending"]
         dead_letter = state["dead_letter"]
         pending_ids = set()
@@ -331,6 +380,7 @@ class EventOutbox:
         if self.file_path:
             self._persist(new_state)
         self._state = new_state
+        self._retry.replace(new_state.get("retry"))
 
     def _persist(self, state: Dict[str, Any]) -> None:
         assert self.file_path is not None

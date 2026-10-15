@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
-
 from event_sender import EventSender, mask_value, sanitize_payload_for_log
 
 PAYLOAD = {
@@ -21,6 +20,8 @@ PAYLOAD = {
 def _response(status_code: int) -> MagicMock:
     response = MagicMock()
     response.status_code = status_code
+    # Ingestion confirms durable acceptance with JSON status, not just HTTP 200.
+    response.json.return_value = {"status": "ok"}
     return response
 
 
@@ -148,7 +149,7 @@ def test_client_error_is_not_retried(mock_post):
     mock_post.assert_called_once()
 
 
-@pytest.mark.parametrize("status_code", [408, 425, 429])
+@pytest.mark.parametrize("status_code", [408, 425])
 @patch("event_sender.requests.post")
 def test_retryable_client_statuses_are_transient(mock_post, status_code):
     mock_post.return_value = _response(status_code)

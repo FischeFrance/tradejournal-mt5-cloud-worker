@@ -1,0 +1,449 @@
+"""Pure MT5 event construction extracted without changing economic identity semantics."""
+
+from __future__ import annotations
+
+from worker.event_detector import detect_events
+
+
+def _usable_symbol(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > 64
+        or any(ord(character) < 32 for character in value)
+    ):
+        return None
+    return value
+
+
+def _identifiers(*values: object) -> set[str]:
+    identifiers: set[str] = set()
+    for value in values:
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            identifier = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if identifier > 0:
+            identifiers.add(str(identifier))
+    return identifiers
+
+
+def _symbols_from_rows(
+    rows: object,
+    identifiers: set[str],
+    identity_fields: tuple[str, ...],
+    *,
+    include_key: bool = True,
+) -> set[str]:
+    if not identifiers or not isinstance(rows, dict):
+        return set()
+    symbols: set[str] = set()
+    for key, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        identity_values = [row.get(field) for field in identity_fields]
+        if include_key:
+            identity_values.insert(0, key)
+        row_identifiers = _identifiers(*identity_values)
+        if identifiers.isdisjoint(row_identifiers):
+            continue
+        symbol = _usable_symbol(row.get("symbol"))
+        if symbol is not None:
+            symbols.add(symbol)
+    return symbols
+
+
+def _authoritative_symbol(record: dict, previous: dict, current: dict) -> str | None:
+    """Resolve a missing symbol only from records already bound to this MT5 event."""
+
+    symbol = _usable_symbol(record.get("symbol"))
+    if symbol is not None:
+        return symbol
+
+    source_type = str(record.get("event_type", "")).upper()
+    position_ids = _identifiers(record.get("position_id"), record.get("position_ticket"))
+    if source_type != "DEAL_ADD":
+        position_ids.update(_identifiers(record.get("ticket")))
+    deal_ids = _identifiers(record.get("deal_id"))
+    if source_type == "DEAL_ADD":
+        deal_ids.update(_identifiers(record.get("ticket")))
+    order_ids = _identifiers(record.get("order_id"))
+
+    candidates: set[str] = set()
+    for snapshot in (current, previous):
+        if not isinstance(snapshot, dict):
+            continue
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("positions"),
+                position_ids,
+                ("ticket", "position_id", "position_ticket"),
+            )
+        )
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("deals"),
+                deal_ids,
+                ("ticket", "deal_id"),
+            )
+        )
+        candidates.update(
+            _symbols_from_rows(
+                snapshot.get("orders"),
+                order_ids,
+                ("ticket", "order_id"),
+            )
+        )
+        # A related deal/order can still authoritatively name the position even when its own
+        # native ticket is unavailable in the callback.
+        for collection in ("deals", "orders"):
+            candidates.update(
+                _symbols_from_rows(
+                    snapshot.get(collection),
+                    position_ids,
+                    ("position_id", "position_ticket"),
+                    include_key=False,
+                )
+            )
+    # Conflicting related rows are not a safe fallback: wait for the next coherent snapshot.
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
+    event_type = str(record.get("event_type", "")).upper()
+    position_ticket = record.get("position_id") or record.get("position_ticket")
+    ticket = position_ticket or record.get("order_id") or record.get("ticket")
+    ticket_text = str(ticket)
+    previous_position = previous.get("positions", {}).get(ticket_text)
+    current_position = current.get("positions", {}).get(ticket_text)
+    base = {
+        "ticket": ticket_text,
+        "symbol": record.get("symbol"),
+        "direction": record.get("direction"),
+        "volume": record.get("volume"),
+        "event_time": record.get("time"),
+        "balance": record.get("balance"),
+        "equity": record.get("equity"),
+        "currency": record.get("currency"),
+        "leverage": record.get("leverage"),
+    }
+    if event_type == "DEAL_ADD":
+        time_msc = record.get("timestamp_msc")
+        if time_msc is None:
+            time_msc = record.get("time_msc")
+        deal_base = {
+            **base,
+            "native_deal_ticket": record.get("deal_id") or record.get("ticket"),
+            "time_msc": time_msc,
+            "time_basis": "broker_server_unresolved",
+        }
+        entry = str(record.get("entry", "")).upper()
+        if entry == "IN":
+            if previous_position is not None and current_position is not None:
+                return {
+                    **deal_base,
+                    "event_type": "trade_volume_changed",
+                    "volume": current_position.get("volume"),
+                    "previous_volume": previous_position.get("volume"),
+                    "open_price": current_position.get("open_price"),
+                    # Opening/scale-in costs are deal-level values.  Keeping each native fill
+                    # separate lets Supabase aggregate them once and lets history replay use
+                    # the same immutable deal identity.
+                    "profit": record.get("profit"),
+                    "commission": record.get("commission"),
+                    "swap": record.get("swap"),
+                    "partial_close": False,
+                }
+            return {
+                **deal_base,
+                "event_type": "trade_opened",
+                "open_price": record.get("price"),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
+                "open_time": record.get("time"),
+                "balance_before_open": record.get("balance_before_open"),
+            }
+        if entry in ("OUT", "OUT_BY"):
+            if current_position is not None:
+                return {
+                    **deal_base,
+                    "event_type": "trade_partial_closed",
+                    # A close event always carries the executed deal volume, never the
+                    # remaining position volume.  This makes its fingerprint identical to
+                    # the same fill replayed by the historical importer.
+                    "close_price": record.get("price"),
+                    "profit": record.get("profit"),
+                    "commission": record.get("commission"),
+                    "swap": record.get("swap"),
+                    "close_time": record.get("time"),
+                }
+            return {
+                **deal_base,
+                "event_type": "trade_closed",
+                "close_price": record.get("price"),
+                "profit": record.get("profit"),
+                "commission": record.get("commission"),
+                "swap": record.get("swap"),
+                "close_time": record.get("time"),
+            }
+        return {
+            **deal_base,
+            "event_type": "deal_recorded",
+            "close_price": record.get("price"),
+            "profit": record.get("profit"),
+            "commission": record.get("commission"),
+            "swap": record.get("swap"),
+            "close_time": record.get("time"),
+        }
+    if event_type == "POSITION" and current_position is not None:
+        if (
+            previous_position is not None
+            and previous_position.get("volume") != current_position.get("volume")
+        ):
+            return {
+                **base,
+                "event_type": "trade_volume_changed",
+                "volume": current_position.get("volume"),
+                "previous_volume": previous_position.get("volume"),
+                "partial_close": (
+                    (current_position.get("volume") or 0)
+                    < (previous_position.get("volume") or 0)
+                ),
+            }
+        return {
+            **base,
+            "event_type": "trade_modified",
+            "volume": current_position.get("volume"),
+            "stop_loss": current_position.get("stop_loss"),
+            "take_profit": current_position.get("take_profit"),
+            "previous_stop_loss": (
+                previous_position.get("stop_loss")
+                if previous_position is not None
+                else None
+            ),
+            "previous_take_profit": (
+                previous_position.get("take_profit")
+                if previous_position is not None
+                else None
+            ),
+        }
+    if event_type == "ORDER_ADD":
+        return {
+            **base,
+            "event_type": "pending_order_created",
+            "price": record.get("price"),
+            "stop_loss": record.get("stop_loss"),
+            "take_profit": record.get("take_profit"),
+        }
+    if event_type == "ORDER_UPDATE":
+        return {
+            **base,
+            "event_type": "pending_order_modified",
+            "price": record.get("price"),
+            "stop_loss": record.get("stop_loss"),
+            "take_profit": record.get("take_profit"),
+        }
+    if event_type in ("ORDER_DELETE", "HISTORY_ADD"):
+        return {
+            **base,
+            "event_type": "pending_order_cancelled",
+            "price": record.get("price"),
+        }
+    return {
+        **base,
+        "event_type": "deal_recorded",
+        "close_price": record.get("price"),
+        "profit": record.get("profit"),
+        "commission": record.get("commission"),
+        "swap": record.get("swap"),
+        "close_time": record.get("time"),
+    }
+
+
+def _merge_event_stream_with_snapshot(
+    records: tuple[dict, ...], previous: dict, current: dict
+) -> list[dict]:
+    # Replay DEAL_ADD records against the position volume that existed before the batch.
+    # Several fills can arrive between two polls; looking only at the final snapshot would
+    # otherwise classify every fill as a final close when the position is now absent.
+    tracked_volumes: dict[str, float] = {}
+    tracked_open_prices: dict[str, float] = {}
+    for ticket, position in previous.get("positions", {}).items():
+        try:
+            tracked_volumes[str(ticket)] = float(position.get("volume"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            tracked_open_prices[str(ticket)] = float(position.get("open_price"))
+        except (TypeError, ValueError):
+            pass
+
+    stream_events: list[dict] = []
+    for record in records:
+        # The immutable history archive may already contain a deal whose MT5 transaction
+        # callback was queued just after the frozen snapshot committed.  Its native ticket is
+        # authoritative membership proof; replaying it from the live queue would turn the same
+        # opening into a false scale-in (or apply the same close twice).
+        if record.get("history_archived") is True:
+            continue
+        resolved_symbol = _authoritative_symbol(record, previous, current)
+        if resolved_symbol is not None and _usable_symbol(record.get("symbol")) is None:
+            record = {**record, "symbol": resolved_symbol}
+        event_previous, event_current = previous, current
+        if str(record.get("event_type", "")).upper() == "DEAL_ADD":
+            position_ticket = record.get("position_id") or record.get("position_ticket")
+            position_key = str(position_ticket) if position_ticket is not None else ""
+            entry = str(record.get("entry", "")).upper()
+            try:
+                raw_volume = record.get("volume")
+                fill_volume = float(raw_volume) if raw_volume is not None else 0.0
+            except (TypeError, ValueError):
+                fill_volume = 0.0
+            prior_volume = tracked_volumes.get(position_key)
+            if position_key and fill_volume > 0 and entry == "IN":
+                remaining = (prior_volume or 0.0) + fill_volume
+                try:
+                    raw_price = record.get("price")
+                    fill_price = float(raw_price) if raw_price is not None else None
+                except (TypeError, ValueError):
+                    fill_price = None
+                prior_price = tracked_open_prices.get(position_key)
+                average_price = fill_price
+                if (
+                    prior_volume is not None
+                    and prior_volume > 0
+                    and prior_price is not None
+                    and fill_price is not None
+                ):
+                    average_price = (
+                        (prior_volume * prior_price) + (fill_volume * fill_price)
+                    ) / remaining
+                event_previous = {
+                    "positions": (
+                        {
+                            position_key: {
+                                "volume": prior_volume,
+                                "open_price": prior_price,
+                            }
+                        }
+                        if prior_volume is not None
+                        else {}
+                    )
+                }
+                event_current = {
+                    "positions": {
+                        position_key: {
+                            "volume": remaining,
+                            "open_price": average_price,
+                        }
+                    }
+                }
+                tracked_volumes[position_key] = remaining
+                if average_price is not None:
+                    tracked_open_prices[position_key] = average_price
+            elif position_key and fill_volume > 0 and entry in ("OUT", "OUT_BY"):
+                if prior_volume is not None:
+                    remaining = prior_volume - fill_volume
+                    prior_price = tracked_open_prices.get(position_key)
+                    event_previous = {
+                        "positions": {
+                            position_key: {
+                                "volume": prior_volume,
+                                "open_price": prior_price,
+                            }
+                        }
+                    }
+                    event_current = {
+                        "positions": (
+                            {
+                                position_key: {
+                                    "volume": remaining,
+                                    "open_price": prior_price,
+                                }
+                            }
+                            if remaining > 1e-8
+                            else {}
+                        )
+                    }
+                    if remaining > 1e-8:
+                        tracked_volumes[position_key] = remaining
+                    else:
+                        tracked_volumes.pop(position_key, None)
+                        tracked_open_prices.pop(position_key, None)
+        stream_events.append(_mql5_file_event(record, event_previous, event_current))
+
+    # DEAL_ADD is the authoritative economic close.  A POSITION notification for the same
+    # transition (or the snapshot diff below) is only a state echo and must not reduce the
+    # volume a second time.
+    economic_close_tickets = {
+        str(event.get("ticket"))
+        for event in stream_events
+        if event.get("event_type") in ("trade_partial_closed", "trade_closed")
+    }
+    stream_events = [
+        event
+        for event in stream_events
+        if not (
+            event.get("event_type") == "trade_volume_changed"
+            and event.get("partial_close") is True
+            and str(event.get("ticket")) in economic_close_tickets
+        )
+    ]
+    reconciliation = detect_windows_events(previous, current)
+    covered = {
+        (str(event.get("event_type")), str(event.get("ticket")))
+        for event in stream_events
+    }
+    stream_deal_ids = {
+        str(record.get("deal_id") or record.get("ticket"))
+        for record in records
+        if str(record.get("event_type", "")).upper() == "DEAL_ADD"
+    }
+    for event in reconciliation:
+        key = (str(event.get("event_type")), str(event.get("ticket")))
+        if key in covered:
+            continue
+        if (
+            event.get("event_type") == "trade_volume_changed"
+            and event.get("partial_close") is True
+            and str(event.get("ticket")) in economic_close_tickets
+        ):
+            continue
+        if (
+            event.get("event_type") == "deal_recorded"
+            and str(event.get("ticket")) in stream_deal_ids
+        ):
+            continue
+        stream_events.append(event)
+    return stream_events
+
+
+def detect_windows_events(previous: dict, current: dict) -> list[dict]:
+    events = detect_events(previous, current)
+    before, after = previous.get("positions", {}), current.get("positions", {})
+    for ticket in sorted(before.keys() & after.keys()):
+        old, new = before[ticket], after[ticket]
+        if old.get("volume") != new.get("volume"):
+            events.append(
+                {
+                    "event_type": "trade_volume_changed",
+                    "ticket": ticket,
+                    "symbol": new.get("symbol"),
+                    "direction": new.get("direction"),
+                    "volume": new.get("volume"),
+                    "previous_volume": old.get("volume"),
+                    "partial_close": (new.get("volume") or 0)
+                    < (old.get("volume") or 0),
+                }
+            )
+    for ticket in sorted(
+        current.get("deals", {}).keys() - previous.get("deals", {}).keys()
+    ):
+        deal = current["deals"][ticket]
+        events.append({"event_type": "deal_recorded", "ticket": ticket, **deal})
+    return events

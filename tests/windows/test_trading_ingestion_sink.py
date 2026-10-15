@@ -14,6 +14,8 @@ from windows_agent.worker.trading_ingestion_sink import TradingIngestionSink
 def _response(status_code: int) -> MagicMock:
     response = MagicMock()
     response.status_code = status_code
+    # Match the ingestion endpoint's explicit durable acknowledgement contract.
+    response.json.return_value = {"status": "ok"}
     return response
 
 

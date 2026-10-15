@@ -350,7 +350,7 @@
       "properties": {
         "error_code": {
           "enum": [
-            "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed",
+            "unauthorized", "invalid_json", "unsupported_api_version", "claim_failed", "heartbeat_failed",
             "invalid_identifier", "lease_lost", "route_not_found", "invalid_error_code",
             "method_not_allowed", "server_not_configured", "payload_too_large",
             "rate_limited", "forbidden_scope", "invalid_event_code",

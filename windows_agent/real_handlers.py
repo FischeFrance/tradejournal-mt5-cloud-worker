@@ -1688,7 +1688,7 @@ def build_real_handlers(
         try:
             account_info = _verify_investor_access(adapter)
             sink = TradingIngestionSink(root, trading_ingestion_url, bridge_token)
-            if not sink.send_heartbeat(account_info):
+            if not sink.heartbeat_may_continue(account_info):
                 raise LiveSyncFailed("live sync heartbeat was not acknowledged")
             delivered = _run_live_sync_once(adapter, root, sink)
         except AgentError:

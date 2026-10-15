@@ -47,6 +47,7 @@ def validate_against(def_name: str, value: object) -> None:
         ("sessionRequest", "sessionRequest"),
         ("sessionResponse", "sessionResponse"),
         ("errorResponse", "errorResponse_unauthorized"),
+        ("errorResponse", "errorResponse_heartbeatFailed"),
     ],
 )
 def test_fixtures_match_schema(def_name: str, fixture_key: str) -> None:

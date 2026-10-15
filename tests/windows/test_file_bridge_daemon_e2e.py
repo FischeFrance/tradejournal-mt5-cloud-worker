@@ -17,8 +17,14 @@ from windows_agent.provisioning.secret_store import WindowsSecretStore
 from windows_agent.real_handlers import build_real_handlers
 from windows_agent.worker.native_mt5_runtime import NativeMt5Status
 
-
 KEY = base64.b64encode(b"8" * 32).decode("ascii")
+
+
+def _ingestion_ack() -> MagicMock:
+    # 2xx by itself is not a durable receipt: use the actual ingestion response shape.
+    reply = MagicMock(status_code=200)
+    reply.json.return_value = {"status": "ok"}
+    return reply
 
 
 def _envelope(payload: dict[str, str]) -> dict[str, str]:
@@ -275,7 +281,7 @@ def _provisioned_env(tmp_path: Path, monkeypatch):
     # Provision performs the first outbox delivery immediately. Keep this offline E2E entirely
     # deterministic; individual live-sync tests may override the same call and inspect it.
     monkeypatch.setattr(
-        "requests.post", MagicMock(return_value=MagicMock(status_code=200))
+        "requests.post", MagicMock(return_value=_ingestion_ack())
     )
     cid = str(uuid4())
     instances, secrets = tmp_path / "instances", tmp_path / "secrets"
@@ -322,7 +328,7 @@ def test_live_sync_job_sends_heartbeat_over_http(tmp_path: Path, monkeypatch) ->
         "history_mode": None, "payload": {},
     })
 
-    with patch("requests.post", return_value=MagicMock(status_code=200)) as mock_post:
+    with patch("requests.post", return_value=_ingestion_ack()) as mock_post:
         assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once() is True
 
     assert api.transitions[-1][1] == "complete"
@@ -360,7 +366,7 @@ def test_live_sync_job_self_heals_when_terminal_not_running(tmp_path: Path, monk
         "history_mode": None, "payload": {},
     })
 
-    with patch("requests.post", return_value=MagicMock(status_code=200)):
+    with patch("requests.post", return_value=_ingestion_ack()):
         assert JobRunner(tmp_path / "agent-state-2.json", api, handlers).run_once() is True
 
     assert relaunched == [cid]

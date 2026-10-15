@@ -5,14 +5,15 @@ Regole di sicurezza (vedi README):
 - maschera sempre account_number e server nei log (il payload HTTP reale, cifrato in transito
   da TLS, contiene i valori veri perche' l'API li usa per validare la connessione);
 - in DRY_RUN=true non esegue alcuna chiamata di rete: stampa solo il payload sanitizzato;
-- esegue un numero limitato di retry con backoff esponenziale sugli errori transitori
-  (rete, 408, 425, 429 e 5xx); 401/403 restano recuperabili tramite rotazione token, mentre gli
-  altri 4xx sono rifiuti permanenti e non vengono ritentati.
+- esegue un numero limitato di retry con backoff esponenziale su rete, 408, 425 e 5xx;
+  429 torna subito al caller per il rinvio persistente. 401/403 restano recuperabili tramite
+  rotazione token, mentre gli altri 4xx sono rifiuti permanenti e non vengono ritentati.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -24,6 +25,16 @@ logger = logging.getLogger("mt5_worker.event_sender")
 _SECRET_KEY_MARKERS = ("password", "token", "secret")
 _TRANSIENT_HTTP_STATUSES = frozenset((408, 425, 429))
 _RECOVERABLE_AUTH_STATUSES = frozenset((401, 403))
+
+
+def retry_after_seconds(headers: Any) -> int:
+    """Accept only the ingestion API's bounded numeric delay, never HTTP dates/body text."""
+    value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value.strip()):
+        seconds = int(value.strip())
+        if 1 <= seconds <= 60:
+            return seconds
+    return 60
 
 
 def mask_value(value: Optional[str]) -> str:
@@ -63,6 +74,7 @@ class SendResult:
     error: Optional[str] = None
     attempts: int = 0
     failure_type: Optional[str] = None  # None | "transient" | "permanent"
+    retry_after_seconds: Optional[int] = None
 
     @property
     def retryable(self) -> bool:
@@ -127,6 +139,7 @@ class EventSender:
                     json=payload,
                     headers=headers,
                     timeout=self.timeout_seconds,
+                    allow_redirects=False,
                 )
             except requests.RequestException as exc:
                 # Alcune eccezioni requests includono gli header (Authorization compreso) nella
@@ -140,7 +153,22 @@ class EventSender:
                     sanitized_event_id,
                 )
             else:
-                if response.status_code < 300:
+                if 200 <= response.status_code < 300:
+                    try:
+                        acknowledgement = response.json()
+                    except ValueError:
+                        acknowledgement = None
+                    if not (
+                        isinstance(acknowledgement, dict)
+                        and acknowledgement.get("status") in ("ok", "duplicate")
+                    ):
+                        # An HTML login page, 204 or "deferred" body is not durable receipt.
+                        # Keep the immutable event so an ambiguous success can replay safely.
+                        return SendResult(
+                            status="failed", http_status=response.status_code,
+                            error="acknowledgement_missing", attempts=attempt,
+                            failure_type="transient",
+                        )
                     logger.info(
                         "Evento inviato con successo (status=%s, event_id=%s). Payload: %s",
                         response.status_code,
@@ -148,6 +176,14 @@ class EventSender:
                         sanitized,
                     )
                     return SendResult(status="sent", http_status=response.status_code, attempts=attempt)
+
+                if 300 <= response.status_code < 400:
+                    # Never forward the bearer token to a new origin or turn this POST into a
+                    # login GET. Retain the event while the configured endpoint is repaired.
+                    return SendResult(
+                        status="failed", http_status=response.status_code,
+                        error="unexpected_redirect", attempts=attempt, failure_type="transient",
+                    )
 
                 if response.status_code in _RECOVERABLE_AUTH_STATUSES:
                     logger.error(
@@ -162,6 +198,18 @@ class EventSender:
                         error="authentication_failed",
                         attempts=attempt,
                         failure_type="transient",
+                    )
+
+                if response.status_code == 429:
+                    # The durable caller schedules this delay. Sleeping/retrying here would
+                    # block the account's job lease and hammer the same exhausted budget.
+                    return SendResult(
+                        status="failed",
+                        http_status=429,
+                        error="http_429",
+                        attempts=attempt,
+                        failure_type="transient",
+                        retry_after_seconds=retry_after_seconds(response.headers),
                     )
 
                 is_transient_http = (
