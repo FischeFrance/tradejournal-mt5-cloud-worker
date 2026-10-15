@@ -94,7 +94,18 @@
         "time_basis": { "const": "broker_server_unresolved" },
         "open_time": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
         "close_time": { "anyOf": [{ "$ref": "#/$defs/isoTimestamp" }, { "type": "null" }] },
-        "event_time": { "$ref": "#/$defs/isoTimestamp" }
+        "event_time": { "$ref": "#/$defs/isoTimestamp" },
+        "broker_utc_offset_seconds": {
+          "type": "integer",
+          "minimum": -50400,
+          "maximum": 50400,
+          "multipleOf": 900,
+          "description": "Broker server time minus UTC, measured by the worker from the terminal clocks. When present the ingestion converts every timestamp of the event with it."
+        },
+        "broker_offset_observed_at": {
+          "$ref": "#/$defs/isoTimestamp",
+          "description": "UTC instant of that measurement."
+        }
       }
     },
 

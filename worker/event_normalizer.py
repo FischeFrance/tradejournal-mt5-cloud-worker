@@ -212,6 +212,11 @@ def normalize_event(
         payload["time_msc"] = event["time_msc"]
     if event.get("time_basis") is not None:
         payload["time_basis"] = event["time_basis"]
+    if event.get("broker_utc_offset_seconds") is not None:
+        # Measured broker server time minus UTC: the ingestion converts every timestamp with it.
+        payload["broker_utc_offset_seconds"] = int(event["broker_utc_offset_seconds"])
+        if event.get("broker_offset_observed_at") is not None:
+            payload["broker_offset_observed_at"] = event["broker_offset_observed_at"]
     if event.get("commission_complete") is not None:
         payload["commission_complete"] = bool(event["commission_complete"])
     if event.get("previous_volume") is not None:

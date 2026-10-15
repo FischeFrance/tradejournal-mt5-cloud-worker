@@ -114,8 +114,12 @@ class LiveSync:
         self.excursions.observe_open_events(events)
         self.excursions.observe_snapshot(current)
         closed_excursions = self.excursions.enrich_close_events(events)
+        offset_reader = getattr(self.adapter, "broker_utc_offset", None)
+        broker_offset = offset_reader() if callable(offset_reader) else None
         payloads = []
         for event in events:
+            if broker_offset is not None:
+                event = {**event, **broker_offset.event_fields()}
             payload = normalize_event(event, account["login"], account["server"])
             if not self.dedup.contains(payload["event_id"]):
                 payloads.append(payload)

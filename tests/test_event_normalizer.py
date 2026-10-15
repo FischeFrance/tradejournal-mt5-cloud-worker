@@ -304,3 +304,16 @@ def test_normalize_all_seven_event_types_yields_valid_payload():
     ]
     assert len({p["event_id"] for p in payloads}) == len(payloads), "ogni evento deve avere un event_id univoco"
     assert all(p["event_id"] for p in payloads)
+
+
+def test_normalize_event_forwards_the_measured_broker_offset_without_changing_the_id():
+    payload = normalize_event(
+        {**RAW_TRADE_OPENED, "broker_utc_offset_seconds": 10800, "broker_offset_observed_at": "2026-10-15T09:00:00Z"},
+        account_number="12345",
+        server="Demo-Server",
+    )
+    assert payload["broker_utc_offset_seconds"] == 10800
+    assert payload["broker_offset_observed_at"] == "2026-10-15T09:00:00Z"
+    plain = normalize_event(RAW_TRADE_OPENED, account_number="12345", server="Demo-Server")
+    assert plain["event_id"] == payload["event_id"]
+    assert "broker_utc_offset_seconds" not in plain

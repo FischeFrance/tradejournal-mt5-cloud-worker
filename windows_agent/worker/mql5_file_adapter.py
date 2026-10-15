@@ -19,6 +19,7 @@ from typing import Any
 
 from ..state_store import atomic_json, read_json
 from .adapter_errors import IdentityMismatch, Mt5Error
+from .broker_offset import BrokerOffset, BrokerOffsetStore, measure_broker_offset
 from .history_balance import reconstruct_trade_deals
 
 SCHEMA_VERSION = 1
@@ -149,6 +150,25 @@ class Mql5FileMt5Adapter:
         if age < -2 or age > self.heartbeat_max_age_seconds:
             raise Mql5FileStale("heartbeat_stale")
         return envelope, payload
+
+    def broker_utc_offset(self) -> BrokerOffset | None:
+        """Broker server time minus UTC from the current heartbeat, else a recent measurement."""
+        store = BrokerOffsetStore(self.state_dir / "broker-utc-offset.json")
+        try:
+            envelope, payload = self._heartbeat_envelope()
+        except Mql5FileAdapterError:
+            return store.recent(datetime.now(timezone.utc))
+        utc_clock = self._parse_time(envelope["generated_at"])
+        server_clock = self._parse_time(payload.get("server_time")) or self._parse_time(payload.get("generated_at"))
+        measured = (
+            measure_broker_offset(utc_clock, server_clock, terminal_connected=payload["terminal_connected"])
+            if utc_clock is not None and server_clock is not None
+            else None
+        )
+        if measured is None:
+            return store.recent(datetime.now(timezone.utc))
+        store.save(measured)
+        return measured
 
     def _heartbeat(self) -> dict[str, Any]:
         _, payload = self._heartbeat_envelope()

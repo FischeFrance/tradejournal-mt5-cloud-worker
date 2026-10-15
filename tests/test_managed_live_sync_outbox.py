@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from worker.event_outbox import EventOutbox
 from worker.event_sender import SendResult
 from windows_agent.real_handlers import PersistentSnapshot
 from windows_agent.worker.dedup import PersistentDedup
+from windows_agent.worker.broker_offset import BrokerOffset
 from windows_agent.worker.live_sync import LiveSync, LiveSyncDeliveryError
 
 
@@ -24,6 +26,11 @@ class Adapter:
     def snapshot(self) -> dict:
         self.snapshot_reads += 1
         return self._snapshot
+
+
+class OffsetAdapter(Adapter):
+    def broker_utc_offset(self) -> BrokerOffset:
+        return BrokerOffset(10800, datetime(2026, 10, 15, 9, 0, tzinfo=timezone.utc))
 
 
 class Sender:
@@ -780,3 +787,17 @@ def test_invalid_open_contract_fields_are_not_enqueued_or_acknowledged(
     assert adapter.acknowledged is None
     assert EventOutbox(str(tmp_path / "outbox.json")).pending_count() == 0
     assert not (tmp_path / "snapshot.json").exists()
+
+
+def test_live_events_carry_the_measured_broker_offset(tmp_path: Path) -> None:
+    sender = Sender([SendResult(status="sent", http_status=200, attempts=1)])
+    live = LiveSync(
+        OffsetAdapter(_snapshot()),
+        PersistentSnapshot(tmp_path / "snapshot.json"),
+        PersistentDedup(tmp_path / "dedup.sqlite"),
+        sender,
+        outbox=EventOutbox(str(tmp_path / "outbox.json")),
+    )
+    assert live.poll_once() == 1
+    assert sender.payloads[0]["broker_utc_offset_seconds"] == 10800
+    assert sender.payloads[0]["broker_offset_observed_at"] == "2026-10-15T09:00:00Z"

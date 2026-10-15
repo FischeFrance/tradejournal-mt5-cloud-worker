@@ -357,6 +357,9 @@ string BuildHeartbeatJson(const long sequence)
   {
    string json = "{";
    json += "\"generated_at\":" + JsonString(Iso8601FromDatetime(TimeCurrent())) + ",";
+   // TimeTradeServer continua a scorrere anche senza quotazioni (fine settimana): il worker
+   // ne ricava lo scarto UTC del broker confrontandolo con il TimeGMT dell'envelope.
+   json += "\"server_time\":" + JsonString(Iso8601FromDatetime(TimeTradeServer())) + ",";
    json += "\"sequence\":" + IntegerToString(sequence) + ",";
    json += "\"history_mode\":" + JsonString(g_new_only ? "new_only" : "history") + ",";
    json += "\"terminal_connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false") + ",";

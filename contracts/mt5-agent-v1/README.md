@@ -12,8 +12,10 @@ Function vs. Python Windows Agent). `SHA256SUMS` pins the two wire files;
 
 ## Compatibility status
 
-The local snapshots are synchronized as of 2026-10-12, including the additive
-`heartbeat_failed` error for a transient database failure. Run both contract suites and the
+The local snapshots are synchronized as of 2026-10-15, including the additive
+`heartbeat_failed` error for a transient database failure and the optional
+`broker_utc_offset_seconds`/`broker_offset_observed_at` of `historyEvent`, which consumers that
+ignore them read as before. Run both contract suites and the
 read-only peer check before either repository is released. Identical files and mocked tests
 do not prove Windows/MT5 end-to-end compatibility or authorize a VPS rollout.
 

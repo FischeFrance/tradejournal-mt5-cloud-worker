@@ -1787,7 +1787,7 @@ def _history_time(value: object) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _history_event(entry: dict, login: str, server: str) -> dict:
+def _history_event(entry: dict, login: str, server: str, broker_offset: Any | None = None) -> dict:
     record = dict(entry.get("record") or {})
     kind = entry.get("kind")
     ticket = record.get("position_id") or record.get("position_ticket") or record.get("ticket")
@@ -1872,6 +1872,9 @@ def _history_event(entry: dict, login: str, server: str) -> dict:
                 "swap": record.get("swap"),
                 "close_time": event_time,
             }
+    if broker_offset is not None:
+        # The whole history is converted with the offset measured when it was exported.
+        raw = {**raw, **broker_offset.event_fields()}
     return normalize_event(raw, login, server)
 
 
@@ -1929,6 +1932,8 @@ def _run_history_sync(
     projected_deals: list[dict[str, Any]] = []
     local_persist = _deduped_sink(dedup, local_sink)
     local_accounting_persist = _deduped_sink(dedup, accounting_sink)
+    offset_reader = getattr(adapter, "broker_utc_offset", None)
+    broker_offset = offset_reader() if callable(offset_reader) else None
 
     def persist(entry: dict) -> None:
         local_persist(entry)
@@ -1946,7 +1951,7 @@ def _run_history_sync(
             and login is not None
             and server is not None
         ):
-            event = _history_event(entry, login, server)
+            event = _history_event(entry, login, server, broker_offset)
             event_id = str(event.get("event_id", ""))
             if event_id not in history_event_ids:
                 history_event_ids.add(event_id)
