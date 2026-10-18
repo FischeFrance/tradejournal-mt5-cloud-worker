@@ -4,36 +4,37 @@ import logging
 import os
 import random
 import threading
-from pathlib import Path
 from datetime import timedelta
+from pathlib import Path
 from typing import Callable
 
-from .broker_endpoint_resolver import resolve_verified_broker_endpoint
 from .broker_endpoint_registry import (
     BrokerEndpointRegistryPublisher,
     observe_process_endpoint,
 )
+from .broker_endpoint_resolver import resolve_verified_broker_endpoint
 from .broker_identity import (
     CachedBrokerIdentityResolver,
     OpenAIBrokerIdentityProvider,
 )
 from .broker_wizard import HiddenSessionBrokerWizard
-from .mtapi_search import MtApiSearchClient
-from .job_runner import JobRunner
 from .event_supervisor import Mt5EventSupervisor
-from .provisioning.mt5_instance_pool import Mt5InstancePool
-from .observability.maintenance_health import Mt5MaintenanceHealthMonitor
-from .mt5_lifecycle import Mt5LifecycleCoordinator
+from .job_runner import JobRunner
 from .maintenance_recovery import MaintenanceRecovery
+from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .mt5_maintenance import Mt5MaintenanceCoordinator
 from .mt5_maintenance_scheduler import Mt5MaintenanceScheduler
+from .mtapi_search import MtApiSearchClient
+from .observability.maintenance_health import Mt5MaintenanceHealthMonitor
+from .provisioning.mt5_instance_pool import Mt5InstancePool
 from .provisioning.mt5_instance_rotation import Mt5InstanceRotator
-from .provisioning.mt5_public_release import Mt5PublicReleaseProbe, Mt5ProvisionedReleaseInventory
+from .provisioning.mt5_public_release import Mt5ProvisionedReleaseInventory, Mt5PublicReleaseProbe
 from .provisioning.mt5_template import Mt5TemplateManager
 from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .real_handlers import build_real_handlers, reconcile_startup_instances
 from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
 from .security import RedactionFilter
+from .worker.native_mt5_runtime import NativeMt5Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,10 @@ def build_runner(
         secrets_root=config.secrets_root,
         source_terminal=config.source_terminal,
         expert_binary=config.expert_binary,
+        runtime_factory=lambda root, connection_id: NativeMt5Runtime(
+            root, connection_id, single_start_enabled=config.mt5_single_start_enabled,
+            bootstrap_symbol_cache=config.instances_root.parent / "state" / "broker-bootstrap-symbols",
+        ),
         terminal_sha256=config.terminal_sha256,
         expert_sha256=config.expert_sha256,
         trading_ingestion_url=config.trading_ingestion_url,

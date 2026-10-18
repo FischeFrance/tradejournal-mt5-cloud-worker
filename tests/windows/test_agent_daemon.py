@@ -2,9 +2,36 @@ from __future__ import annotations
 
 import threading
 import time
+from unittest.mock import Mock
+
+import pytest
 
 from windows_agent.agent_daemon import default_handlers, run_forever
 from windows_agent.job_runner import JobRunner
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_runner_passes_single_start_gate_to_native_factory(tmp_path, monkeypatch, enabled):
+    import windows_agent.agent_daemon as daemon
+    from windows_agent.runtime_config import AgentRuntimeConfig
+
+    config = AgentRuntimeConfig(
+        base_url="https://agent.example/trading-agent", poll_seconds=5, secrets_root=tmp_path / "secrets",
+        instances_root=tmp_path / "instances", instance_pool_target_size=0,
+        mt5_single_start_enabled=enabled,
+    )
+    monkeypatch.setattr(daemon, "build_api_client", lambda _config: QueueApi([]))
+    monkeypatch.setattr(daemon, "reconcile_startup_instances", lambda *_args: Mock(
+        adopted=(), missing=(), terminated=(), blocked=()
+    ))
+    handlers = Mock(return_value={"provision": lambda _job: {}})
+    monkeypatch.setattr(daemon, "build_real_handlers", handlers)
+    daemon.build_runner(config, state_path=tmp_path / "state.json")
+    factory = handlers.call_args.kwargs["runtime_factory"]
+    runtime = factory(tmp_path / "isolated", "00000000-0000-4000-8000-000000000001")
+    assert runtime._single_start_enabled is enabled
+    assert runtime._bootstrap_symbol_cache.root == tmp_path / "state" / "broker-bootstrap-symbols"
+    assert not runtime._bootstrap_symbol_cache.root.exists()
 
 
 class QueueApi:

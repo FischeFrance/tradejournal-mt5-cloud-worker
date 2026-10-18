@@ -1302,6 +1302,80 @@ def test_provision_authorization_error_maps_to_mt5_authorization_failed(env):
 
 
 @pytest.mark.parametrize(
+    ("failure_code", "expected_code", "expected_invalidation"),
+    [
+        ("authorization_failed", "mt5_authorization_failed", None),
+        ("authorization_timeout", "mt5_initialize_failed", None),
+        (
+            "endpoint_connection_refused",
+            "mt5_initialize_failed",
+            "ENDPOINT_CONNECTION_REFUSED",
+        ),
+    ],
+)
+def test_native_provision_failure_reaches_control_plane_with_exact_error_code(
+    env,
+    monkeypatch,
+    failure_code,
+    expected_code,
+    expected_invalidation,
+):
+    cid = str(uuid4())
+    job = _job("provision", cid, payload=_provision_payload())
+    endpoint = _verified_endpoint()
+    invalidations: list[EndpointInvalidation] = []
+    started: list[str] = []
+
+    class QueueApi(FakeApi):
+        def claim(self):
+            return job
+
+    class FailingNativeRuntime:
+        def __init__(self, root, connection_id):
+            assert root == env.instances_root / cid
+            assert connection_id == cid
+
+        def set_cancel_check(self, check):
+            assert callable(check)
+
+        def start(self, **kwargs):
+            assert kwargs["investor_password"] == "investor-pw"
+            started.append(kwargs["connection_endpoint"])
+            raise real_handlers.NativeMt5Error(failure_code)
+
+    monkeypatch.setattr(real_handlers.ProcessManager, "find", lambda _path: [])
+    api = QueueApi()
+    handlers = build_real_handlers(
+        api,
+        instances_root=env.instances_root,
+        secrets_root=env.secrets_root,
+        source_terminal=env.source_terminal,
+        process_factory=FakeProcessManager,
+        runtime_factory=FailingNativeRuntime,
+        endpoint_resolver=lambda _label, _server: endpoint,
+        endpoint_invalidator=invalidations.append,
+    )
+    state = env.instances_root.parent / "job-state.json"
+
+    assert JobRunner(state, api, handlers).run_once() is True
+
+    assert started == [endpoint.server_address]
+    assert api.transitions == [
+        ("running", None),
+        ("fail", {"error_code": expected_code}),
+    ]
+    assert read_json(state)["status"] == "failed"
+    assert not (env.instances_root / cid).exists()
+    assert not (env.secrets_root / cid).exists()
+    if expected_invalidation is None:
+        assert invalidations == []
+    else:
+        assert len(invalidations) == 1
+        assert invalidations[0].endpoint is endpoint
+        assert invalidations[0].reason == expected_invalidation
+
+
+@pytest.mark.parametrize(
     ("failure_code", "expected_reason", "expected_error_code"),
     [
         (

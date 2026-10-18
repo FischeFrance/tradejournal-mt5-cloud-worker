@@ -279,6 +279,381 @@ def test_start_uses_portable_config_and_removes_plaintext(tmp_path: Path) -> Non
     assert "InpCandleBars=200\n</inputs>" in template
 
 
+def _single_start_case(
+    tmp_path, monkeypatch, *, build=6249, enabled=True, account=None, hint=True, cache=True,
+):
+    """Exercise real config, journal, discovery and producer guards without launching MT5."""
+    base = _runtime(tmp_path)
+    runtime = NativeMt5Runtime(
+        tmp_path, base.connection_id, single_start_enabled=enabled,
+        bootstrap_symbol_cache=tmp_path / "bootstrap-cache" if cache else None,
+    )
+    expert = tmp_path / "bridge.ex5"
+    expert.write_bytes(b"expert")
+    monkeypatch.setattr(WindowsSecretStore, "restrict_acl", staticmethod(lambda path: None))
+    monkeypatch.setattr(WindowsSecretStore, "restrict_shared_service_acl", staticmethod(lambda path: None))
+    if hint and runtime._bootstrap_symbol_cache is not None:
+        assert runtime._bootstrap_symbol_cache.store_verified(
+            canonical_server="Demo", terminal_build=build, preferred_base="EURUSD",
+            verified_symbol="EURUSD.raw",
+        )
+    build_reader = Mock(return_value=build)
+    monkeypatch.setattr("windows_agent.worker.native_mt5_runtime.read_windows_pe_build", build_reader)
+    alive = []
+    launches = []
+    journal_lines = [
+        "'42': authorized on Demo through access point\r\n",
+        "'42': terminal synchronized with Demo Ltd.\r\n",
+        "'42': trading has been disabled - investor mode\r\n",
+    ]
+
+    def launch(config):
+        launches.append(config.read_text(encoding="utf-8"))
+        alive[:] = [100 + len(launches)]
+        accounts = runtime.terminal_root / "Config" / "accounts.dat"
+        accounts.parent.mkdir(exist_ok=True)
+        accounts.write_bytes(b"encrypted-fixture")
+        logs = runtime.terminal_root / "logs"
+        logs.mkdir(exist_ok=True)
+        with (logs / "20261010.log").open("ab") as handle:
+            handle.write("".join(journal_lines).encode("utf-16-le"))
+        discovered = _discovery_result(runtime)
+        discovered["terminal_build"] = build
+        (runtime.files / "discovered-symbol.json").write_text(json.dumps(discovered), encoding="utf-8")
+
+    def stop(**_kwargs):
+        alive.clear()
+        return True
+
+    original_handoff = runtime._publish_bridge_handoff
+
+    def handoff():
+        marker = original_handoff()
+        (runtime.files / "account.json").write_text(_envelope(account or {
+            "login": "42", "server": "Demo", "trade_allowed": False,
+        }), encoding="utf-8")
+        (runtime.files / "heartbeat.json").write_text(
+            _envelope({"terminal_connected": True}), encoding="utf-8"
+        )
+        return marker
+
+    stop_mock = Mock(side_effect=stop)
+    handoff_mock = Mock(side_effect=handoff)
+    monkeypatch.setattr(runtime, "_start_process", launch)
+    monkeypatch.setattr(runtime, "_running_terminal_pids", lambda: alive[:])
+    monkeypatch.setattr(runtime, "stop", stop_mock)
+    monkeypatch.setattr(runtime, "_publish_bridge_handoff", handoff_mock)
+    monkeypatch.setattr(runtime, "set_terminal_window_visibility", lambda *_args, **_kwargs: {})
+    return runtime, expert, launches, journal_lines, stop_mock, handoff_mock, build_reader
+
+
+def test_verified_single_start_uses_one_process_and_removes_credentials(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, build_reader = _single_start_case(tmp_path, monkeypatch)
+    result = runtime.start(login=42, server="Demo", investor_password="fixture-password", expert_binary=expert)
+    assert result.pid == 101
+    assert len(launches) == 1
+    assert "Script=TradeJournal\\TradeJournalDiscovery" in launches[0]
+    assert "Symbol=EURUSD.raw" in launches[0]
+    assert (runtime.files / "symbol-preference.txt").read_text() == "EURUSD"
+    assert "Password=fixture-password" in launches[0]
+    assert "AllowLiveTrading=0" in launches[0]
+    assert "AllowDllImport=0" in launches[0]
+    assert not (runtime.state / "single-start.ini").exists()
+    stop.assert_not_called()
+    handoff.assert_called_once()
+    build_reader.assert_called_once_with(runtime.terminal)
+    assert runtime._bridge_template_symbol() == "EURUSD.raw"
+
+
+@pytest.mark.parametrize("build,enabled", [(6032, True), (6250, True), (6249, False)])
+def test_single_start_gate_retains_legacy_bootstrap_for_other_builds(tmp_path, monkeypatch, build, enabled):
+    runtime, expert, launches, _, stop, _, build_reader = _single_start_case(
+        tmp_path, monkeypatch, build=build, enabled=enabled
+    )
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    assert "Script=" not in launches[0]
+    assert "Enabled=0" in launches[0]
+    assert "Script=TradeJournal\\TradeJournalDiscovery" in launches[1]
+    stop.assert_called_once()
+    assert build_reader.call_count == 1  # Gate read, or post-success PE confirmation for learning.
+
+
+@pytest.mark.parametrize("invalid", ["absent", "corrupt", "expired", "server", "build", "preferred"])
+def test_single_start_invalid_hint_keeps_legacy_and_learns_only_after_success(tmp_path, monkeypatch, invalid):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch, hint=False)
+    cache = runtime._bootstrap_symbol_cache
+    if invalid != "absent":
+        assert cache.store_verified(
+            canonical_server="Other" if invalid == "server" else "Demo",
+            terminal_build=6032 if invalid == "build" else 6249,
+            preferred_base="GBPUSD" if invalid == "preferred" else "EURUSD",
+            verified_symbol="GBPUSD.other",
+        )
+        path = next(cache.root.glob("*.json"))
+        if invalid == "corrupt":
+            path.write_text("{invalid", encoding="utf-8")
+        elif invalid == "expired":
+            record = json.loads(path.read_text())
+            record["verified_at"] -= cache.MAX_AGE_SECONDS + 1
+            path.write_text(json.dumps(record))
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    assert "Script=" not in launches[0]
+    assert "Symbol=GBPUSD.other" not in "".join(launches)
+    stop.assert_called_once()
+    assert cache.lookup(canonical_server="Demo", terminal_build=6249, preferred_base="EURUSD") == "EURUSD.raw"
+
+
+def test_single_start_flag_without_optional_cache_preserves_legacy(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch, cache=False)
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    stop.assert_called_once()
+
+
+def test_single_start_uninspectable_build_preserves_legacy_without_learning(tmp_path, monkeypatch):
+    from windows_agent.provisioning.mt5_public_release import Mt5PublicReleaseError
+
+    runtime, expert, launches, _, stop, _, reader = _single_start_case(tmp_path, monkeypatch, hint=False)
+    reader.side_effect = Mt5PublicReleaseError("fixture invalid PE")
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    stop.assert_called_once()
+    assert not runtime._bootstrap_symbol_cache.root.exists()
+
+
+@pytest.mark.parametrize("code", ["identity_mismatch", "investor_readonly_not_verified", "terminal_not_ready"])
+def test_legacy_failed_producer_proof_never_learns_bootstrap_hint(tmp_path, monkeypatch, code):
+    runtime, expert, _, _, _, _, _ = _single_start_case(tmp_path, monkeypatch, enabled=False, hint=False)
+    monkeypatch.setattr(runtime, "_wait_for_heartbeat", Mock(side_effect=NativeMt5Error(code)))
+    with pytest.raises(NativeMt5Error, match=code):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert not runtime._bootstrap_symbol_cache.root.exists()
+
+
+def test_legacy_mismatched_discovery_and_pe_build_do_not_learn_hint(tmp_path, monkeypatch):
+    runtime, expert, launches, _, _, _, reader = _single_start_case(
+        tmp_path, monkeypatch, enabled=False, hint=False,
+    )
+    reader.return_value = 6250
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    assert not runtime._bootstrap_symbol_cache.root.exists()
+
+
+def test_verified_single_start_rechecks_wrong_hint_and_recovers_in_two_launches(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch)
+    cache = runtime._bootstrap_symbol_cache
+    assert cache.store_verified(
+        canonical_server="Demo", terminal_build=6249, preferred_base="EURUSD", verified_symbol="EURUSD.old",
+    )
+    original = runtime._probe_broker_symbol
+    calls = 0
+
+    def probe(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            selected = runtime.terminal_root / "Bases" / "Demo" / "symbols" / "selected-42.dat"
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes("EURUSD.raw\0".encode("utf-16-le"))
+            raise NativeMt5Error("broker_symbol_probe_failed")
+        return original(*args)
+
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", probe)
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    assert "Symbol=EURUSD.old" in launches[0]
+    assert "Symbol=EURUSD.raw" in launches[1]
+    assert (runtime.files / "symbol-preference.txt").read_text() == "EURUSD"
+    stop.assert_called_once()
+    assert cache.lookup(canonical_server="Demo", terminal_build=6249, preferred_base="EURUSD") == "EURUSD.raw"
+
+
+@pytest.mark.parametrize("code", sorted(NativeMt5Runtime._SINGLE_START_RETRYABLE))
+def test_single_start_timeout_retries_only_once_on_warmed_instance(tmp_path, monkeypatch, code):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch)
+    original_probe = runtime._probe_broker_symbol
+    calls = 0
+
+    def probe(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            selected = runtime.terminal_root / "Bases" / "Demo" / "symbols" / "selected-42.dat"
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes("EURUSD.raw\0".encode("utf-16-le"))
+            raise NativeMt5Error(code)
+        return original_probe(*args)
+
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", probe)
+    result = runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert result.pid == 102
+    assert len(launches) == 2
+    assert "Symbol=EURUSD.raw" in launches[1]
+    stop.assert_called_once()
+    assert not (runtime.state / "single-start.ini").exists()
+
+
+@pytest.mark.parametrize("line,code", [
+    ("'42': authorization failed (Invalid account)\r\n", "authorization_failed"),
+    ("'42': trading has been enabled\r\n", "investor_readonly_not_verified"),
+])
+def test_single_start_credential_and_master_access_fail_without_retry(tmp_path, monkeypatch, line, code):
+    runtime, expert, launches, lines, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    if code == "authorization_failed":
+        lines[:] = [line]
+    else:
+        lines.append(line)
+    with pytest.raises(NativeMt5Error, match=code):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    stop.assert_called_once()
+    handoff.assert_not_called()
+    assert not (runtime.state / "single-start.ini").exists()
+
+
+@pytest.mark.parametrize("account,code", [
+    ({"login": "99", "server": "Demo", "trade_allowed": False}, "identity_mismatch"),
+    ({"login": "42", "server": "Other", "trade_allowed": False}, "server_identity_mismatch"),
+    ({"login": "42", "server": "Demo", "trade_allowed": True}, "investor_readonly_not_verified"),
+])
+def test_single_start_producer_identity_failure_never_retries(tmp_path, monkeypatch, account, code):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch, account=account)
+    with pytest.raises(NativeMt5Error, match=code):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    stop.assert_called_once()
+
+
+def test_single_start_second_timeout_does_not_start_a_third_process(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", Mock(side_effect=NativeMt5Error("broker_symbol_probe_failed")))
+    with pytest.raises(NativeMt5Error, match="broker_symbol_probe_failed"):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 2
+    assert stop.call_count == 2
+    handoff.assert_not_called()
+
+
+def test_single_start_cancellation_prevents_warm_retry_and_cleans_config(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    cancelled = False
+
+    def guard():
+        if cancelled:
+            raise RuntimeError("fixture lease lost")
+
+    def probe(*_args):
+        nonlocal cancelled
+        cancelled = True
+        raise NativeMt5Error("broker_symbol_probe_failed")
+
+    runtime.set_cancel_check(guard)
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", probe)
+    with pytest.raises(RuntimeError, match="fixture lease lost"):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    stop.assert_called_once()
+    handoff.assert_not_called()
+    assert not (runtime.state / "single-start.ini").exists()
+
+
+def test_single_start_exhausted_global_budget_prevents_another_launch(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr("windows_agent.worker.native_mt5_runtime.time.monotonic", lambda: clock[0])
+
+    def authorize(*_args):
+        clock[0] = 10.0
+        raise NativeMt5Error("authorization_timeout")
+
+    monkeypatch.setattr(runtime, "_wait_for_authorization", authorize)
+    with pytest.raises(NativeMt5Error, match="cold_start_timeout"):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert, timeout=10)
+    assert len(launches) == 1
+    stop.assert_called_once()
+    handoff.assert_not_called()
+
+
+def test_single_start_warm_retry_uses_remaining_global_budget(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, _, _ = _single_start_case(tmp_path, monkeypatch)
+    clock = [0.0]
+    budgets = []
+    original = runtime._wait_for_authorization
+    monkeypatch.setattr("windows_agent.worker.native_mt5_runtime.time.monotonic", lambda: clock[0])
+
+    def authorize(*args):
+        budgets.append(args[3])
+        if len(budgets) == 1:
+            clock[0] = 7.0
+            raise NativeMt5Error("authorization_timeout")
+        return original(*args)
+
+    monkeypatch.setattr(runtime, "_wait_for_authorization", authorize)
+    runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert, timeout=10)
+    assert budgets == [10.0, 3.0]
+    assert len(launches) == 2
+    stop.assert_called_once_with(timeout=3.0)
+
+
+def test_single_start_failed_cleanup_prevents_another_launch(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", Mock(side_effect=NativeMt5Error("broker_symbol_probe_failed")))
+    stop.side_effect = None
+    stop.return_value = False
+    with pytest.raises(NativeMt5Error, match="terminal_stop_failed"):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    assert stop.call_count == 2  # Retry cleanup fails; final failure cleanup still runs.
+    handoff.assert_not_called()
+
+
+def test_single_start_stale_handoff_marker_prevents_launch(tmp_path, monkeypatch):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    runtime.files.mkdir(parents=True)
+    (runtime.files / "bridge-ready").write_text("old ready")
+    monkeypatch.setattr(runtime, "_remove_readiness_files", lambda: None)
+    with pytest.raises(NativeMt5Error, match="cold_start_cleanup_failed"):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert not launches
+    stop.assert_called_once()
+    handoff.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", [{"terminal_build": 6250}, {"login": 99}])
+def test_single_start_rejects_changed_build_or_uncorrelated_discovery_before_bridge(tmp_path, monkeypatch, mutation):
+    runtime, expert, launches, _, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    original = runtime._probe_broker_symbol
+
+    def probe(*args):
+        path = runtime.files / "discovered-symbol.json"
+        result = json.loads(path.read_text())
+        result.update(mutation)
+        path.write_text(json.dumps(result))
+        return original(*args)
+
+    monkeypatch.setattr(runtime, "_probe_broker_symbol", probe)
+    code = "terminal_build_mismatch" if "terminal_build" in mutation else "broker_symbol_probe_invalid"
+    with pytest.raises(NativeMt5Error, match=code):
+        runtime.start(login=42, server="Demo", investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    stop.assert_called_once()
+    handoff.assert_not_called()
+
+
+def test_single_start_endpoint_rejection_never_retries(tmp_path, monkeypatch):
+    runtime, expert, launches, lines, stop, handoff, _ = _single_start_case(tmp_path, monkeypatch)
+    lines[:] = ["'42': connection to 203.0.113.10:443 failed\r\n"]
+    with pytest.raises(NativeMt5Error, match="endpoint_connection_failed"):
+        runtime.start(login=42, server="Demo", connection_endpoint="203.0.113.10:443",
+                      investor_password="fixture", expert_binary=expert)
+    assert len(launches) == 1
+    stop.assert_called_once()
+    handoff.assert_not_called()
+
+
 def test_remove_generated_example_code_removes_only_known_paths(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     generated = runtime.terminal_root / "MQL5" / "Scripts" / "Examples" / "Demo.mq5"

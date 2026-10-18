@@ -46,6 +46,7 @@ def test_load_runtime_config_defaults(tmp_path):
     assert config.broker_wizard_enabled is False
     assert config.mtapi_search_enabled is True
     assert config.mt5_interactive_user == ""
+    assert config.mt5_single_start_enabled is False
 
 
 def test_load_runtime_config_overrides(tmp_path):
@@ -123,6 +124,26 @@ def test_runtime_config_rejects_invalid_broker_wizard_gate(value):
                 **PIN_ENV,
             }
         )
+
+
+@pytest.mark.parametrize("value,enabled", [("", False), ("0", False), ("1", True)])
+def test_runtime_config_single_start_requires_explicit_opt_in(value, enabled):
+    config = load_runtime_config(env={
+        "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+        "TRADEJOURNAL_MT5_SINGLE_START_ENABLED": value,
+        **PIN_ENV,
+    })
+    assert config.mt5_single_start_enabled is enabled
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", "-1"])
+def test_runtime_config_rejects_invalid_single_start_gate(value):
+    with pytest.raises(ValueError, match="TRADEJOURNAL_MT5_SINGLE_START_ENABLED"):
+        load_runtime_config(env={
+            "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+            "TRADEJOURNAL_MT5_SINGLE_START_ENABLED": value,
+            **PIN_ENV,
+        })
 
 
 def test_runtime_config_requires_dedicated_user_when_wizard_is_enabled():
