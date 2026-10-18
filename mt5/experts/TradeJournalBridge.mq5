@@ -18,7 +18,7 @@
 //+------------------------------------------------------------------------+
 #property copyright "TradeJournal"
 #property link      ""
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 #property description "EA read-only: scrive account/posizioni/ordini/eventi/candele su file JSON. Nessuna funzione di trading."
 
@@ -716,7 +716,8 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
                        const double stop_loss, const double take_profit, const double profit,
                        const double commission, const double swap, const long magic,
                        const string comment, const string entry, const datetime event_time,
-                       long timestamp_msc)
+                       long timestamp_msc, const long order_type = -1,
+                       const long order_state = -1)
   {
    // Riserva la sequenza su disco PRIMA di pubblicare event-N.json. In caso di crash fra le due
    // operazioni resta al massimo un gap (accettato dal consumer), mai il riuso di N con
@@ -779,6 +780,10 @@ string BuildEventJson(const string event_type, const long ticket, const long pos
    json += "\"magic\":" + IntegerToString(magic) + ",";
    json += "\"comment\":" + JsonString(comment) + ",";
    json += "\"entry\":" + (entry == "" ? "null" : JsonString(entry)) + ",";
+   // ORDER_TYPE and ORDER_STATE let the consumer tell a genuine limit/stop order from the
+   // transient order MT5 creates for every market execution, and a fill from a cancellation.
+   json += "\"order_type\":" + (order_type >= 0 ? IntegerToString(order_type) : "null") + ",";
+   json += "\"order_state\":" + (order_state >= 0 ? IntegerToString(order_state) : "null") + ",";
    json += "\"time\":" + JsonString(Iso8601FromDatetime(event_time));
    json += "}";
    return json;
@@ -939,6 +944,7 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
   {
    string   symbol;
    long     type;
+   long     state = -1;
    double   volume, price, sl, tp;
    long     magic;
    string   comment;
@@ -949,6 +955,7 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
      {
       symbol      = OrderGetString(ORDER_SYMBOL);
       type        = OrderGetInteger(ORDER_TYPE);
+      state       = OrderGetInteger(ORDER_STATE);
       volume      = OrderGetDouble(ORDER_VOLUME_CURRENT);
       price       = OrderGetDouble(ORDER_PRICE_OPEN);
       sl          = OrderGetDouble(ORDER_SL);
@@ -964,6 +971,7 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
       // scaduto o cancellato): in quel caso non e' piu' selezionabile tra gli attivi.
       symbol      = HistoryOrderGetString(order_ticket, ORDER_SYMBOL);
       type        = HistoryOrderGetInteger(order_ticket, ORDER_TYPE);
+      state       = HistoryOrderGetInteger(order_ticket, ORDER_STATE);
       volume      = HistoryOrderGetDouble(order_ticket, ORDER_VOLUME_CURRENT);
       price       = HistoryOrderGetDouble(order_ticket, ORDER_PRICE_OPEN);
       sl          = HistoryOrderGetDouble(order_ticket, ORDER_SL);
@@ -978,7 +986,8 @@ void EmitOrderEvent(const string event_type, const ulong order_ticket)
 
    string line = BuildEventJson(event_type, (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
-                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
+                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc,
+                                 type, state);
    WriteEventAtomic(line);
   }
 
@@ -1012,6 +1021,7 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
 
    string   symbol      = HistoryOrderGetString(order_ticket, ORDER_SYMBOL);
    long     type        = HistoryOrderGetInteger(order_ticket, ORDER_TYPE);
+   long     state       = HistoryOrderGetInteger(order_ticket, ORDER_STATE);
    double   volume      = HistoryOrderGetDouble(order_ticket, ORDER_VOLUME_CURRENT);
    double   price       = HistoryOrderGetDouble(order_ticket, ORDER_PRICE_OPEN);
    double   sl          = HistoryOrderGetDouble(order_ticket, ORDER_SL);
@@ -1023,7 +1033,8 @@ void EmitHistoryOrderEvent(const ulong order_ticket)
 
    string line = BuildEventJson("HISTORY_ADD", (long)order_ticket, 0, (long)order_ticket, 0,
                                  symbol, DirectionFromType(type), volume, price, sl, tp,
-                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc);
+                                 0.0, 0.0, 0.0, magic, comment, "", event_time, timestamp_msc,
+                                 type, state);
    WriteEventAtomic(line);
   }
 

@@ -64,6 +64,7 @@ _FINGERPRINT_FIELDS = {
         "previous_take_profit",
     ),
     "pending_order_cancelled": ("symbol", "direction", "volume", "price"),
+    "pending_order_filled": ("symbol", "direction", "volume", "price"),
     "trade_volume_changed": ("volume", "previous_volume", "partial_close"),
     "deal_recorded": (
         "position_ticket",
@@ -219,6 +220,10 @@ def normalize_event(
             payload["broker_offset_observed_at"] = event["broker_offset_observed_at"]
     if event.get("commission_complete") is not None:
         payload["commission_complete"] = bool(event["commission_complete"])
+    if event.get("order_type") is not None:
+        # The app keeps only genuine limit/stop orders (2-7) as pending; market tickets (0/1)
+        # and untyped legacy events stay out. Not part of the fingerprint: same id as before.
+        payload["order_type"] = str(event["order_type"])
     if event.get("previous_volume") is not None:
         payload["previous_volume"] = event["previous_volume"]
     if event.get("partial_close") is not None:

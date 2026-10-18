@@ -113,6 +113,48 @@ def _authoritative_symbol(record: dict, previous: dict, current: dict) -> str | 
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
+# MT5 ENUM_ORDER_STATE: ORDER_STATE_FILLED.  Every other terminal state (cancelled, expired,
+# rejected) keeps the historical "pending_order_cancelled" meaning.
+_ORDER_STATE_FILLED = 4
+
+
+def _order_number(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _native_order_type(record: dict, previous: dict, current: dict) -> int | None:
+    """ORDER_TYPE of this order: from the event itself, else from the bound orders snapshot.
+
+    Bridges before 1.01 did not write it on transaction events; the active-orders snapshot has
+    always carried it, so a genuine limit/stop order is still recognised once it has been seen.
+    A market order that fills between two polls never reaches that snapshot and stays unknown.
+    """
+
+    native = _order_number(record.get("order_type"))
+    if native is not None:
+        return native
+    order_ids = _identifiers(record.get("order_id"), record.get("ticket"))
+    for snapshot in (current, previous):
+        rows = snapshot.get("orders") if isinstance(snapshot, dict) else None
+        if not isinstance(rows, dict):
+            continue
+        for key, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            if order_ids.isdisjoint(_identifiers(key, row.get("ticket"), row.get("order_id"))):
+                continue
+            native = _order_number(row.get("order_type", row.get("type")))
+            if native is not None:
+                return native
+    return None
+
+
 def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
     event_type = str(record.get("event_type", "")).upper()
     position_ticket = record.get("position_id") or record.get("position_ticket")
@@ -232,26 +274,31 @@ def _mql5_file_event(record: dict, previous: dict, current: dict) -> dict:
                 else None
             ),
         }
-    if event_type == "ORDER_ADD":
+    if event_type in ("ORDER_ADD", "ORDER_UPDATE", "ORDER_DELETE", "HISTORY_ADD"):
+        order_type = _native_order_type(record, previous, current)
+        order_base = {**base}
+        if order_type is not None:
+            order_base["order_type"] = order_type
+        if event_type == "ORDER_ADD":
+            return {
+                **order_base,
+                "event_type": "pending_order_created",
+                "price": record.get("price"),
+                "stop_loss": record.get("stop_loss"),
+                "take_profit": record.get("take_profit"),
+            }
+        if event_type == "ORDER_UPDATE":
+            return {
+                **order_base,
+                "event_type": "pending_order_modified",
+                "price": record.get("price"),
+                "stop_loss": record.get("stop_loss"),
+                "take_profit": record.get("take_profit"),
+            }
+        filled = _order_number(record.get("order_state")) == _ORDER_STATE_FILLED
         return {
-            **base,
-            "event_type": "pending_order_created",
-            "price": record.get("price"),
-            "stop_loss": record.get("stop_loss"),
-            "take_profit": record.get("take_profit"),
-        }
-    if event_type == "ORDER_UPDATE":
-        return {
-            **base,
-            "event_type": "pending_order_modified",
-            "price": record.get("price"),
-            "stop_loss": record.get("stop_loss"),
-            "take_profit": record.get("take_profit"),
-        }
-    if event_type in ("ORDER_DELETE", "HISTORY_ADD"):
-        return {
-            **base,
-            "event_type": "pending_order_cancelled",
+            **order_base,
+            "event_type": "pending_order_filled" if filled else "pending_order_cancelled",
             "price": record.get("price"),
         }
     return {
