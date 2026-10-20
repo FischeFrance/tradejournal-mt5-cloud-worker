@@ -124,6 +124,7 @@ class Mt5MaintenanceCoordinator:
         ) = None,
         scope_refresh: Callable[[], None] | None = None,
         connection_allowed: Callable[[str], bool] | None = None,
+        scope_exclude: Callable[[frozenset[str]], None] | None = None,
     ) -> None:
         self.instances_root = Path(instances_root).resolve()
         self.expert_binary = Path(expert_binary).resolve()
@@ -140,6 +141,37 @@ class Mt5MaintenanceCoordinator:
         self.public_release_inventory = public_release_inventory
         self.scope_refresh = scope_refresh
         self.connection_allowed = connection_allowed or (lambda _cid: True)
+        self.scope_exclude = scope_exclude
+
+    def _exclude_unverifiable(
+        self,
+        records: tuple[Mt5InstanceReleaseInventory, ...],
+    ) -> tuple[Mt5InstanceReleaseInventory, ...]:
+        """Leave terminals whose release state cannot be verified out of tonight.
+
+        An unverifiable terminal is never stopped, rotated or used as a canary.
+        Excluding only that account keeps the rest of the fleet maintained, as
+        the ticket-baseline preflight already does. When nothing is verifiable
+        the cause is shared and the pass still stops.
+        """
+        unverifiable = tuple(
+            record for record in records if record.classification == "unverifiable"
+        )
+        if not unverifiable:
+            return records
+        if self.scope_exclude is None or len(unverifiable) == len(records):
+            raise Mt5MaintenanceError("MT5 public fleet contains unverifiable state")
+        excluded = frozenset(record.connection_id for record in unverifiable)
+        for record in unverifiable:
+            logger.warning(
+                "MT5 maintenance excludes %s from tonight's rotation: release state unverifiable (%s)",
+                record.connection_id,
+                record.failure,
+            )
+        self.scope_exclude(excluded)
+        if any(self.connection_allowed(connection_id) for connection_id in excluded):
+            raise Mt5MaintenanceError("MT5 maintenance scope exclusion failed")
+        return tuple(record for record in records if record.connection_id not in excluded)
 
     def _current_release(self) -> Mt5TemplateRelease:
         with self.template_lock:
@@ -1232,7 +1264,11 @@ class Mt5MaintenanceCoordinator:
             terminal_sha256=target.terminal_sha256,
         )
         try:
-            records = tuple(inventory.scan(comparison))
+            records = tuple(
+                record
+                for record in inventory.scan(comparison)
+                if self.connection_allowed(record.connection_id)
+            )
         except Exception as exc:
             raise Mt5MaintenanceError("MT5 public fleet inventory failed") from exc
         if any(record.classification == "unverifiable" for record in records):
@@ -1398,13 +1434,11 @@ class Mt5MaintenanceCoordinator:
         public_validated: set[str] = set()
         if public_enabled:
             baseline, public_records = self._refresh_public_baseline()
-            if any(
-                record.classification == "unverifiable"
-                for record in public_records
-            ):
-                raise Mt5MaintenanceError(
-                    "MT5 public fleet contains unverifiable state"
-                )
+            scanned = len(public_records)
+            public_records = self._exclude_unverifiable(public_records)
+            if len(public_records) != scanned:
+                # Excluded terminals must not serve as tonight's broker canaries.
+                canaries = self._canaries(previous)
             golden_build = self._public_build(
                 self.template_manager.source_terminal
             )

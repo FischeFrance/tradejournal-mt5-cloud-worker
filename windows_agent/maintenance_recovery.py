@@ -84,6 +84,12 @@ class MaintenanceRecovery:
         self.connection_ids = frozenset(ready)
         self.skipped_connection_ids = frozenset(failures)
 
+    def exclude(self, connection_ids: frozenset[str]) -> None:
+        """Remove accounts from tonight's scope after a later preflight check."""
+        excluded = frozenset(connection_ids) & self.connection_ids
+        self.connection_ids = self.connection_ids - excluded
+        self.skipped_connection_ids = self.skipped_connection_ids | excluded
+
     def identity(self, connection_id: str) -> tuple[int, str]:
         return int(self.secrets.read(connection_id, "mt5_login")), self.secrets.read(connection_id, "mt5_server")
 

@@ -87,3 +87,15 @@ def test_a_missing_ticket_reader_still_stops_the_whole_run(tmp_path, monkeypatch
     with pytest.raises(MaintenanceRecoveryUnavailable):
         recovery.refresh_for_rotation()
     assert captured == []
+
+
+def test_a_later_preflight_check_can_remove_one_account_from_tonight(tmp_path, monkeypatch):
+    first, second = sorted(str(uuid4()) for _ in range(2))
+    recovery, _captured = _recovery(tmp_path, monkeypatch, [first, second], failing=set())
+    recovery.refresh_for_rotation()
+
+    recovery.exclude(frozenset({second, str(uuid4())}))
+
+    assert recovery.allows(first)
+    assert not recovery.allows(second)
+    assert recovery.skipped_connection_ids == frozenset({second})

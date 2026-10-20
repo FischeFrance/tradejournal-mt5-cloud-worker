@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, RLock
 from types import SimpleNamespace
@@ -1669,3 +1670,105 @@ def test_failed_rotation_recovery_blocks_all_maintenance_mutations(
     assert runtime.stop_calls == 0
     assert manager.promotions == 0
     assert pool.calls == []
+
+
+class _Scope:
+    def __init__(self, connection_ids: list[str]) -> None:
+        self.connection_ids = set(connection_ids)
+        self.excluded: list[frozenset[str]] = []
+
+    def allows(self, connection_id: str) -> bool:
+        return connection_id in self.connection_ids
+
+    def exclude(self, connection_ids: frozenset[str]) -> None:
+        self.excluded.append(frozenset(connection_ids))
+        self.connection_ids -= set(connection_ids)
+
+
+class _ScopedPublicInventory(FakePublicInventory):
+    def __init__(self, instances: Path, rotator: FakeRotator, scope: _Scope, unverifiable: set[str]) -> None:
+        super().__init__(instances, rotator)
+        self.scope = scope
+        self.unverifiable = unverifiable
+
+    def scan(self, baseline: Mt5PublicRelease) -> tuple[Mt5InstanceReleaseInventory, ...]:
+        records = []
+        for record in super().scan(baseline):
+            if not self.scope.allows(record.connection_id):
+                continue
+            if record.connection_id in self.unverifiable:
+                record = replace(
+                    record,
+                    classification="unverifiable",
+                    failure="state_invalid",
+                    state_integrity=False,
+                )
+            records.append(record)
+        return tuple(records)
+
+
+def _scoped_coordinator(tmp_path: Path, unverifiable_indexes: set[int], *, with_exclusion: bool = True):
+    ids, instances, expert, manager, rotator, secrets = _fixture(
+        tmp_path,
+        ("Broker-A", "Broker-A", "Broker-B"),
+    )
+    scope = _Scope(ids)
+    unverifiable = {ids[index] for index in unverifiable_indexes}
+    coordinator = _coordinator(
+        instances,
+        expert,
+        manager,
+        rotator,
+        secrets,
+        RuntimeController(),
+        FakePool(),
+        None,
+        FakePublicProbe(_public_release(manager)),
+        _ScopedPublicInventory(instances, rotator, scope, unverifiable),
+    )
+    coordinator.connection_allowed = scope.allows
+    if with_exclusion:
+        coordinator.scope_exclude = scope.exclude
+    return ids, manager, rotator, scope, coordinator
+
+
+def test_unverifiable_account_is_left_out_and_the_rest_is_maintained(tmp_path: Path, caplog) -> None:
+    ids, manager, rotator, scope, coordinator = _scoped_coordinator(tmp_path, {2})
+
+    report = coordinator.run_once(Event())
+
+    assert scope.excluded == [frozenset({ids[2]})]
+    assert ids[2] not in rotator.current
+    assert all(connection_id != ids[2] for connection_id, _force in rotator.rotate_one_calls)
+    assert rotator.current == {ids[0], ids[1]}
+    assert manager.commits == 1
+    assert ids[2] not in report.checked_connections
+    assert ids[2] in caplog.text
+
+
+def test_unverifiable_canary_does_not_stop_its_broker_peer(tmp_path: Path) -> None:
+    ids, manager, rotator, scope, coordinator = _scoped_coordinator(tmp_path, {0})
+
+    coordinator.run_once(Event())
+
+    assert scope.excluded == [frozenset({ids[0]})]
+    assert ids[0] not in rotator.current
+    assert rotator.current == {ids[1], ids[2]}
+
+
+def test_the_pass_stops_when_no_account_is_verifiable(tmp_path: Path) -> None:
+    _ids, manager, rotator, _scope, coordinator = _scoped_coordinator(tmp_path, {0, 1, 2})
+
+    with pytest.raises(Mt5MaintenanceError, match="unverifiable state"):
+        coordinator.run_once(Event())
+    assert manager.commits == 0
+    assert rotator.rotate_one_calls == []
+
+
+def test_without_scope_exclusion_an_unverifiable_account_still_stops_the_pass(tmp_path: Path) -> None:
+    _ids, manager, rotator, _scope, coordinator = _scoped_coordinator(tmp_path, {2}, with_exclusion=False)
+
+    with pytest.raises(Mt5MaintenanceError, match="unverifiable state"):
+        coordinator.run_once(Event())
+    assert manager.commits == 0
+    assert rotator.rotate_one_calls == []

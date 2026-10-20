@@ -150,6 +150,7 @@ def build_runner(
                 runtime_factory=recovery.runtime,
                 scope_refresh=recovery.refresh_for_rotation,
                 connection_allowed=recovery.allows,
+                scope_exclude=recovery.exclude,
                 pending_update_store=pending_update_store,
                 public_release_probe=Mt5PublicReleaseProbe(
                     config.mt5_maintenance_state_path.parent / "mt5-public-releases",
