@@ -1,6 +1,7 @@
 """Assigned-account maintenance and lease-bound restart-gap recovery."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ from .worker.native_mt5_runtime import NativeMt5Runtime as CurrentNativeMt5Runti
 from .worker.mql5_file_adapter import Mql5FileMt5Adapter
 
 
+logger = logging.getLogger(__name__)
+
+
 class MaintenanceRecoveryUnavailable(RuntimeError):
     error_code = "native_maintenance_recovery_unavailable"
 
@@ -21,6 +25,7 @@ class MaintenanceRecovery:
     def __init__(self, api: Any, instances_root: Path, *, secrets_root: Path | None = None) -> None:
         self.api, self.instances_root = api, instances_root.resolve()
         self.connection_ids: frozenset[str] = frozenset()
+        self.skipped_connection_ids: frozenset[str] = frozenset()
         self.secrets = WindowsSecretStore(secrets_root or self.instances_root.parent / "secrets")
 
     def refresh(self) -> None:
@@ -37,23 +42,47 @@ class MaintenanceRecovery:
 
     def refresh_for_rotation(self) -> None:
         self.refresh()
+        self.skipped_connection_ids = frozenset()
         if not self.connection_ids:
             return
         if CurrentNativeMt5Runtime._setting("TRADEJOURNAL_MT5_TICKET_RECOVERY_ENABLED") != "1":
             raise MaintenanceRecoveryUnavailable("native_maintenance_recovery_unavailable")
         try:
             verify_ticket_reader()
-            # Prove every assigned terminal can produce a baseline before the
-            # coordinator is permitted to stop even its first canary.
-            for cid in sorted(self.connection_ids):
+        except Exception as exc:
+            raise MaintenanceRecoveryUnavailable("native_maintenance_recovery_unavailable") from exc
+        # Every terminal that takes part in tonight's rotation must first produce a baseline, so
+        # none is ever stopped without one. A prop firm can disable an account during the day
+        # (daily loss limit, expired challenge): its terminal can no longer log in or capture.
+        # That account alone stays out of tonight's scope, which every maintenance step reads
+        # through allows(), and the rest of the fleet is still maintained. When no account can
+        # capture, the cause is shared (session, reader, control plane) and the run stops.
+        ready: set[str] = set()
+        failures: dict[str, Exception] = {}
+        for cid in sorted(self.connection_ids):
+            try:
                 root = self.instances_root / cid
                 pointer = read_json(root / "state" / POINTER, {})
                 if pointer and pointer.get("status") != "prepared":
                     raise ValueError("maintenance_ticket_recovery_pending")
                 login, server = self.identity(cid)
                 capture_baseline(root, cid, login, server)
-        except Exception as exc:
-            raise MaintenanceRecoveryUnavailable("native_maintenance_recovery_unavailable") from exc
+            except Exception as exc:
+                failures[cid] = exc
+                logger.warning(
+                    "MT5 maintenance excludes %s from tonight's rotation: ticket baseline unavailable (%s: %s)",
+                    cid,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
+            else:
+                ready.add(cid)
+        if not ready:
+            raise MaintenanceRecoveryUnavailable(
+                "native_maintenance_recovery_unavailable"
+            ) from next(iter(failures.values()))
+        self.connection_ids = frozenset(ready)
+        self.skipped_connection_ids = frozenset(failures)
 
     def identity(self, connection_id: str) -> tuple[int, str]:
         return int(self.secrets.read(connection_id, "mt5_login")), self.secrets.read(connection_id, "mt5_server")
