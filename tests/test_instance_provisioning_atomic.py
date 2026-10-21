@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from windows_agent.provisioning.mt5_instance import InstanceProvisioner
-from windows_agent.state_store import read_json
+from windows_agent.state_store import atomic_json, read_json
 
 
 def _template(root: Path) -> Path:
@@ -233,3 +233,72 @@ def test_failed_rotation_cleans_read_only_upgrade_and_rollback(
     assert provisioner.validate_runtime_assets(connection_id) == previous_seal
     assert not list(root.rglob("*.upgrade"))
     assert not list(root.rglob("*.rollback"))
+
+
+def _with_vendor_seal(root: Path, code_manifest: str | None = None) -> str:
+    state_path = root / "state" / "instance.json"
+    state = read_json(state_path)
+    sealed_code = code_manifest or state["template_code_manifest_sha256"]
+    state["vendor_update"] = {
+        "schema_version": 1,
+        "verified_at_unix_ms": 1,
+        "signer_subject": "CN=MetaQuotes Ltd.,O=MetaQuotes Ltd.",
+        "terminal_sha256": state["terminal_sha256"],
+        "code_manifest_sha256": sealed_code,
+    }
+    atomic_json(state_path, state)
+    return sealed_code
+
+
+def _replacement_bridge(tmp_path: Path) -> tuple[Path, str]:
+    replacement = tmp_path / "TradeJournalBridge-release.ex5"
+    replacement.write_bytes(b"bridge-v2")
+    return replacement, hashlib.sha256(b"bridge-v2").hexdigest()
+
+
+def test_bridge_rotation_moves_an_intact_metaquotes_seal_to_the_new_bridge(
+    tmp_path: Path,
+) -> None:
+    provisioner, connection_id, root, _target = _sealed_runtime_instance(tmp_path)
+    _with_vendor_seal(root)
+    replacement, expected = _replacement_bridge(tmp_path)
+
+    provisioner.rotate_managed_expert(connection_id, replacement, expected)
+
+    state = read_json(root / "state" / "instance.json")
+    current = InstanceProvisioner._code_manifest(root / "terminal")
+    assert state["template_code_manifest_sha256"] == current
+    assert state["vendor_update"]["code_manifest_sha256"] == current
+    assert state["vendor_update"]["terminal_sha256"] == state["terminal_sha256"]
+    assert state["vendor_update"]["verified_at_unix_ms"] == 1
+
+
+def test_bridge_rotation_leaves_a_stale_metaquotes_seal_untouched(
+    tmp_path: Path,
+) -> None:
+    provisioner, connection_id, root, _target = _sealed_runtime_instance(tmp_path)
+    stale = _with_vendor_seal(root, "0" * 64)
+    replacement, expected = _replacement_bridge(tmp_path)
+
+    provisioner.rotate_managed_expert(connection_id, replacement, expected)
+
+    state = read_json(root / "state" / "instance.json")
+    assert state["vendor_update"]["code_manifest_sha256"] == stale
+    assert state["template_code_manifest_sha256"] != stale
+
+
+def test_bridge_rotation_does_not_reseal_a_tree_that_already_drifted(
+    tmp_path: Path,
+) -> None:
+    provisioner, connection_id, root, _target = _sealed_runtime_instance(tmp_path)
+    sealed = _with_vendor_seal(root)
+    extra = root / "terminal" / "MQL5" / "Scripts" / "Other" / "Tool.ex5"
+    extra.parent.mkdir(parents=True)
+    extra.write_bytes(b"third-party program")
+    replacement, expected = _replacement_bridge(tmp_path)
+
+    provisioner.rotate_managed_expert(connection_id, replacement, expected)
+
+    state = read_json(root / "state" / "instance.json")
+    assert state["vendor_update"]["code_manifest_sha256"] == sealed
+    assert state["template_code_manifest_sha256"] != sealed

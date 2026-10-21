@@ -274,6 +274,8 @@ class InstanceProvisioner:
         previous_state = read_json(state_path, {})
         if not isinstance(previous_state, dict):
             raise ValueError("published instance state invalid")
+        # Executable digest of the tree right before our own bridge is swapped.
+        pre_rotation_code_manifest = self._code_manifest(root / "terminal")
         temporary = target.with_name(f"{target.name}.upgrade")
         rollback = target.with_name(f"{target.name}.rollback")
         if temporary.exists() or rollback.exists():
@@ -294,9 +296,24 @@ class InstanceProvisioner:
             if self._sha256(target) != expected:
                 raise ValueError("published managed expert digest mismatch")
             state = dict(previous_state)
-            state["template_code_manifest_sha256"] = self._code_manifest(
-                root / "terminal"
-            )
+            code_manifest = self._code_manifest(root / "terminal")
+            vendor_update = previous_state.get("vendor_update")
+            if (
+                isinstance(vendor_update, dict)
+                and vendor_update.get("code_manifest_sha256")
+                == previous_state.get("template_code_manifest_sha256")
+                == pre_rotation_code_manifest
+            ):
+                # A sealed MetaQuotes update binds the whole executable manifest,
+                # bridge included. The tree matched that seal right before the
+                # swap, so our bridge is the only change and the seal moves to
+                # the new digest. A stale seal, or a tree that already drifted,
+                # is left as it was and keeps failing closed.
+                state["vendor_update"] = {
+                    **vendor_update,
+                    "code_manifest_sha256": code_manifest,
+                }
+            state["template_code_manifest_sha256"] = code_manifest
             state["runtime_assets_manifest_sha256"] = (
                 self._managed_runtime_assets_manifest(root / "terminal")
             )
