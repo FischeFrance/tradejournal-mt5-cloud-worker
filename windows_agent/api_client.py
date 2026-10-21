@@ -196,6 +196,56 @@ def _validate_claim(job: dict) -> dict:
     return job
 
 
+SESSION_TOPIC_PATTERN = re.compile(r"^mt5-agent:(any|[0-9a-fA-F-]{36})$")
+JWT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+
+def _realtime_hosts(parsed) -> frozenset[str]:
+    """The Realtime hosts allowed to receive the Agent's short-lived JWT: the control plane's own
+    project. ``<ref>.functions.supabase.co`` and ``<ref>.supabase.co`` are the same project."""
+    hostname = parsed.hostname or ""
+    hosts = {hostname}
+    functions_suffix = ".functions.supabase.co"
+    if hostname.endswith(functions_suffix):
+        project_ref = hostname[: -len(functions_suffix)]
+        if project_ref and "." not in project_ref:
+            hosts.add(f"{project_ref}.supabase.co")
+    return frozenset(hosts)
+
+
+def _validate_session(response: dict, allowed_hosts: frozenset[str]) -> dict:
+    required = {"api_version", "realtime_url", "publishable_key", "access_token", "expires_at", "topics"}
+    if set(response) != required or response.get("api_version") != "1":
+        raise AgentContractError("session response fields do not match contract V1")
+    realtime_url = response.get("realtime_url")
+    parsed = urlparse(realtime_url) if isinstance(realtime_url, str) else None
+    if (
+        parsed is None
+        or parsed.scheme != "wss"
+        or parsed.hostname not in allowed_hosts
+        or parsed.username
+        or parsed.password
+        or parsed.query
+    ):
+        raise AgentContractError("realtime_url is not this project's Realtime endpoint")
+    publishable_key = response.get("publishable_key")
+    if not isinstance(publishable_key, str) or not publishable_key:
+        raise AgentContractError("publishable_key is required")
+    access_token = response.get("access_token")
+    if not isinstance(access_token, str) or not JWT_PATTERN.fullmatch(access_token):
+        raise AgentContractError("access_token must be a JWT")
+    _timestamp(response.get("expires_at"), "expires_at")
+    topics = response.get("topics")
+    if (
+        not isinstance(topics, list)
+        or len(topics) != 2
+        or len(set(topics)) != 2
+        or not all(isinstance(topic, str) and SESSION_TOPIC_PATTERN.fullmatch(topic) for topic in topics)
+    ):
+        raise AgentContractError("topics do not match contract V1")
+    return response
+
+
 def _validate_heartbeat(response: dict) -> dict:
     if response.get("api_version") != "1" or not isinstance(response.get("lease_valid"), bool):
         raise AgentContractError("heartbeat response does not match contract V1")
@@ -258,6 +308,7 @@ class AgentApiClient:
             _normalized_origin(parsed),
         )
         self._history_upload_origins = _history_upload_origins(parsed)
+        self._realtime_hosts = _realtime_hosts(parsed)
         self.client = httpx.Client(
             transport=transport,
             timeout=10,
@@ -308,6 +359,11 @@ class AgentApiClient:
     def claim(self) -> dict:
         response = self.request("POST", "claim", {"api_version": self.API_VERSION})
         return _validate_claim(response) if response else {}
+
+    def session(self) -> dict:
+        """A one-hour Realtime JWT and the two private wake-up topics of this Agent."""
+        response = self.request("POST", "session", {"api_version": self.API_VERSION})
+        return _validate_session(response, self._realtime_hosts)
 
     def heartbeat(self, job_id: str, lease_id: str) -> dict:
         return _validate_heartbeat(

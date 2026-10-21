@@ -33,6 +33,12 @@ DEFAULT_BROKER_IDENTITY_MODEL = "gpt-5.6-terra"
 DEFAULT_BROKER_WIZARD_ENABLED = False
 DEFAULT_MTAPI_SEARCH_ENABLED = True
 DEFAULT_POLL_SECONDS = 5.0
+DEFAULT_REALTIME_WAKE_ENABLED = True
+# Safety claim cadence while the private wake-up channel is joined. Each claim also refreshes the
+# Agent's last_seen_at; the admin fleet view calls an Agent online below 90 s, so with the 25%
+# jitter the cadence must stay at or under 60 s.
+DEFAULT_WAKE_FALLBACK_SECONDS = 60.0
+MAX_WAKE_FALLBACK_SECONDS = 60.0
 DEFAULT_MT5_MAINTENANCE_ENABLED = False
 DEFAULT_MT5_MAINTENANCE_LOCAL_TIME = time(23, 30)
 DEFAULT_MT5_MAINTENANCE_TIMEZONE = "Europe/Rome"
@@ -70,6 +76,8 @@ class AgentRuntimeConfig:
     mt5_maintenance_grace_minutes: int = DEFAULT_MT5_MAINTENANCE_GRACE_MINUTES
     mt5_maintenance_state_path: Path = DEFAULT_MT5_MAINTENANCE_STATE_PATH
     mt5_single_start_enabled: bool = False
+    realtime_wake_enabled: bool = DEFAULT_REALTIME_WAKE_ENABLED
+    wake_fallback_seconds: float = DEFAULT_WAKE_FALLBACK_SECONDS
 
 
 def _required_sha256(source: Mapping[str, str], name: str) -> str:
@@ -300,6 +308,21 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         source.get("TRADEJOURNAL_MT5_MAINTENANCE_STATE_PATH", "").strip()
         or DEFAULT_MT5_MAINTENANCE_STATE_PATH
     )
+    realtime_wake_raw = source.get("TRADEJOURNAL_REALTIME_WAKE", "").strip()
+    if realtime_wake_raw not in ("", "0", "1"):
+        raise ValueError("TRADEJOURNAL_REALTIME_WAKE must be 0 or 1")
+    realtime_wake_enabled = (
+        realtime_wake_raw == "1" if realtime_wake_raw else DEFAULT_REALTIME_WAKE_ENABLED
+    )
+    wake_fallback_raw = source.get("TRADEJOURNAL_WAKE_FALLBACK_SECONDS", "").strip()
+    try:
+        wake_fallback_seconds = (
+            float(wake_fallback_raw) if wake_fallback_raw else DEFAULT_WAKE_FALLBACK_SECONDS
+        )
+    except ValueError as exc:
+        raise ValueError("TRADEJOURNAL_WAKE_FALLBACK_SECONDS is invalid") from exc
+    if not 5.0 <= wake_fallback_seconds <= MAX_WAKE_FALLBACK_SECONDS:
+        raise ValueError("TRADEJOURNAL_WAKE_FALLBACK_SECONDS is invalid")
     terminal_sha256 = _required_sha256(
         source, "TRADEJOURNAL_MT5_TEMPLATE_SHA256"
     )
@@ -340,6 +363,8 @@ def load_runtime_config(env: dict[str, str] | None = None) -> AgentRuntimeConfig
         mt5_maintenance_grace_minutes=mt5_maintenance_grace_minutes,
         mt5_maintenance_state_path=mt5_maintenance_state_path,
         mt5_single_start_enabled=mt5_single_start_enabled,
+        realtime_wake_enabled=realtime_wake_enabled,
+        wake_fallback_seconds=wake_fallback_seconds,
     )
 
 

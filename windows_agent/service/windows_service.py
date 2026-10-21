@@ -9,7 +9,7 @@ import win32event
 import win32service
 import win32serviceutil
 
-from windows_agent.agent_daemon import build_runner, run_forever
+from windows_agent.agent_daemon import build_runner, build_wake_listener, run_forever
 from windows_agent.observability.log_shipper import install_loki_handler
 from windows_agent.runtime_config import load_runtime_config
 from windows_agent.security import RedactionFilter
@@ -75,7 +75,13 @@ class TradeJournalAgentService(win32serviceutil.ServiceFramework):
             raise RuntimeError("TradeJournal agent startup failed")
 
         self._worker = threading.Thread(
-            target=run_forever, args=(runner, config.poll_seconds, self._stop_signal), daemon=True
+            target=run_forever,
+            args=(runner, config.poll_seconds, self._stop_signal),
+            kwargs={
+                "wake_listener": build_wake_listener(config, runner.api),
+                "wake_fallback_seconds": config.wake_fallback_seconds,
+            },
+            daemon=True,
         )
         self._worker.start()
         win32event.WaitForSingleObject(self.stop_event, win32event.INFINITE)

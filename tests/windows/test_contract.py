@@ -237,3 +237,49 @@ def test_401_unauthorized_is_not_retried() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         client.claim()
     assert calls["count"] == 1
+
+
+def _session_client(body: dict, base_url: str = "https://fixture.functions.supabase.co/trading-agent") -> AgentApiClient:
+    return AgentApiClient(base_url, "fixture", httpx.MockTransport(lambda r: httpx.Response(200, json=body)))
+
+
+def test_session_request_body_matches_schema_and_returns_the_fixture() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=FIXTURES["sessionResponse"])
+
+    client = AgentApiClient("https://fixture.functions.supabase.co/trading-agent", "fixture", httpx.MockTransport(handler))
+    assert client.session() == FIXTURES["sessionResponse"]
+    assert seen["path"].endswith("/trading-agent/session")
+    validate_against("sessionRequest", seen["body"])
+
+
+def test_session_accepts_the_same_project_on_the_main_supabase_host() -> None:
+    client = _session_client(FIXTURES["sessionResponse"], "https://fixture.supabase.co/functions/v1/trading-agent")
+    assert client.session()["topics"][0] == "mt5-agent:any"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"realtime_url": "wss://attacker.example/realtime/v1/websocket"},
+        {"realtime_url": "ws://fixture.supabase.co/realtime/v1/websocket"},
+        {"realtime_url": "wss://other.supabase.co/realtime/v1/websocket"},
+        {"realtime_url": "wss://fixture.supabase.co/realtime/v1/websocket?apikey=leak"},
+        {"access_token": "not-a-jwt"},
+        {"publishable_key": ""},
+        {"expires_at": "tomorrow"},
+        {"topics": ["mt5-agent:any"]},
+        {"topics": ["mt5-agent:any", "mt5-agent:any"]},
+        {"topics": ["mt5-agent:any", "public:everything"]},
+        {"api_version": "2"},
+        {"extra": True},
+    ],
+)
+def test_session_rejects_a_response_outside_the_contract(overrides: dict) -> None:
+    body = {**FIXTURES["sessionResponse"], **overrides}
+    with pytest.raises(AgentContractError):
+        _session_client(body).session()

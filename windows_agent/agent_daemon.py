@@ -4,9 +4,10 @@ import logging
 import os
 import random
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Protocol
 
 from .broker_endpoint_registry import (
     BrokerEndpointRegistryPublisher,
@@ -32,7 +33,12 @@ from .provisioning.mt5_public_release import Mt5ProvisionedReleaseInventory, Mt5
 from .provisioning.mt5_template import Mt5TemplateManager
 from .provisioning.mt5_update_store import Mt5PendingUpdateStore
 from .real_handlers import build_real_handlers, reconcile_startup_instances
-from .runtime_config import AgentRuntimeConfig, build_api_client, load_runtime_config
+from .runtime_config import (
+    DEFAULT_WAKE_FALLBACK_SECONDS,
+    AgentRuntimeConfig,
+    build_api_client,
+    load_runtime_config,
+)
 from .security import RedactionFilter
 from .worker.native_mt5_runtime import NativeMt5Runtime
 
@@ -241,12 +247,58 @@ def build_runner(
     )
 
 
-def run_forever(runner: JobRunner, poll_seconds: float, stop_event: threading.Event) -> None:
+class WakeListener(Protocol):
+    @property
+    def joined(self) -> bool: ...
+
+    def run(self, wake_event: threading.Event, stop_event: threading.Event) -> None: ...
+
+
+def build_wake_listener(config: AgentRuntimeConfig, api: Any) -> WakeListener | None:
+    """The private Realtime wake-up, unless switched off with TRADEJOURNAL_REALTIME_WAKE=0. A
+    missing websocket-client leaves the Agent polling as before instead of failing to start."""
+    if not config.realtime_wake_enabled or not callable(getattr(api, "session", None)):
+        return None
+    try:
+        from .realtime_wake import RealtimeWakeListener
+    except ImportError:
+        logger.warning("Realtime wake-up unavailable (websocket-client missing): claim polling only")
+        return None
+    return RealtimeWakeListener(api)
+
+
+def _jittered(seconds: float) -> float:
+    return seconds + random.uniform(0, seconds * 0.25)
+
+
+def _wait_for_tick(wake_event: threading.Event, stop_event: threading.Event, timeout: float) -> None:
+    """Sleeps until the next tick, returning early on a wake-up or a stop request."""
+    deadline = time.monotonic() + timeout
+    while not stop_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or wake_event.wait(min(remaining, 0.5)):
+            return
+
+
+def run_forever(
+    runner: JobRunner,
+    poll_seconds: float,
+    stop_event: threading.Event,
+    wake_listener: WakeListener | None = None,
+    wake_fallback_seconds: float = DEFAULT_WAKE_FALLBACK_SECONDS,
+) -> None:
     """Polls run_once() until stop_event is set. A crash-restart of the whole process leaves the
     previous job's lease to expire and be reclaimed server-side (see claim_mt5_provisioning_job's
     reclaim-on-expiry logic) -- recover() only logs the leftover state for operator visibility,
     it does not attempt to resume the job locally (the contract has no "get job status" route to
-    safely reconcile against)."""
+    safely reconcile against).
+
+    The loop ticks every ``poll_seconds`` (scheduled maintenance keeps that cadence). Without a
+    wake listener, or while its private channel is not joined, every tick claims, as it always
+    did. While the channel is joined, a ``command_available`` broadcast or a (re)connect claims
+    at once and idle ticks claim only every ``wake_fallback_seconds``: that safety claim still
+    refreshes the Agent's last_seen_at and picks up delayed retries and expired leases, which
+    raise no broadcast."""
     leftover = runner.recover()
     if leftover.get("status") in ("running", "claimed"):
         logger.warning(
@@ -266,20 +318,52 @@ def run_forever(runner: JobRunner, poll_seconds: float, stop_event: threading.Ev
     )
     for thread in workers:
         thread.start()
+    wake_event = threading.Event()
+    listener_thread = None
+    if wake_listener is not None:
+        listener_thread = threading.Thread(
+            target=wake_listener.run,
+            args=(wake_event, stop_event),
+            daemon=True,
+            name="agent-realtime-wake",
+        )
+        listener_thread.start()
+    next_idle_claim = 0.0
     try:
         while not stop_event.is_set():
             try:
                 if runner.scheduled_maintenance is not None and runner.scheduled_maintenance.run_if_due(stop_event):
                     continue
-                claimed = runner.run_once()
+                if (
+                    wake_listener is None
+                    or not wake_listener.joined
+                    or wake_event.is_set()
+                    or time.monotonic() >= next_idle_claim
+                ):
+                    wake_event.clear()
+                    claimed = runner.run_once()
+                    # Only an empty queue earns the long idle spacing. After a job (drained at
+                    # once) or a job that ended in LeaseLost the next tick claims, as before.
+                    next_idle_claim = (
+                        time.monotonic() + _jittered(wake_fallback_seconds)
+                        if not claimed and not runner.last_claim_found_job
+                        else 0.0
+                    )
+                else:
+                    claimed = False
             except Exception:
                 logger.exception("run_once failed unexpectedly")
                 claimed = False
+                next_idle_claim = 0.0  # a failed claim is retried on the next tick, as before
             if not claimed:
-                jitter = poll_seconds + random.uniform(0, poll_seconds * 0.25)
-                stop_event.wait(jitter)
+                if wake_listener is None:
+                    stop_event.wait(_jittered(poll_seconds))
+                else:
+                    _wait_for_tick(wake_event, stop_event, _jittered(poll_seconds))
     finally:
         stop_event.set()
+        if listener_thread is not None:
+            listener_thread.join(timeout=5.0)
         for thread in workers:
             thread.join(timeout=1.0)
 
@@ -295,7 +379,13 @@ def main() -> int:
     config = load_runtime_config()
     runner = build_runner(config)
     stop_event = threading.Event()
-    run_forever(runner, config.poll_seconds, stop_event)
+    run_forever(
+        runner,
+        config.poll_seconds,
+        stop_event,
+        wake_listener=build_wake_listener(config, runner.api),
+        wake_fallback_seconds=config.wake_fallback_seconds,
+    )
     return 0
 
 

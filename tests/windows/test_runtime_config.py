@@ -256,3 +256,50 @@ def test_runtime_config_requires_secure_ingestion_endpoint():
                 "TRADEJOURNAL_TRADING_INGESTION_URL": "http://agent.example/events",
             }
         )
+
+
+def test_runtime_config_realtime_wake_defaults_on_with_a_60_second_safety_claim():
+    config = load_runtime_config(env={"TRADEJOURNAL_API_URL": "https://agent.example/trading-agent", **PIN_ENV})
+    assert config.realtime_wake_enabled is True
+    assert config.wake_fallback_seconds == 60.0
+
+
+@pytest.mark.parametrize("value,enabled", [("", True), ("1", True), ("0", False)])
+def test_runtime_config_realtime_wake_can_be_switched_off(value, enabled):
+    config = load_runtime_config(env={
+        "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+        "TRADEJOURNAL_REALTIME_WAKE": value,
+        **PIN_ENV,
+    })
+    assert config.realtime_wake_enabled is enabled
+
+
+@pytest.mark.parametrize("value", ["true", "no", "2"])
+def test_runtime_config_rejects_invalid_realtime_wake_gate(value):
+    with pytest.raises(ValueError, match="TRADEJOURNAL_REALTIME_WAKE"):
+        load_runtime_config(env={
+            "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+            "TRADEJOURNAL_REALTIME_WAKE": value,
+            **PIN_ENV,
+        })
+
+
+def test_runtime_config_reads_the_wake_fallback_cadence():
+    config = load_runtime_config(env={
+        "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+        "TRADEJOURNAL_WAKE_FALLBACK_SECONDS": "30",
+        **PIN_ENV,
+    })
+    assert config.wake_fallback_seconds == 30.0
+
+
+@pytest.mark.parametrize("value", ["4", "61", "90", "abc", "nan"])
+def test_runtime_config_keeps_the_wake_fallback_under_the_online_threshold(value):
+    # Above 60 s (75 s with jitter) the admin fleet view would show the idle Agent as stale.
+    with pytest.raises(ValueError, match="TRADEJOURNAL_WAKE_FALLBACK_SECONDS"):
+        load_runtime_config(env={
+            "TRADEJOURNAL_API_URL": "https://agent.example/trading-agent",
+            "TRADEJOURNAL_WAKE_FALLBACK_SECONDS": value,
+            **PIN_ENV,
+        })
+

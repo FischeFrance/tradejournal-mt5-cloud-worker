@@ -81,11 +81,16 @@ class JobRunner:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.background_workers = background_workers
         self.scheduled_maintenance = scheduled_maintenance
+        # False only when the last claim found the queue empty; a job that ended in LeaseLost
+        # still returns False from run_once() but leaves this True.
+        self.last_claim_found_job = False
 
     def run_once(self) -> bool:
+        self.last_claim_found_job = False
         job = self.api.claim()
         if not job:
             return False
+        self.last_claim_found_job = True
         minimal = {
             "job_id": job["job_id"],
             "action": job.get("job_type", job.get("action")),
