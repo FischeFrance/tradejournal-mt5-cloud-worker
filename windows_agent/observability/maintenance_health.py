@@ -7,7 +7,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from ..maintenance_capability import (
@@ -95,7 +95,16 @@ def evaluate_maintenance_health(
 class Mt5MaintenanceHealthMonitor:
     """Publish local evidence and logs even when the scheduler has disappeared."""
 
-    def __init__(self, release_root: Path, environment: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        release_root: Path,
+        environment: Mapping[str, str] | None = None,
+        *,
+        overdue_reporter: Callable[[str, object], None] | None = None,
+    ) -> None:
+        # Told about a night whose maintenance never finished: the scheduler itself
+        # cannot report a run that did not happen.
+        self.overdue_reporter = overdue_reporter
         source = os.environ if environment is None else environment
         self.environment = {
             name: value for name, value in source.items()
@@ -116,6 +125,14 @@ class Mt5MaintenanceHealthMonitor:
             logger.info("MT5 maintenance health %s", report)
         else:
             logger.error("MT5 maintenance health %s", report)
+        if health["status"] == "overdue" and self.overdue_reporter is not None:
+            try:
+                self.overdue_reporter(
+                    str(health.get("expected_completed_local_date", "")),
+                    health.get("error_code"),
+                )
+            except Exception:
+                logger.exception("MT5 maintenance overdue report failed")
         return health
 
     def run(self, stop_event: threading.Event) -> None:

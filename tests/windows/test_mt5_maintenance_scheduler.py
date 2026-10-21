@@ -389,3 +389,66 @@ def test_window_expiry_cancels_maintenance_but_leaves_daemon_alive(tmp_path):
     state = read_json(tmp_path / 'maintenance.json')
     assert state['status'] == 'failed'
     assert state['window_deadline_reached'] is True
+
+
+def _reported(tmp_path, clock, coordinator, **kwargs):
+    reports: list[tuple[str, int, bool]] = []
+    scheduler, _ = _scheduler(
+        tmp_path, clock, coordinator,
+        attempt_reporter=lambda state, final: reports.append((state["status"], state["attempts"], final)),
+        **kwargs,
+    )
+    return scheduler, reports
+
+
+def test_every_attempt_is_reported_and_only_the_last_one_is_final(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 8, 27, 21, 30, tzinfo=timezone.utc))
+    scheduler, reports = _reported(
+        tmp_path, clock, Coordinator(failures=1),
+        grace_window=timedelta(minutes=45), retry_delay=timedelta(minutes=10), max_attempts_per_local_date=2,
+    )
+
+    scheduler.run_if_due(threading.Event())
+    clock.current += timedelta(minutes=10)
+    scheduler.run_if_due(threading.Event())
+
+    assert reports == [("failed", 1, False), ("completed", 2, True)]
+
+
+def test_a_failure_with_no_attempt_left_is_final(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 8, 27, 21, 30, tzinfo=timezone.utc))
+    scheduler, reports = _reported(
+        tmp_path, clock, Coordinator(failures=5),
+        retry_delay=timedelta(minutes=5), max_attempts_per_local_date=2,
+    )
+
+    scheduler.run_if_due(threading.Event())
+    clock.current += timedelta(minutes=5)
+    scheduler.run_if_due(threading.Event())
+
+    assert reports == [("failed", 1, False), ("failed", 2, True)]
+
+
+def test_a_failure_too_close_to_the_window_end_is_final(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 8, 27, 22, 10, tzinfo=timezone.utc))
+    scheduler, reports = _reported(
+        tmp_path, clock, Coordinator(failures=5),
+        grace_window=timedelta(minutes=45), retry_delay=timedelta(minutes=10), max_attempts_per_local_date=2,
+    )
+
+    scheduler.run_if_due(threading.Event())
+
+    assert reports == [("failed", 1, True)]
+
+
+def test_a_broken_reporter_never_affects_maintenance(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 8, 27, 21, 30, tzinfo=timezone.utc))
+
+    def broken(_state, _final):
+        raise RuntimeError("control plane down")
+
+    scheduler, coordinator = _scheduler(tmp_path, clock, attempt_reporter=broken)
+
+    assert scheduler.run_if_due(threading.Event()) is True
+    assert read_json(tmp_path / "maintenance.json")["status"] == "completed"
+    assert len(coordinator.calls) == 1

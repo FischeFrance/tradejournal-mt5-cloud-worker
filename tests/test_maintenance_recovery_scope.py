@@ -42,6 +42,7 @@ def test_an_account_the_broker_disabled_is_left_out_and_the_rest_is_maintained(t
     assert recovery.allows(healthy)
     assert not recovery.allows(disabled)
     assert recovery.skipped_connection_ids == frozenset({disabled})
+    assert recovery.skip_reasons == {disabled: "ticket_baseline_unavailable"}
     assert disabled in caplog.text
 
 
@@ -99,3 +100,20 @@ def test_a_later_preflight_check_can_remove_one_account_from_tonight(tmp_path, m
     assert recovery.allows(first)
     assert not recovery.allows(second)
     assert recovery.skipped_connection_ids == frozenset({second})
+    assert recovery.skip_reasons == {second: "release_state_unverifiable"}
+
+
+def test_each_night_starts_without_the_previous_reasons(tmp_path, monkeypatch):
+    first, second = sorted(str(uuid4()) for _ in range(2))
+    recovery, _captured = _recovery(tmp_path, monkeypatch, [first, second], failing={second})
+    recovery.refresh_for_rotation()
+    recovery.exclude(frozenset({first}))
+    assert recovery.skip_reasons == {
+        first: "release_state_unverifiable", second: "ticket_baseline_unavailable",
+    }
+
+    monkeypatch.setattr("windows_agent.maintenance_recovery.capture_baseline", lambda *_args: None)
+    recovery.refresh_for_rotation()
+
+    assert recovery.skip_reasons == {}
+    assert recovery.skipped_connection_ids == frozenset()

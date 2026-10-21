@@ -26,6 +26,8 @@ class MaintenanceRecovery:
         self.api, self.instances_root = api, instances_root.resolve()
         self.connection_ids: frozenset[str] = frozenset()
         self.skipped_connection_ids: frozenset[str] = frozenset()
+        # Why each account was left out of tonight's scope, reported with the night's outcome.
+        self.skip_reasons: dict[str, str] = {}
         self.secrets = WindowsSecretStore(secrets_root or self.instances_root.parent / "secrets")
 
     def refresh(self) -> None:
@@ -43,6 +45,7 @@ class MaintenanceRecovery:
     def refresh_for_rotation(self) -> None:
         self.refresh()
         self.skipped_connection_ids = frozenset()
+        self.skip_reasons = {}
         if not self.connection_ids:
             return
         if CurrentNativeMt5Runtime._setting("TRADEJOURNAL_MT5_TICKET_RECOVERY_ENABLED") != "1":
@@ -83,12 +86,18 @@ class MaintenanceRecovery:
             ) from next(iter(failures.values()))
         self.connection_ids = frozenset(ready)
         self.skipped_connection_ids = frozenset(failures)
+        self.skip_reasons = {cid: "ticket_baseline_unavailable" for cid in failures}
 
-    def exclude(self, connection_ids: frozenset[str]) -> None:
+    def exclude(
+        self,
+        connection_ids: frozenset[str],
+        reason: str = "release_state_unverifiable",
+    ) -> None:
         """Remove accounts from tonight's scope after a later preflight check."""
         excluded = frozenset(connection_ids) & self.connection_ids
         self.connection_ids = self.connection_ids - excluded
         self.skipped_connection_ids = self.skipped_connection_ids | excluded
+        self.skip_reasons.update({cid: reason for cid in excluded})
 
     def identity(self, connection_id: str) -> tuple[int, str]:
         return int(self.secrets.read(connection_id, "mt5_login")), self.secrets.read(connection_id, "mt5_server")

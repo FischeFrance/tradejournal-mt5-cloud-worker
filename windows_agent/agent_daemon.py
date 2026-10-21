@@ -22,6 +22,7 @@ from .broker_wizard import HiddenSessionBrokerWizard
 from .event_supervisor import Mt5EventSupervisor
 from .job_runner import JobRunner
 from .maintenance_recovery import MaintenanceRecovery
+from .maintenance_report import MaintenanceReporter
 from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .mt5_maintenance import Mt5MaintenanceCoordinator
 from .mt5_maintenance_scheduler import Mt5MaintenanceScheduler
@@ -82,6 +83,7 @@ def build_runner(
     instance_pool: Mt5InstancePool | None = None
     template_manager: Mt5TemplateManager | None = None
     scheduled_maintenance: Mt5MaintenanceScheduler | None = None
+    maintenance_reporter: MaintenanceReporter | None = None
     template_lock = threading.RLock()
     background_workers: tuple[
         Callable[[threading.Event], None], ...
@@ -131,6 +133,7 @@ def build_runner(
             background_workers = (instance_pool.replenish_forever,)
         if config.mt5_maintenance_enabled:
             recovery = MaintenanceRecovery(api, config.instances_root, secrets_root=config.secrets_root)
+            maintenance_reporter = MaintenanceReporter(api, recovery)
             pending_update_store = Mt5PendingUpdateStore(
                 config.mt5_maintenance_state_path.parent / "mt5-update-pending",
             )
@@ -172,6 +175,7 @@ def build_runner(
                 timezone_name=config.mt5_maintenance_timezone,
                 scheduled_time=config.mt5_maintenance_local_time,
                 grace_window=timedelta(minutes=config.mt5_maintenance_grace_minutes),
+                attempt_reporter=maintenance_reporter.attempt_finished,
             )
             scheduled_maintenance.recover_interrupted()
     identity_resolver: CachedBrokerIdentityResolver | None = None
@@ -236,7 +240,14 @@ def build_runner(
         )
         background_workers = (*background_workers, event_supervisor.run)
         if os.environ.get("TRADEJOURNAL_MT5_MAINTENANCE_ENABLED"):
-            maintenance_health = Mt5MaintenanceHealthMonitor(Path(__file__).resolve().parent.parent)
+            maintenance_health = Mt5MaintenanceHealthMonitor(
+                Path(__file__).resolve().parent.parent,
+                overdue_reporter=(
+                    maintenance_reporter.overdue
+                    if maintenance_reporter is not None
+                    else None
+                ),
+            )
             background_workers = (*background_workers, maintenance_health.run)
     return JobRunner(
         state_path,

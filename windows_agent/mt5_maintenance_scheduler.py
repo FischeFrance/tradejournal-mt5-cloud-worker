@@ -115,6 +115,7 @@ class Mt5MaintenanceScheduler:
         retry_delay: timedelta = DEFAULT_RETRY_DELAY,
         max_attempts_per_local_date: int = (DEFAULT_MAX_ATTEMPTS_PER_LOCAL_DATE),
         clock: Callable[[], datetime] | None = None,
+        attempt_reporter: Callable[[dict, bool], None] | None = None,
     ) -> None:
         if not isinstance(timezone_name, str) or not timezone_name.strip():
             raise ValueError("MT5 maintenance timezone is invalid")
@@ -151,6 +152,16 @@ class Mt5MaintenanceScheduler:
         self.max_attempts_per_local_date = max_attempts_per_local_date
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
+        self.attempt_reporter = attempt_reporter
+
+    def _report_attempt(self, state: dict, final: bool) -> None:
+        """Hand the finished attempt to the reporter; reporting never affects maintenance."""
+        if self.attempt_reporter is None:
+            return
+        try:
+            self.attempt_reporter(dict(state), final)
+        except Exception:
+            logger.exception("MT5 maintenance attempt report failed")
 
     def _now(self) -> datetime:
         observed = self._clock()
@@ -356,6 +367,13 @@ class Mt5MaintenanceScheduler:
                 scheduled_local_date.isoformat(),
                 attempts,
             )
+            # No retry follows when the attempts are used up or the next one would
+            # start after tonight's window has closed.
+            self._report_attempt(
+                failed,
+                attempts >= self.max_attempts_per_local_date
+                or failed_at + self.retry_delay > window_stop.deadline,
+            )
             return True
 
         completed_at = self._now()
@@ -370,4 +388,5 @@ class Mt5MaintenanceScheduler:
             scheduled_local_date.isoformat(),
             attempts,
         )
+        self._report_attempt(completed, True)
         return True

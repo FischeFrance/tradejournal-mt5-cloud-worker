@@ -90,3 +90,30 @@ def test_native_gap_delivery_failure_is_visible_in_health(tmp_path):
     health = evaluate_maintenance_health(root, environment(tmp_path), now=datetime(2026, 10, 8, 21, 50, tzinfo=timezone.utc))
     assert health["status"] == "failed"
     assert health["error_code"] == "native_maintenance_recovery_unavailable"
+
+
+def test_monitor_reports_a_night_that_never_ran(tmp_path):
+    root = capable_release(tmp_path / "release")
+    state(tmp_path, "2026-09-23", finished="2026-09-23T21:50:32Z")
+    reported = []
+    monitor = Mt5MaintenanceHealthMonitor(
+        root, environment(tmp_path), overdue_reporter=lambda date, code: reported.append((date, code)),
+    )
+
+    health = monitor.check_once()
+
+    assert health["status"] == "overdue"
+    assert reported == [(health["expected_completed_local_date"], health["error_code"])]
+
+
+def test_monitor_keeps_working_when_the_overdue_report_fails(tmp_path):
+    root = capable_release(tmp_path / "release")
+    state(tmp_path, "2026-09-23", finished="2026-09-23T21:50:32Z")
+
+    def broken(_date, _code):
+        raise RuntimeError("control plane down")
+
+    monitor = Mt5MaintenanceHealthMonitor(root, environment(tmp_path), overdue_reporter=broken)
+
+    assert monitor.check_once()["status"] == "overdue"
+    assert json.loads((tmp_path / "mt5-maintenance-health.json").read_text())["status"] == "overdue"
