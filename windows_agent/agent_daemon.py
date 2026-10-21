@@ -23,6 +23,8 @@ from .event_supervisor import Mt5EventSupervisor
 from .job_runner import JobRunner
 from .maintenance_recovery import MaintenanceRecovery
 from .maintenance_report import MaintenanceReporter
+from .mt5_expert_alignment import Mt5TemplateExpertSync
+from .mt5_fleet_verification import Mt5FleetVerifier
 from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .mt5_maintenance import Mt5MaintenanceCoordinator
 from .mt5_maintenance_scheduler import Mt5MaintenanceScheduler
@@ -82,6 +84,7 @@ def build_runner(
     state_path.parent.mkdir(parents=True, exist_ok=True)
     instance_pool: Mt5InstancePool | None = None
     template_manager: Mt5TemplateManager | None = None
+    template_expert_sync: Mt5TemplateExpertSync | None = None
     scheduled_maintenance: Mt5MaintenanceScheduler | None = None
     maintenance_reporter: MaintenanceReporter | None = None
     template_lock = threading.RLock()
@@ -93,6 +96,15 @@ def build_runner(
             template_manager = Mt5TemplateManager(
                 config.source_terminal, config.terminal_sha256, lock=template_lock,
             )
+            template_expert_sync = Mt5TemplateExpertSync(
+                template_manager,
+                template_lock=template_lock,
+                expert_binary=config.expert_binary,
+                expert_sha256=config.expert_sha256,
+                backup_root=config.mt5_maintenance_state_path.parent / "mt5-expert-backups",
+            )
+            # Before the template is validated: a Bridge swap cut off before its seal is undone.
+            template_expert_sync.recover_interrupted()
             template_manager.recover_interrupted_rotation()
         reconciliation = reconcile_startup_instances(
             config.instances_root,
@@ -133,7 +145,11 @@ def build_runner(
             background_workers = (instance_pool.replenish_forever,)
         if config.mt5_maintenance_enabled:
             recovery = MaintenanceRecovery(api, config.instances_root, secrets_root=config.secrets_root)
-            maintenance_reporter = MaintenanceReporter(api, recovery)
+            if template_expert_sync is not None:
+                template_expert_sync.instance_pool = instance_pool
+            public_release_probe = Mt5PublicReleaseProbe(
+                config.mt5_maintenance_state_path.parent / "mt5-public-releases",
+            )
             pending_update_store = Mt5PendingUpdateStore(
                 config.mt5_maintenance_state_path.parent / "mt5-update-pending",
             )
@@ -161,13 +177,28 @@ def build_runner(
                 connection_allowed=recovery.allows,
                 scope_exclude=recovery.exclude,
                 pending_update_store=pending_update_store,
-                public_release_probe=Mt5PublicReleaseProbe(
-                    config.mt5_maintenance_state_path.parent / "mt5-public-releases",
-                ),
+                public_release_probe=public_release_probe,
                 public_release_inventory=Mt5ProvisionedReleaseInventory(
                     config.instances_root, trusted_template_root=config.source_terminal.parent,
                     connection_allowed=recovery.allows,
                 ),
+                template_expert_sync=template_expert_sync,
+                expert_sha256=config.expert_sha256,
+                expert_backup_root=config.mt5_maintenance_state_path.parent / "mt5-expert-backups",
+                fleet_verifier=Mt5FleetVerifier(
+                    instances_root=config.instances_root,
+                    secrets=rotator.secrets,
+                    expert_sha256=config.expert_sha256,
+                    template_terminal=config.source_terminal,
+                    build_reader=public_release_probe.build_reader,
+                    # Accounts left out of tonight are checked too: the report covers them all.
+                    connection_ids=lambda: recovery.connection_ids | recovery.skipped_connection_ids,
+                ),
+            )
+            maintenance_reporter = MaintenanceReporter(
+                api,
+                recovery,
+                phases=lambda: maintenance_coordinator.last_phases,
             )
             scheduled_maintenance = Mt5MaintenanceScheduler(
                 maintenance_coordinator,

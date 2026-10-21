@@ -4,6 +4,10 @@ The scheduler deliberately owns only *when* maintenance may run.  The injected
 coordinator owns the MT5/template/pool operation itself.  Persisting a RUNNING
 claim before calling the coordinator prevents a service restart from silently
 executing the same local-date maintenance twice after an uncertain crash.
+
+An administrator can also ask for one pass now by creating the run-now request file
+next to the state file (the state folder is writable only by SYSTEM and administrators).
+That pass has its own state file and deadline and never changes the nightly schedule.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ DEFAULT_SCHEDULED_TIME = time(23, 30)
 DEFAULT_GRACE_WINDOW = timedelta(minutes=60)
 DEFAULT_RETRY_DELAY = timedelta(minutes=10)
 DEFAULT_MAX_ATTEMPTS_PER_LOCAL_DATE = 2
+DEFAULT_MANUAL_WINDOW = timedelta(hours=3)
+MANUAL_REQUEST_NAME = "mt5-maintenance-run-now.request"
+MANUAL_STATE_NAME = "mt5-maintenance-manual.json"
 
 _TIME_PATTERN = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 _STATUSES = frozenset(("running", "completed", "failed"))
@@ -116,6 +123,7 @@ class Mt5MaintenanceScheduler:
         max_attempts_per_local_date: int = (DEFAULT_MAX_ATTEMPTS_PER_LOCAL_DATE),
         clock: Callable[[], datetime] | None = None,
         attempt_reporter: Callable[[dict, bool], None] | None = None,
+        manual_window: timedelta = DEFAULT_MANUAL_WINDOW,
     ) -> None:
         if not isinstance(timezone_name, str) or not timezone_name.strip():
             raise ValueError("MT5 maintenance timezone is invalid")
@@ -153,6 +161,9 @@ class Mt5MaintenanceScheduler:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self.attempt_reporter = attempt_reporter
+        self.manual_window = manual_window
+        self.manual_request_path = self.state_path.parent / MANUAL_REQUEST_NAME
+        self.manual_state_path = self.state_path.parent / MANUAL_STATE_NAME
 
     def _report_attempt(self, state: dict, final: bool) -> None:
         """Hand the finished attempt to the reporter; reporting never affects maintenance."""
@@ -269,6 +280,21 @@ class Mt5MaintenanceScheduler:
         """
 
         with self._lock:
+            try:
+                manual = read_json(self.manual_state_path, {})
+            except (OSError, ValueError):
+                manual = {}
+            if manual.get("status") == "running":
+                # A run-now pass is never retried on its own: the next request decides.
+                atomic_json(
+                    self.manual_state_path,
+                    {
+                        **manual,
+                        "status": "failed",
+                        "finished_at_utc": _utc_text(self._now()),
+                        "recovered_interrupted_run": True,
+                    },
+                )
             state = self._read_state()
             if not state or state.get("status") != "running":
                 return False
@@ -287,17 +313,76 @@ class Mt5MaintenanceScheduler:
             )
             return True
 
+    def _take_manual_request(self) -> bool:
+        """Consume a run-now request; it is removed before the pass starts."""
+        path = self.manual_request_path
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def run_requested(self, stop_event: threading.Event) -> bool:
+        """Run one pass now if an administrator asked for it; return whether it ran."""
+        if stop_event.is_set():
+            return False
+        with self._lock:
+            if stop_event.is_set() or not self._take_manual_request():
+                return False
+            now_utc = self._now()
+            running = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "trigger": "manual",
+                "scheduled_local_date": now_utc.astimezone(self.local_timezone)
+                .date()
+                .isoformat(),
+                "timezone": self.timezone_name,
+                "status": "running",
+                "attempts": 1,
+                "run_id": str(uuid4()),
+                "started_at_utc": _utc_text(now_utc),
+            }
+            atomic_json(self.manual_state_path, running)
+        deadline = now_utc + self.manual_window
+        window_stop = _WindowStop(stop_event, deadline, self._now)
+        logger.info("manual MT5 maintenance started (run_id=%s)", running["run_id"])
+        try:
+            self.coordinator.run_once(window_stop)
+            if window_stop.is_set():
+                raise Mt5MaintenanceScheduleError("MT5 maintenance window ended or service stopped")
+        except Exception as exc:
+            failed_at = self._now()
+            failed = {**running, "status": "failed", "finished_at_utc": _utc_text(failed_at)}
+            if getattr(exc, "error_code", None) == "native_maintenance_recovery_unavailable":
+                failed["error_code"] = "native_maintenance_recovery_unavailable"
+            if window_stop.is_set():
+                failed["window_deadline_reached"] = failed_at >= deadline
+            atomic_json(self.manual_state_path, failed)
+            logger.exception("manual MT5 maintenance failed (run_id=%s)", running["run_id"])
+            self._report_attempt(failed, True)
+            return True
+        completed = {**running, "status": "completed", "finished_at_utc": _utc_text(self._now())}
+        atomic_json(self.manual_state_path, completed)
+        logger.info("manual MT5 maintenance completed (run_id=%s)", running["run_id"])
+        self._report_attempt(completed, True)
+        return True
+
     def run_if_due(self, stop_event: threading.Event) -> bool:
         """Run one due attempt and return whether an attempt was started.
 
-        Coordinator failures are recorded and logged, but deliberately do not
-        escape: the long-running Windows Agent must remain alive so the bounded
-        retry can occur.  State I/O failures still propagate because proceeding
-        without a durable claim would make duplicate execution possible.
+        An administrator's run-now request goes first. Coordinator failures are
+        recorded and logged, but deliberately do not escape: the long-running
+        Windows Agent must remain alive so the bounded retry can occur.  State
+        I/O failures still propagate because proceeding without a durable claim
+        would make duplicate execution possible.
         """
 
         if stop_event.is_set():
             return False
+        if self.run_requested(stop_event):
+            return True
         with self._lock:
             if stop_event.is_set():
                 return False

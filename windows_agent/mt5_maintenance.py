@@ -1,19 +1,26 @@
-"""Nightly MT5 release probe, golden promotion, pool rebuild and fleet rollout."""
+"""Nightly MT5 maintenance in three phases.
+
+1. Expert: the pinned Bridge goes into the golden template and into every terminal.
+2. MT5: release probe, golden promotion, pool rebuild and fleet rollout.
+3. Verification: every account is checked, read only, after the updates.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, RLock
 from typing import Any, Callable
 
+from .mt5_expert_alignment import Mt5TemplateExpertError, copy_verified
 from .mt5_lifecycle import Mt5LifecycleCoordinator
 from .mt5_recovery_window import new_only_recovery_from
 from .provisioning.mt5_instance_pool import Mt5InstancePool
-from .provisioning.mt5_instance import InstanceProvisioner
+from .provisioning.mt5_instance import InstanceProvisioner, _MANAGED_RUNTIME_ASSETS
 from .provisioning.mt5_instance_rotation import (
     Mt5FleetRotationReport,
     Mt5InstanceRotationError,
@@ -28,6 +35,7 @@ from .provisioning.mt5_public_release import (
     Mt5PublicReleaseProbe,
 )
 from .provisioning.mt5_template import (
+    Mt5TemplateError,
     Mt5TemplateManager,
     Mt5TemplateRecoveryRequired,
     PreparedMt5Template,
@@ -42,12 +50,45 @@ from .provisioning.process_manager import ProcessManager
 from .security import canonical_uuid
 from .state_store import read_json
 from .worker.maintenance_mt5_runtime import NativeMt5Runtime, NativeMt5Status
+from .worker.native_mt5_runtime import NativeMt5Error
 
 logger = logging.getLogger(__name__)
+
+# Reports carry at most this many per-account verification problems.
+MAX_REPORTED_ISSUES = 12
 
 
 class Mt5MaintenanceError(RuntimeError):
     """A sanitized nightly maintenance failure."""
+
+
+_REPORTABLE_ERRORS = (
+    Mt5MaintenanceError,
+    Mt5InstanceRotationError,
+    Mt5TemplateError,
+    Mt5TemplateExpertError,
+    NativeMt5Error,
+)
+
+
+def failure_reason(exc: BaseException) -> str:
+    """The most specific sanitized cause in the chain, as a short code for the report."""
+    reason = "mt5_maintenance_failed"
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        error_code = getattr(current, "error_code", None)
+        if isinstance(error_code, str) and re.fullmatch(r"[a-z0-9_]{1,64}", error_code):
+            reason = error_code
+        elif isinstance(current, _REPORTABLE_ERRORS):
+            code = re.sub(r"[^a-z0-9]+", "_", str(current).casefold())[:64].strip("_")
+            if code:
+                reason = code
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return reason
 
 
 @dataclass(frozen=True)
@@ -124,7 +165,12 @@ class Mt5MaintenanceCoordinator:
         ) = None,
         scope_refresh: Callable[[], None] | None = None,
         connection_allowed: Callable[[str], bool] | None = None,
-        scope_exclude: Callable[[frozenset[str]], None] | None = None,
+        scope_exclude: Callable[..., None] | None = None,
+        template_expert_sync: Any | None = None,
+        expert_sha256: str | None = None,
+        expert_backup_root: Path | None = None,
+        provisioner: Any | None = None,
+        fleet_verifier: Any | None = None,
     ) -> None:
         self.instances_root = Path(instances_root).resolve()
         self.expert_binary = Path(expert_binary).resolve()
@@ -142,6 +188,21 @@ class Mt5MaintenanceCoordinator:
         self.scope_refresh = scope_refresh
         self.connection_allowed = connection_allowed or (lambda _cid: True)
         self.scope_exclude = scope_exclude
+        # Phase one runs only when the pinned Bridge digest is wired; phase three only with a
+        # verifier. Without them a pass is the MT5 phase alone, as before.
+        self.template_expert_sync = template_expert_sync
+        self.expert_sha256 = (
+            expert_sha256.strip().lower() if expert_sha256 is not None else None
+        )
+        self.expert_backup_root = (
+            Path(expert_backup_root)
+            if expert_backup_root is not None
+            else self.instances_root.parent / "state" / "mt5-expert-backups"
+        )
+        self.provisioner = provisioner
+        self.fleet_verifier = fleet_verifier
+        # What each phase of the latest pass did, for the report sent at its end.
+        self.last_phases: dict[str, dict[str, Any]] = {}
 
     def _exclude_unverifiable(
         self,
@@ -297,8 +358,9 @@ class Mt5MaintenanceCoordinator:
         ):
             raise Mt5MaintenanceError("MT5 canary health check failed")
 
-    def _canaries(self, target: Mt5TemplateRelease) -> tuple[_Canary, ...]:
-        by_server: dict[str, list[_Canary]] = {}
+    def _accounts(self) -> tuple[_Canary, ...]:
+        """Every provisioned account in tonight's scope with a valid identity."""
+        accounts: list[_Canary] = []
         if not self.instances_root.exists():
             return ()
         for candidate in sorted(
@@ -319,19 +381,23 @@ class Mt5MaintenanceCoordinator:
                 server = self.secrets.read(connection_id, "mt5_server")
             except Exception:
                 logger.warning(
-                    "skipping MT5 canary with unavailable identity (connection=%s)",
+                    "skipping MT5 account with unavailable identity (connection=%s)",
                     connection_id,
                 )
                 continue
             if login <= 0 or not server or server != server.strip():
                 logger.warning(
-                    "skipping MT5 canary with invalid identity (connection=%s)",
+                    "skipping MT5 account with invalid identity (connection=%s)",
                     connection_id,
                 )
                 continue
-            by_server.setdefault(server.casefold(), []).append(
-                _Canary(connection_id, root, login, server)
-            )
+            accounts.append(_Canary(connection_id, root, login, server))
+        return tuple(accounts)
+
+    def _canaries(self, target: Mt5TemplateRelease) -> tuple[_Canary, ...]:
+        by_server: dict[str, list[_Canary]] = {}
+        for account in self._accounts():
+            by_server.setdefault(account.server.casefold(), []).append(account)
 
         selected: list[_Canary] = []
         for values in by_server.values():
@@ -1387,9 +1453,234 @@ class Mt5MaintenanceCoordinator:
         if pool_failed:
             raise Mt5MaintenanceError("MT5 pool postcondition failed")
 
+    def _provisioner(self) -> Any:
+        if self.provisioner is None:
+            self.provisioner = InstanceProvisioner(
+                self.instances_root,
+                self.rotator.secrets_root,
+            )
+        return self.provisioner
+
+    def _resume_account(
+        self,
+        runtime: Any,
+        account: _Canary,
+        expert: Path,
+        recovery_from: datetime,
+    ) -> None:
+        status = runtime.resume(
+            login=account.login,
+            server=account.server,
+            expert_binary=expert,
+            history_mode="new_only",
+            history_from=recovery_from,
+        )
+        self._validate_status(status)
+        self._adopt(account)
+
+    def _align_instance_expert(self, account: _Canary, stop_event: Event) -> None:
+        """Swap one terminal's Bridge for the pinned one; on failure it gets its own back."""
+        assert self.expert_sha256 is not None
+        provisioner = self._provisioner()
+        bridge = account.root / "terminal" / _MANAGED_RUNTIME_ASSETS[0]
+        with self.lifecycle.connection(account.connection_id):
+            self._require_not_stopped(stop_event)
+            previous = InstanceProvisioner._sha256(bridge)
+            self.expert_backup_root.mkdir(parents=True, exist_ok=True)
+            backup = self.expert_backup_root / f"{account.connection_id}-{previous}.ex5"
+            copy_verified(bridge, backup, previous)
+            runtime = self.runtime_factory(account.root, account.connection_id)
+            set_cancel_check = getattr(runtime, "set_cancel_check", None)
+            if callable(set_cancel_check):
+
+                def require_not_stopped() -> None:
+                    if stop_event.is_set():
+                        raise Mt5MaintenanceError("MT5 maintenance was interrupted")
+
+                set_cancel_check(require_not_stopped)
+            runtime.set_verified_vendor_update_callback(
+                self._capture_callback(stop_event),
+                required=self.pending_update_store is not None,
+            )
+            try:
+                recovery_from = new_only_recovery_from(account.root)
+            except Exception as exc:
+                raise Mt5MaintenanceError(
+                    "MT5 expert update recovery cursor is unavailable"
+                ) from exc
+            if not runtime.stop():
+                raise Mt5MaintenanceError("MT5 expert update could not stop terminal")
+            try:
+                provisioner.rotate_managed_expert(
+                    account.connection_id,
+                    self.expert_binary,
+                    self.expert_sha256,
+                )
+                self._resume_account(runtime, account, self.expert_binary, recovery_from)
+            except Exception as exc:
+                try:
+                    runtime.stop()
+                    provisioner.rotate_managed_expert(
+                        account.connection_id,
+                        backup,
+                        previous,
+                    )
+                    self._resume_account(runtime, account, backup, recovery_from)
+                except Exception as rollback_exc:
+                    # The backup stays on disk: it is the only copy of that terminal's Bridge.
+                    raise Mt5MaintenanceError(
+                        "MT5 expert update and rollback failed"
+                    ) from rollback_exc
+                backup.unlink(missing_ok=True)
+                raise Mt5MaintenanceError(
+                    "MT5 expert update failed and was rolled back"
+                ) from exc
+            backup.unlink(missing_ok=True)
+
+    def _align_instance_experts(
+        self,
+        stop_event: Event,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Give every terminal in scope the pinned Bridge; return (updated, failed)."""
+        updated: list[str] = []
+        failed: list[str] = []
+        for account in self._accounts():
+            self._require_not_stopped(stop_event)
+            bridge = account.root / "terminal" / _MANAGED_RUNTIME_ASSETS[0]
+            try:
+                if InstanceProvisioner._sha256(bridge) == self.expert_sha256:
+                    continue
+                self._align_instance_expert(account, stop_event)
+            except Exception as exc:
+                if stop_event.is_set():
+                    raise Mt5MaintenanceError("MT5 maintenance was interrupted") from exc
+                logger.warning(
+                    "MT5 expert update failed for %s (%s)",
+                    account.connection_id,
+                    failure_reason(exc),
+                )
+                failed.append(account.connection_id)
+                if not updated and len(failed) >= 2:
+                    # Two terminals in a row refused the new Bridge and none took it: the
+                    # release itself is the likely cause, so no other terminal is touched.
+                    raise Mt5MaintenanceError(
+                        "MT5 expert update failed on every tried account"
+                    ) from exc
+                continue
+            updated.append(account.connection_id)
+            logger.info("MT5 expert updated for %s", account.connection_id)
+        if failed:
+            if self.scope_exclude is None:
+                raise Mt5MaintenanceError("MT5 expert update failed")
+            self.scope_exclude(frozenset(failed), "expert_update_failed")
+            if any(self.connection_allowed(connection_id) for connection_id in failed):
+                raise Mt5MaintenanceError("MT5 maintenance scope exclusion failed")
+        return tuple(updated), tuple(failed)
+
+    def _run_expert_phase(self, stop_event: Event) -> None:
+        if self.template_expert_sync is None and self.expert_sha256 is None:
+            return
+        template_updated = (
+            self.template_expert_sync.align(stop_event)
+            if self.template_expert_sync is not None
+            else False
+        )
+        updated: tuple[str, ...] = ()
+        failed: tuple[str, ...] = ()
+        if self.expert_sha256 is not None:
+            updated, failed = self._align_instance_experts(stop_event)
+        if failed:
+            status = "partial"
+        elif template_updated or updated:
+            status = "updated"
+        else:
+            status = "ok"
+        self.last_phases["expert"] = {
+            "status": status,
+            "template": "updated" if template_updated else "ok",
+            "updated": len(updated),
+            "failed": len(failed),
+        }
+
+    def _run_verification_phase(self, stop_event: Event) -> None:
+        if self.fleet_verifier is None:
+            return
+        try:
+            result = self.fleet_verifier.verify(stop_event)
+        except Exception as exc:
+            logger.exception("MT5 fleet verification failed")
+            self.last_phases["verify"] = {"status": "failed", "reason": failure_reason(exc)}
+            return
+        self.last_phases["verify"] = {
+            "status": "issues" if result.issues else "ok",
+            "checked": len(result.checked),
+            "healthy": result.healthy,
+            "issues": [
+                {"connection_id": connection_id, "problem": problem}
+                for connection_id, problem in result.issues[:MAX_REPORTED_ISSUES]
+            ],
+        }
+
+    def _golden_build(self) -> int | None:
+        try:
+            return self._public_build(self.template_manager.source_terminal)
+        except Mt5MaintenanceError:
+            return None
+
     def run_once(self, stop_event: Event) -> Mt5MaintenanceReport:
-        if self.scope_refresh is not None:
-            self.scope_refresh()
+        """Phase one (Expert), then phase two (MT5), then phase three (verification).
+
+        Phase two starts only after phase one succeeded. Verification always runs, also
+        after a failure, so the report says how every account was left.
+        """
+        self.last_phases = {}
+        expert_enabled = (
+            self.template_expert_sync is not None or self.expert_sha256 is not None
+        )
+        try:
+            if self.scope_refresh is not None:
+                self.scope_refresh()
+        except Exception:
+            # Without tonight's scope nothing may be stopped: both phases are skipped and
+            # the report carries the cause as its error code.
+            if expert_enabled:
+                self.last_phases["expert"] = {"status": "skipped"}
+            self.last_phases["mt5"] = {"status": "skipped"}
+            self._run_verification_phase(stop_event)
+            raise
+        try:
+            self._run_expert_phase(stop_event)
+        except Exception as exc:
+            if expert_enabled:
+                self.last_phases["expert"] = {
+                    "status": "failed",
+                    "reason": failure_reason(exc),
+                }
+            self.last_phases["mt5"] = {"status": "skipped"}
+            self._run_verification_phase(stop_event)
+            raise
+        previous_build = self._golden_build()
+        try:
+            report = self._run_mt5_phase(stop_event)
+        except Exception as exc:
+            self.last_phases["mt5"] = {"status": "failed", "reason": failure_reason(exc)}
+            self._run_verification_phase(stop_event)
+            raise
+        moved = set(report.migrated_connections)
+        if report.release_changed:
+            # Canaries moved to the new release while validating it; the fleet pass then
+            # finds them already current.
+            moved |= set(report.checked_connections)
+        self.last_phases["mt5"] = {
+            "status": "updated" if moved or report.release_changed else "ok",
+            "build": self._golden_build(),
+            "previous_build": previous_build,
+            "migrated": len(moved),
+        }
+        self._run_verification_phase(stop_event)
+        return report
+
+    def _run_mt5_phase(self, stop_event: Event) -> Mt5MaintenanceReport:
         try:
             return self._run_once(stop_event)
         except Mt5PendingUpdateStoreError as exc:

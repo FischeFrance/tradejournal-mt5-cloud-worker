@@ -29,7 +29,7 @@ from windows_agent.provisioning.mt5_public_release import (
 )
 from windows_agent.provisioning.mt5_template import PreparedMt5Template
 from windows_agent.provisioning.mt5_update_store import Mt5UpdateRelease
-from windows_agent.state_store import atomic_json
+from windows_agent.state_store import atomic_json, read_json
 from windows_agent.worker.maintenance_mt5_runtime import NativeMt5Status
 
 
@@ -1772,3 +1772,280 @@ def test_without_scope_exclusion_an_unverifiable_account_still_stops_the_pass(tm
         coordinator.run_once(Event())
     assert manager.commits == 0
     assert rotator.rotate_one_calls == []
+
+
+class _ReasonScope(_Scope):
+    def __init__(self, connection_ids: list[str]) -> None:
+        super().__init__(connection_ids)
+        self.reasons: dict[str, str] = {}
+
+    def exclude(
+        self,
+        connection_ids: frozenset[str],
+        reason: str = "release_state_unverifiable",
+    ) -> None:
+        super().exclude(connection_ids)
+        self.reasons.update({connection_id: reason for connection_id in connection_ids})
+
+
+class _TemplateSync:
+    def __init__(self, events: list[str], result: bool = True, error: Exception | None = None) -> None:
+        self.events = events
+        self.result = result
+        self.error = error
+
+    def align(self, stop_event: Event) -> bool:
+        assert not stop_event.is_set()
+        self.events.append("template")
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class _Provisioner:
+    def __init__(self, instances: Path, events: list[str]) -> None:
+        self.instances = instances
+        self.events = events
+        self.calls: list[tuple[str, Path, str]] = []
+
+    def rotate_managed_expert(self, connection_id: str, source: Path, expected_sha256: str) -> str:
+        assert InstanceProvisioner._sha256(Path(source)) == expected_sha256
+        self.calls.append((connection_id, Path(source), expected_sha256))
+        self.events.append(f"expert:{connection_id}")
+        root = self.instances / connection_id
+        _bridge(root).write_bytes(Path(source).read_bytes())
+        # Like the real reseal, the terminal's state follows its new executables.
+        state = read_json(root / "state" / "instance.json")
+        code = InstanceProvisioner._code_manifest(root / "terminal")
+        state["template_code_manifest_sha256"] = code
+        state["template_release_id"] = hashlib.sha256(
+            f"{state['terminal_sha256']}:{code}".encode("ascii")
+        ).hexdigest()
+        atomic_json(root / "state" / "instance.json", state)
+        return "f" * 64
+
+
+class _ExpertRuntime(RuntimeController):
+    """Refuses to come back online with the pinned Bridge for the listed accounts."""
+
+    def __init__(self, pinned: Path, refuse: set[str]) -> None:
+        super().__init__()
+        self.pinned = pinned
+        self.refuse = refuse
+
+    def factory(self, root: Path, connection_id: str):
+        runtime = super().factory(root, connection_id)
+        resume = runtime.resume
+        owner = self
+
+        def guarded(**kwargs):
+            if connection_id in owner.refuse and Path(kwargs["expert_binary"]) == owner.pinned:
+                owner.resume_calls.append(kwargs)
+                raise RuntimeError("new bridge refused")
+            return resume(**kwargs)
+
+        runtime.resume = guarded
+        return runtime
+
+
+class _Verifier:
+    def __init__(self, issues: tuple[tuple[str, str], ...] = ()) -> None:
+        self.issues = issues
+        self.calls = 0
+
+    def verify(self, _stop_event: Event):
+        from windows_agent.mt5_fleet_verification import Mt5FleetVerification
+
+        self.calls += 1
+        return Mt5FleetVerification(("a", "b"), self.issues)
+
+
+def _bridge(root: Path) -> Path:
+    return root / "terminal" / "MQL5" / "Experts" / "TradeJournal" / "TradeJournalBridge.ex5"
+
+
+def _phased(
+    tmp_path: Path,
+    servers: tuple[str, ...] = ("Broker-A", "Broker-B"),
+    *,
+    refuse: tuple[int, ...] = (),
+    sync_error: Exception | None = None,
+    template_result: bool = True,
+):
+    ids, instances, expert, manager, rotator, secrets = _fixture(tmp_path, servers)
+    ordered = sorted(ids)
+    events: list[str] = []
+    runtime = _ExpertRuntime(expert, {ordered[index] for index in refuse})
+    coordinator = _coordinator(instances, expert, manager, rotator, secrets, runtime, FakePool())
+    scope = _ReasonScope(ids)
+    provisioner = _Provisioner(instances, events)
+    verifier = _Verifier()
+    coordinator.connection_allowed = scope.allows
+    coordinator.scope_exclude = scope.exclude
+    coordinator.template_expert_sync = _TemplateSync(events, template_result, sync_error)
+    coordinator.expert_sha256 = InstanceProvisioner._sha256(expert)
+    coordinator.expert_backup_root = tmp_path / "state" / "mt5-expert-backups"
+    coordinator.provisioner = provisioner
+    coordinator.fleet_verifier = verifier
+    return SimpleNamespace(
+        ids=ordered,
+        instances=instances,
+        expert=expert,
+        manager=manager,
+        rotator=rotator,
+        runtime=runtime,
+        coordinator=coordinator,
+        scope=scope,
+        provisioner=provisioner,
+        verifier=verifier,
+        events=events,
+    )
+
+
+def test_phase_one_gives_template_and_terminals_the_pinned_bridge_before_mt5(tmp_path: Path) -> None:
+    case = _phased(tmp_path)
+
+    case.coordinator.run_once(Event())
+
+    assert case.events == ["template", *(f"expert:{cid}" for cid in case.ids)]
+    assert all(_bridge(case.instances / cid).read_bytes() == b"expert" for cid in case.ids)
+    # Phase one restarts each terminal with the pinned Bridge, phase two probes it again.
+    assert [Path(call["expert_binary"]) for call in case.runtime.resume_calls[:2]] == [case.expert] * 2
+    assert case.coordinator.last_phases["expert"] == {
+        "status": "updated", "template": "updated", "updated": 2, "failed": 0,
+    }
+    assert case.coordinator.last_phases["mt5"] == {
+        "status": "ok", "build": None, "previous_build": None, "migrated": 0,
+    }
+    assert case.coordinator.last_phases["verify"] == {
+        "status": "ok", "checked": 2, "healthy": 2, "issues": [],
+    }
+    assert not list(case.coordinator.expert_backup_root.glob("*.ex5"))
+
+
+def test_a_terminal_refusing_the_new_bridge_gets_its_own_back_and_sits_out(tmp_path: Path) -> None:
+    case = _phased(tmp_path, ("Broker-A", "Broker-A", "Broker-B"), refuse=(1,))
+    refused = case.ids[1]
+    previous = InstanceProvisioner._sha256(_bridge(case.instances / refused))
+
+    case.coordinator.run_once(Event())
+
+    calls = [call for call in case.provisioner.calls if call[0] == refused]
+    assert [(call[1] == case.expert, call[2]) for call in calls] == [
+        (True, case.coordinator.expert_sha256),
+        (False, previous),
+    ]
+    assert _bridge(case.instances / refused).read_bytes() == b"instance-bridge"
+    assert case.scope.reasons == {refused: "expert_update_failed"}
+    # Left out of tonight: never a canary, never probed again after its own Bridge came back.
+    assert refused not in [cid for cid, _force in case.rotator.rotate_one_calls]
+    assert [cid for _root, cid in case.runtime.factory_calls].count(refused) == 1
+    assert case.coordinator.last_phases["expert"] == {
+        "status": "partial", "template": "updated", "updated": 2, "failed": 1,
+    }
+    assert case.verifier.calls == 1
+
+
+def test_two_refusals_in_a_row_stop_phase_one_and_skip_mt5(tmp_path: Path) -> None:
+    case = _phased(tmp_path, ("Broker-A", "Broker-A", "Broker-B"), refuse=(0, 1, 2))
+
+    with pytest.raises(Mt5MaintenanceError, match="every tried account"):
+        case.coordinator.run_once(Event())
+
+    assert {call[0] for call in case.provisioner.calls} == {case.ids[0], case.ids[1]}
+    assert _bridge(case.instances / case.ids[2]).read_bytes() == b"instance-bridge"
+    assert case.rotator.rotate_all_calls == []
+    assert case.manager.promotions == 0
+    assert case.coordinator.last_phases["expert"] == {
+        "status": "failed", "reason": "mt5_expert_update_failed_and_was_rolled_back",
+    }
+    assert case.coordinator.last_phases["mt5"] == {"status": "skipped"}
+    assert case.verifier.calls == 1
+
+
+def test_a_template_that_refuses_the_bridge_stops_before_any_terminal(tmp_path: Path) -> None:
+    from windows_agent.mt5_expert_alignment import Mt5TemplateExpertError
+    from windows_agent.provisioning.mt5_template import Mt5TemplateError
+
+    error = Mt5TemplateExpertError("MT5 template expert update failed")
+    error.__cause__ = Mt5TemplateError("MT5 managed deployment changed companion code")
+    case = _phased(tmp_path, sync_error=error)
+
+    with pytest.raises(Mt5TemplateExpertError):
+        case.coordinator.run_once(Event())
+
+    assert case.provisioner.calls == []
+    assert case.runtime.stop_calls == 0
+    assert case.coordinator.last_phases["expert"] == {
+        "status": "failed", "reason": "mt5_managed_deployment_changed_companion_code",
+    }
+    assert case.coordinator.last_phases["mt5"] == {"status": "skipped"}
+    assert case.verifier.calls == 1
+
+
+def test_an_mt5_failure_reports_its_cause_and_every_account_is_still_verified(tmp_path: Path) -> None:
+    case = _phased(tmp_path, template_result=False)
+    for cid in case.ids:
+        _bridge(case.instances / cid).write_bytes(b"expert")
+    case.rotator.recovery_failed = (case.ids[0],)
+
+    with pytest.raises(Mt5MaintenanceError, match="recovery is incomplete"):
+        case.coordinator.run_once(Event())
+
+    assert case.provisioner.calls == []
+    assert case.coordinator.last_phases["expert"] == {
+        "status": "ok", "template": "ok", "updated": 0, "failed": 0,
+    }
+    assert case.coordinator.last_phases["mt5"] == {
+        "status": "failed", "reason": "mt5_rotation_recovery_is_incomplete",
+    }
+    assert case.verifier.calls == 1
+
+
+def test_a_scope_that_cannot_be_read_skips_both_phases_but_verifies(tmp_path: Path) -> None:
+    class Unavailable(RuntimeError):
+        error_code = "native_maintenance_recovery_unavailable"
+
+    case = _phased(tmp_path)
+
+    def refuse() -> None:
+        raise Unavailable("native_maintenance_recovery_unavailable")
+
+    case.coordinator.scope_refresh = refuse
+
+    with pytest.raises(Unavailable):
+        case.coordinator.run_once(Event())
+
+    assert case.events == []
+    assert case.coordinator.last_phases["expert"] == {"status": "skipped"}
+    assert case.coordinator.last_phases["mt5"] == {"status": "skipped"}
+    assert case.verifier.calls == 1
+
+
+def test_verification_problems_are_reported_without_failing_the_pass(tmp_path: Path) -> None:
+    case = _phased(tmp_path)
+    case.verifier.issues = ((case.ids[0], "disconnected"),)
+
+    case.coordinator.run_once(Event())
+
+    assert case.coordinator.last_phases["verify"] == {
+        "status": "issues", "checked": 2, "healthy": 1,
+        "issues": [{"connection_id": case.ids[0], "problem": "disconnected"}],
+    }
+
+
+def test_failure_reason_names_the_most_specific_sanitized_cause() -> None:
+    from windows_agent.mt5_maintenance import failure_reason
+    from windows_agent.provisioning.mt5_instance_rotation import Mt5InstanceRotationError
+
+    try:
+        try:
+            try:
+                raise Mt5InstanceRotationError("rotated MT5 release changed during restart")
+            except Mt5InstanceRotationError as inner:
+                raise Mt5InstanceRotationError("MT5 instance rotation failed and was rolled back") from inner
+        except Mt5InstanceRotationError as middle:
+            raise Mt5MaintenanceError("MT5 public candidate verification failed") from middle
+    except Mt5MaintenanceError as outer:
+        assert failure_reason(outer) == "rotated_mt5_release_changed_during_restart"
+    assert failure_reason(RuntimeError("C:\\secret\\path")) == "mt5_maintenance_failed"

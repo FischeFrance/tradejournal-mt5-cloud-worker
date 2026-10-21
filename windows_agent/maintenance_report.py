@@ -1,28 +1,45 @@
-"""Tell the control plane how each nightly MT5 maintenance attempt ended.
+"""Tell the control plane how each MT5 maintenance pass ended.
 
-The server turns a final failure, an overdue night or accounts left out of the
-night into an alert for the administrators. Delivery is best effort: a report
-that cannot be sent is logged and never affects maintenance or account sync.
+Every final attempt, nightly or asked for by an administrator, becomes one notification
+for the administrators with what each phase did: Expert, MT5 and the final verification.
+A night that never ran raises its own alert. Delivery is best effort: a report that
+cannot be sent is logged and never affects maintenance or account sync.
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
-# The maintenance endpoint rejects bodies above 2 KiB; twelve exclusions stay well below it.
+# The maintenance endpoint rejects bodies above 4 KiB; twelve exclusions and twelve
+# verification problems stay well below it.
 MAX_REPORTED_EXCLUSIONS = 12
-EXCLUSION_REASONS = frozenset({"ticket_baseline_unavailable", "release_state_unverifiable"})
+MAX_REPORTED_ISSUES = 12
+EXCLUSION_REASONS = frozenset({
+    "ticket_baseline_unavailable",
+    "release_state_unverifiable",
+    "expert_update_failed",
+})
 _ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _LOCAL_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_PHASES = ("expert", "mt5", "verify")
+_PHASE_CODES = ("status", "template", "reason")
+_PHASE_COUNTS = ("updated", "failed", "migrated", "build", "previous_build", "checked", "healthy")
 
 
 class MaintenanceReporter:
-    def __init__(self, api: Any, recovery: Any | None = None) -> None:
+    def __init__(
+        self,
+        api: Any,
+        recovery: Any | None = None,
+        phases: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> None:
         self.api = api
         self.recovery = recovery
+        self.phases = phases
         self._overdue_reported: set[str] = set()
 
     def attempt_finished(self, state: Mapping[str, Any], final: bool) -> None:
@@ -47,7 +64,7 @@ class MaintenanceReporter:
                 error_code = "maintenance_window_ended"
             else:
                 error_code = "mt5_maintenance_failed"
-        self._send({
+        body = {
             "api_version": "1",
             "operation": "report",
             "local_date": local_date,
@@ -56,7 +73,13 @@ class MaintenanceReporter:
             "final": bool(final),
             "error_code": error_code,
             "excluded": self._excluded(),
-        })
+            "trigger": "manual" if state.get("trigger") == "manual" else "scheduled",
+            "phases": self._phases(),
+        }
+        run_id = state.get("run_id")
+        if isinstance(run_id, str) and _UUID.fullmatch(run_id):
+            body["run_id"] = run_id
+        self._send(body)
 
     def overdue(self, local_date: str, error_code: str | None) -> None:
         """Report, once per local date, a night whose maintenance never finished."""
@@ -87,6 +110,45 @@ class MaintenanceReporter:
             if isinstance(connection_id, str) and reason in EXCLUSION_REASONS
         ]
         return items[:MAX_REPORTED_EXCLUSIONS]
+
+    def _phases(self) -> dict[str, dict[str, Any]]:
+        """What each phase did, reduced to short codes and counts."""
+        try:
+            source = self.phases() if self.phases is not None else None
+        except Exception:
+            logger.exception("MT5 maintenance phases unavailable for the report")
+            return {}
+        if not isinstance(source, Mapping):
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for name in _PHASES:
+            phase = source.get(name)
+            if not isinstance(phase, Mapping):
+                continue
+            item: dict[str, Any] = {}
+            for field in _PHASE_CODES:
+                value = phase.get(field)
+                if isinstance(value, str) and _ERROR_CODE.fullmatch(value):
+                    item[field] = value
+            if "status" not in item:
+                continue
+            for field in _PHASE_COUNTS:
+                value = phase.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+                    item[field] = value
+            issues = phase.get("issues")
+            if isinstance(issues, list):
+                item["issues"] = [
+                    {"connection_id": issue["connection_id"], "problem": issue["problem"]}
+                    for issue in issues
+                    if isinstance(issue, Mapping)
+                    and isinstance(issue.get("connection_id"), str)
+                    and _UUID.fullmatch(issue["connection_id"])
+                    and isinstance(issue.get("problem"), str)
+                    and _ERROR_CODE.fullmatch(issue["problem"])
+                ][:MAX_REPORTED_ISSUES]
+            result[name] = item
+        return result
 
     def _send(self, body: dict[str, Any]) -> bool:
         try:

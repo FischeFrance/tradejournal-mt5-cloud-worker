@@ -2,7 +2,11 @@ import json
 from types import SimpleNamespace
 from uuid import uuid4
 
-from windows_agent.maintenance_report import MAX_REPORTED_EXCLUSIONS, MaintenanceReporter
+from windows_agent.maintenance_report import (
+    MAX_REPORTED_EXCLUSIONS,
+    MAX_REPORTED_ISSUES,
+    MaintenanceReporter,
+)
 
 
 class Api:
@@ -39,7 +43,65 @@ def test_a_completed_night_reports_the_accounts_left_out_and_why():
             {"connection_id": first, "reason": "ticket_baseline_unavailable"},
             {"connection_id": second, "reason": "release_state_unverifiable"},
         ],
+        "trigger": "scheduled", "phases": {},
     }]
+
+
+def test_the_report_carries_what_each_phase_did():
+    account = str(uuid4())
+    run_id = str(uuid4())
+    phases = {
+        "expert": {"status": "updated", "template": "updated", "updated": 1, "failed": 0},
+        "mt5": {"status": "updated", "build": 6274, "migrated": 5},
+        "verify": {
+            "status": "issues", "checked": 5, "healthy": 4,
+            "issues": [{"connection_id": account, "problem": "disconnected"}],
+        },
+    }
+    api = Api()
+
+    MaintenanceReporter(api, SimpleNamespace(skip_reasons={}), phases=lambda: phases).attempt_finished(
+        state(trigger="manual", run_id=run_id), True,
+    )
+
+    body = api.bodies[0]
+    assert body["trigger"] == "manual"
+    assert body["run_id"] == run_id
+    assert body["phases"] == phases
+
+
+def test_phase_values_are_reduced_to_codes_and_counts():
+    phases = {
+        "expert": {"status": "failed", "reason": "MT5 template expert update failed", "updated": True},
+        "mt5": {"status": "skipped", "build": -1, "secret": "value"},
+        "verify": {"status": "issues", "issues": [
+            {"connection_id": "not-a-uuid", "problem": "disconnected"},
+            {"connection_id": str(uuid4()), "problem": "Not A Code"},
+        ]},
+        "other": {"status": "ok"},
+    }
+    api = Api()
+
+    MaintenanceReporter(api, phases=lambda: phases).attempt_finished(state("failed", 2, run_id="x"), True)
+
+    body = api.bodies[0]
+    assert "run_id" not in body
+    assert body["phases"] == {
+        "expert": {"status": "failed"},
+        "mt5": {"status": "skipped"},
+        "verify": {"status": "issues", "issues": []},
+    }
+
+
+def test_unavailable_phases_still_send_the_report():
+    def broken():
+        raise RuntimeError("coordinator state unavailable")
+
+    api = Api()
+
+    MaintenanceReporter(api, phases=broken).attempt_finished(state(), True)
+
+    assert api.bodies[0]["phases"] == {}
 
 
 def test_a_failure_carries_its_error_code_and_whether_a_retry_follows():
@@ -96,12 +158,24 @@ def test_an_overdue_night_is_reported_once_and_retried_only_if_undelivered():
 
 def test_the_report_stays_under_the_endpoint_size_limit():
     reasons = {str(uuid4()): "ticket_baseline_unavailable" for _ in range(MAX_REPORTED_EXCLUSIONS + 5)}
+    phases = {
+        "expert": {"status": "partial", "template": "updated", "updated": 3, "failed": 2},
+        "mt5": {"status": "failed", "reason": "r" * 64},
+        "verify": {
+            "status": "issues", "checked": 40, "healthy": 20,
+            "issues": [
+                {"connection_id": str(uuid4()), "problem": "process_ambiguous"}
+                for _ in range(MAX_REPORTED_ISSUES + 5)
+            ],
+        },
+    }
     api = Api()
 
-    MaintenanceReporter(api, SimpleNamespace(skip_reasons=reasons)).attempt_finished(
-        state("failed", 2, error_code="native_maintenance_recovery_unavailable"), True,
+    MaintenanceReporter(api, SimpleNamespace(skip_reasons=reasons), phases=lambda: phases).attempt_finished(
+        state("failed", 2, error_code="native_maintenance_recovery_unavailable", run_id=str(uuid4())), True,
     )
 
     body = api.bodies[0]
     assert len(body["excluded"]) == MAX_REPORTED_EXCLUSIONS
-    assert len(json.dumps(body).encode("utf-8")) < 2048
+    assert len(body["phases"]["verify"]["issues"]) == MAX_REPORTED_ISSUES
+    assert len(json.dumps(body).encode("utf-8")) < 4096

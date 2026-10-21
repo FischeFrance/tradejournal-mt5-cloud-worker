@@ -452,3 +452,92 @@ def test_a_broken_reporter_never_affects_maintenance(tmp_path: Path) -> None:
     assert scheduler.run_if_due(threading.Event()) is True
     assert read_json(tmp_path / "maintenance.json")["status"] == "completed"
     assert len(coordinator.calls) == 1
+
+
+def _request_run(tmp_path: Path) -> Path:
+    request = tmp_path / "mt5-maintenance-run-now.request"
+    request.write_text("requested by an administrator", encoding="utf-8")
+    return request
+
+
+def test_a_run_now_request_runs_one_pass_outside_the_window(tmp_path: Path) -> None:
+    # 10:00 Rome: far from the nightly window.
+    clock = Clock(datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc))
+    reports: list[tuple[dict, bool]] = []
+    scheduler, coordinator = _scheduler(
+        tmp_path, clock, attempt_reporter=lambda state, final: reports.append((state, final)),
+    )
+    request = _request_run(tmp_path)
+
+    assert scheduler.run_if_due(threading.Event()) is True
+
+    assert not request.exists()
+    assert len(coordinator.calls) == 1
+    manual = read_json(tmp_path / "mt5-maintenance-manual.json")
+    assert manual["status"] == "completed"
+    assert manual["trigger"] == "manual"
+    assert manual["scheduled_local_date"] == "2026-10-22"
+    assert not (tmp_path / "maintenance.json").exists()
+    assert [(state["trigger"], state["status"], final) for state, final in reports] == [
+        ("manual", "completed", True),
+    ]
+    # Consumed: the next tick runs nothing.
+    assert scheduler.run_if_due(threading.Event()) is False
+    assert len(coordinator.calls) == 1
+
+
+def test_a_run_now_pass_has_its_own_deadline(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc))
+    scheduler, coordinator = _scheduler(tmp_path, clock, manual_window=timedelta(hours=3))
+    _request_run(tmp_path)
+
+    scheduler.run_if_due(threading.Event())
+
+    stop = coordinator.calls[0]
+    assert not stop.is_set()
+    clock.current += timedelta(hours=3)
+    assert stop.is_set()
+
+
+def test_a_failed_run_now_pass_is_final_and_leaves_the_night_alone(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 10, 21, 21, 40, tzinfo=timezone.utc))
+    reports: list[tuple[dict, bool]] = []
+    scheduler, coordinator = _scheduler(
+        tmp_path, clock, Coordinator(failures=1),
+        attempt_reporter=lambda state, final: reports.append((state, final)),
+    )
+    _request_run(tmp_path)
+
+    assert scheduler.run_if_due(threading.Event()) is True
+    assert read_json(tmp_path / "mt5-maintenance-manual.json")["status"] == "failed"
+    assert [(state["trigger"], final) for state, final in reports] == [("manual", True)]
+    # The nightly pass of that date is still due and runs on the next tick.
+    assert scheduler.run_if_due(threading.Event()) is True
+    assert read_json(tmp_path / "maintenance.json")["status"] == "completed"
+    assert len(coordinator.calls) == 2
+
+
+def test_a_run_now_pass_cut_off_by_a_restart_is_marked_failed_and_not_retried(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc))
+    scheduler, coordinator = _scheduler(tmp_path, clock)
+    atomic_json(tmp_path / "mt5-maintenance-manual.json", {
+        "schema_version": 1, "trigger": "manual", "status": "running", "attempts": 1,
+        "scheduled_local_date": "2026-10-22", "run_id": "x",
+    })
+
+    scheduler.recover_interrupted()
+
+    manual = read_json(tmp_path / "mt5-maintenance-manual.json")
+    assert manual["status"] == "failed"
+    assert manual["recovered_interrupted_run"] is True
+    assert scheduler.run_if_due(threading.Event()) is False
+    assert coordinator.calls == []
+
+
+def test_a_request_that_is_not_a_regular_file_is_ignored(tmp_path: Path) -> None:
+    clock = Clock(datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc))
+    scheduler, coordinator = _scheduler(tmp_path, clock)
+    (tmp_path / "mt5-maintenance-run-now.request").mkdir()
+
+    assert scheduler.run_if_due(threading.Event()) is False
+    assert coordinator.calls == []

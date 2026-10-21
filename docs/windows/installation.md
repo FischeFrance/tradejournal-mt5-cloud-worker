@@ -103,6 +103,24 @@ UTC. Il supervisore live attende il completamento dell'handoff. Un cursore
 incompleto o una consegna non confermata impediscono un'ulteriore rotazione;
 un errore del control plane ripristina il producer investitore live.
 
+Ogni passaggio procede in tre fasi. Fase 1, Expert: il template riceve il Bridge
+fissato dal servizio con un nuovo sigillo, poi ogni terminale con un Bridge
+diverso viene riavviato con quello fissato. Un registro in `mt5-expert-backups`
+rende sicuro lo scambio nel template: all'avvio il servizio rimette il Bridge
+precedente se lo scambio si è interrotto prima del sigillo. Un terminale che non
+riparte con il nuovo Bridge riprende il suo e resta fuori dalla notte; due
+rifiuti consecutivi fermano la fase. Fase 2, MT5: probe della release pubblica,
+canary e rotazione, solo dopo una fase 1 riuscita. Fase 3, verifica in sola
+lettura: per ogni account assegnato controlla processo, heartbeat, identità,
+sola lettura, Bridge e build. A fine passaggio il worker invia il riepilogo delle
+fasi al control plane, che lo trasforma in una notifica per gli amministratori.
+
+Per avviare subito un passaggio, un amministratore crea il file
+`mt5-maintenance-run-now.request` nella cartella di `mt5-maintenance.json`. Il
+servizio lo consuma al ciclo successivo, scrive l'esito in
+`mt5-maintenance-manual.json` con una scadenza di tre ore e non cambia la
+pianificazione notturna. Il passaggio riavvia i terminali anche a mercati aperti.
+
 Il monitor indipendente scrive `mt5-maintenance-health.json` accanto al journal
 originale e invia tramite il logger del servizio un evento ogni minuto. Gli
 stati `unsupported`, `overdue`, `failed` e `invalid_state` sono errori, anche se

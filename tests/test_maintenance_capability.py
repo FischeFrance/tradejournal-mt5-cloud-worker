@@ -27,7 +27,7 @@ def capable_release(root: Path) -> Path:
     (root / "windows_agent" / "agent_daemon.py").write_text(
         "def build_runner(config):\n"
         "    recovery = MaintenanceRecovery()\n"
-        "    coordinator = Mt5MaintenanceCoordinator(Mt5PublicReleaseProbe())\n"
+        "    coordinator = Mt5MaintenanceCoordinator(Mt5PublicReleaseProbe(), Mt5TemplateExpertSync(), Mt5FleetVerifier())\n"
         "    maintenance = Mt5MaintenanceScheduler(coordinator)\n"
         "    return JobRunner(scheduled_maintenance=maintenance)\n"
         "def run_forever(runner):\n"
@@ -61,7 +61,7 @@ def test_rejects_a_partially_packaged_scheduler(tmp_path, file):
         verify_maintenance_capability(root)
 
 
-@pytest.mark.parametrize("removed", ["Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "Mt5MaintenanceScheduler", "MaintenanceRecovery", "run_if_due", "scheduled_maintenance="])
+@pytest.mark.parametrize("removed", ["Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "Mt5MaintenanceScheduler", "MaintenanceRecovery", "Mt5TemplateExpertSync", "Mt5FleetVerifier", "run_if_due", "scheduled_maintenance="])
 def test_files_alone_do_not_prove_the_worker_runs_maintenance(tmp_path, removed):
     root = capable_release(tmp_path)
     path = root / "windows_agent" / "agent_daemon.py"

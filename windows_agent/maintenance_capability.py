@@ -17,6 +17,8 @@ from typing import Mapping, Sequence
 MAINTENANCE_ENV = "TRADEJOURNAL_MT5_MAINTENANCE_ENABLED"
 MAINTENANCE_FILES = (
     "mt5_maintenance.py",
+    "mt5_expert_alignment.py",
+    "mt5_fleet_verification.py",
     "mt5_maintenance_scheduler.py",
     "mt5_lifecycle.py",
     "mt5_recovery_window.py",
@@ -29,6 +31,8 @@ MAINTENANCE_FILES = (
 )
 MAINTENANCE_TYPES = {
     "mt5_maintenance.py": "Mt5MaintenanceCoordinator",
+    "mt5_expert_alignment.py": "Mt5TemplateExpertSync",
+    "mt5_fleet_verification.py": "Mt5FleetVerifier",
     "mt5_maintenance_scheduler.py": "Mt5MaintenanceScheduler",
     "mt5_lifecycle.py": "Mt5LifecycleCoordinator",
     "provisioning/mt5_instance_rotation.py": "Mt5InstanceRotator",
@@ -96,6 +100,7 @@ def verify_maintenance_capability(release_root: Path | str) -> None:
     loader = _function(config, "load_runtime_config")
     required_calls = (
         "Mt5MaintenanceScheduler", "Mt5MaintenanceCoordinator", "Mt5PublicReleaseProbe", "MaintenanceRecovery",
+        "Mt5TemplateExpertSync", "Mt5FleetVerifier",
     )
     wired = any(
         isinstance(node, ast.Call)
